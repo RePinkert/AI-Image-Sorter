@@ -1,0 +1,49 @@
+[package]
+name = "app"
+version = "0.1.0"
+description = "AI Image Sorter"
+authors = ["you"]
+license = ""
+repository = ""
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.11.3", features = ["protocol-asset"] }
+tauri-plugin-log = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+
+# Metadata / image
+png = "0.17"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp"] }
+kamadak-exif = "0.5"
+walkdir = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+sha2 = "0.10"
+
+# DB
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Misc
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "1"
+sysinfo = "0.32"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

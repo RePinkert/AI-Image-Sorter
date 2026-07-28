@@ -1,0 +1,34 @@
+# Node / frontend
+node_modules/
+dist/
+
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# Local SQLite database + WAL (NEVER commit your local scores/labels)
+*.db
+*.db-wal
+*.db-shm
+/AI-Image-Sorter.db
+/ai-image-sorter.db*
+
+# App-local data dir
+src-tauri/app_data/
+app_data/
+
+# Thumbnails cache
+**/thumbnails/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Personal work logs (timestamped .md) — never push these
+0???????.md
+[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].md
