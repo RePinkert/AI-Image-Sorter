@@ -1,6 +1,5 @@
 pub const BASE_SCORE: f64 = 50.0;
 pub const SWIPE_DELTA: f64 = 10.0;
-pub const SWIPE_DOWN_DELTA: f64 = 0.0;
 pub const ARENA_DELTA: f64 = 8.0;
 pub const MIN_SCORE: f64 = 0.0;
 pub const MAX_SCORE: f64 = 100.0;

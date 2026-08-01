@@ -1,9 +1,12 @@
 use crate::db::Db;
+use std::collections::HashSet;
 use xxhash_rust::xxh3::xxh3_64;
 
-/// Jaccard similarity threshold for L2 single-linkage clustering.
-/// Hardcoded for now; a Settings slider can be added later.
-pub const L2_SIMILARITY_THRESHOLD: f64 = 0.5;
+/// Default Jaccard similarity threshold for L2 single-linkage clustering,
+/// mirroring the value persisted in the frontend store (l2Threshold).
+/// Runtime callers pass the user-adjusted threshold explicitly so the
+/// Settings slider can re-cluster live without a re-scan.
+pub const DEFAULT_L2_THRESHOLD: f64 = 0.3;
 
 /// Tokenize a prompt for Jaccard similarity.
 /// Normalizes whitespace + lowercase, splits on commas and whitespace,
@@ -61,59 +64,58 @@ fn jaccard(a: &[String], b: &[String]) -> f64 {
 
 /// Single-linkage agglomerative clustering of `(image_id, prompt)` pairs.
 /// Returns `(image_id, cluster_index)` for each input, in input order.
-pub fn cluster_l1(items: &[(i64, String)]) -> Vec<(i64, u64)> {
+/// `threshold` is the Jaccard similarity at/above which two prompts merge.
+///
+/// Implementation: tokenize once, evaluate every pair exactly once
+/// (O(n²) Jaccard in a single pass), and union pairs above the threshold
+/// with union-find. Equivalent to the previous iterative "merge best pair
+/// and rescan" single-linkage but O(n²) total instead of O(passes · n²),
+/// which made every 8s sync freeze the app on 100+ member groups.
+pub fn cluster_l1(items: &[(i64, String)], threshold: f64) -> Vec<(i64, u64)> {
     let n = items.len();
     if n == 0 {
         return Vec::new();
     }
     // Pre-tokenize once.
     let tokenized: Vec<Vec<String>> = items.iter().map(|(_, p)| tokenize(p)).collect();
-    // Each item starts as its own cluster.
-    let mut cluster_of: Vec<usize> = (0..n).collect();
-    // Greedy single-linkage merges: repeatedly merge the closest pair >= T.
-    loop {
-        let mut best: Option<(usize, usize, f64)> = None;
-        for i in 0..n {
-            for j in (i + 1)..n {
-                if cluster_of[i] == cluster_of[j] {
-                    continue;
-                }
-                let sim = jaccard(&tokenized[i], &tokenized[j]);
-                if sim >= L2_SIMILARITY_THRESHOLD {
-                    match best {
-                        Some((_, _, bs)) if bs >= sim => {}
-                        _ => best = Some((i, j, sim)),
-                    }
-                }
-            }
+    // Union-find with path compression.
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
         }
-        match best {
-            Some((i, j, _)) => {
-                let src = cluster_of[i];
-                let dst = cluster_of[j];
-                let target = src.min(dst);
-                for c in cluster_of.iter_mut() {
-                    if *c == src || *c == dst {
-                        *c = target;
-                    }
+        x
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if find(&mut parent, i) == find(&mut parent, j) {
+                continue;
+            }
+            if jaccard(&tokenized[i], &tokenized[j]) >= threshold {
+                let ri = find(&mut parent, i);
+                let rj = find(&mut parent, j);
+                if ri != rj {
+                    parent[ri] = rj;
                 }
             }
-            None => break,
         }
     }
-    // Compact cluster ids to 0..k.
-    let mut ids: Vec<usize> = cluster_of.clone();
-    ids.sort();
-    ids.dedup();
-    let mut compact_index: Vec<u64> = Vec::with_capacity(n);
-    compact_index.resize(*ids.last().unwrap_or(&0) + 1, 0);
-    for (idx, c) in ids.iter().enumerate() {
-        compact_index[*c] = idx as u64;
+    // Compact cluster ids to 0..k in order of first appearance.
+    let mut id_of_root: Vec<u64> = vec![0; n];
+    let mut next_id: u64 = 0;
+    for i in 0..n {
+        let root = find(&mut parent, i);
+        if id_of_root[root] == 0 {
+            // reserve: first root gets id 0
+            next_id += 1;
+            id_of_root[root] = next_id;
+        }
     }
     items
         .iter()
         .enumerate()
-        .map(|(i, (id, _))| (*id, compact_index[cluster_of[i]]))
+        .map(|(i, (id, _))| (*id, id_of_root[find(&mut parent, i)] - 1))
         .collect()
 }
 
@@ -139,9 +141,43 @@ pub fn cluster_key(l1: &str, members: &[(i64, String)]) -> String {
     format!("{:016x}", xxh3_64(buf.as_bytes()))
 }
 
+/// Deterministic group key for a MANUAL group (merge / split). Derived only
+/// from the sorted set of normalized prompt hashes — independent of L1 and
+/// of membership ordering — and namespaced so it can never collide with an
+/// auto-computed `cluster_key`. Re-using the same formula on the same
+/// prompts yields the same key, so identical prompts naturally re-join the
+/// manual group even without an explicit binding.
+pub fn manual_key(members: &[(i64, String)]) -> String {
+    let mut prompt_hashes: Vec<u64> = members
+        .iter()
+        .map(|(_, p)| xxh3_64(crate::grouper::normalize_prompt(p).as_bytes()))
+        .collect();
+    prompt_hashes.sort();
+    prompt_hashes.dedup();
+    let mut buf = String::from("manual:");
+    for h in prompt_hashes {
+        buf.push_str(&format!("{:016x}", h));
+    }
+    format!("{:016x}", xxh3_64(buf.as_bytes()))
+}
+
 /// Re-cluster L2 for a given source. Reads all images grouped by L1,
-/// clusters each L1's prompts via Jaccard, writes stable cluster keys.
-pub fn recluster_l2(db: &Db, source_id: i64) -> anyhow::Result<()> {
+/// clusters each L1's prompts via Jaccard at the given threshold, writes
+/// stable cluster keys. The threshold is propagated by the caller so the
+/// Settings slider can re-cluster live without a re-scan.
+pub fn recluster_l2(db: &Db, source_id: i64, threshold: f64) -> anyhow::Result<()> {
+    let keys = HashSet::new();
+    recluster_l2_keys(db, source_id, &keys, threshold)
+}
+
+/// Incremental variant of `recluster_l2`: only L1 groups listed in `only`
+/// are re-clustered. An empty set means "all groups" (full pass).
+pub fn recluster_l2_keys(
+    db: &Db,
+    source_id: i64,
+    only: &HashSet<String>,
+    threshold: f64,
+) -> anyhow::Result<()> {
     let conn = db.0.lock().unwrap();
     let mut stmt = conn.prepare(
         "SELECT id, prompt_pos, group_key_l1 FROM images
@@ -159,6 +195,27 @@ pub fn recluster_l2(db: &Db, source_id: i64) -> anyhow::Result<()> {
         all.push(r?);
     }
     drop(stmt);
+    // Manual group overrides (level 2): images pinned to a fixed key must
+    // keep it regardless of what auto-clustering computes — this is what
+    // makes merges/splits survive re-clustering. Queried on the SAME
+    // connection we already hold (calling a Db method here would re-lock
+    // the Mutex and deadlock).
+    let mut binding_of: std::collections::HashMap<i64, String> =
+        std::collections::HashMap::new();
+    {
+        let mut bstmt = conn.prepare(
+            "SELECT b.image_id, b.group_key
+             FROM manual_group_bindings b JOIN images i ON i.id=b.image_id
+             WHERE b.level=?1 AND i.source_id=?2",
+        )?;
+        let brows = bstmt.query_map(rusqlite::params![2, source_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for r in brows {
+            let (id, key) = r?;
+            binding_of.insert(id, key);
+        }
+    }
 
     // Group by L1.
     let mut by_l1: std::collections::HashMap<String, Vec<(i64, String)>> =
@@ -169,7 +226,10 @@ pub fn recluster_l2(db: &Db, source_id: i64) -> anyhow::Result<()> {
 
     let mut updates: Vec<(i64, String)> = Vec::new();
     for (l1, members) in by_l1.iter() {
-        let clusters = cluster_l1(members);
+        if !only.is_empty() && !only.contains(l1) {
+            continue;
+        }
+        let clusters = cluster_l1(members, threshold);
         // Bucket image_ids per cluster index.
         let mut buckets: std::collections::HashMap<u64, Vec<(i64, String)>> =
             std::collections::HashMap::new();
@@ -186,12 +246,20 @@ pub fn recluster_l2(db: &Db, source_id: i64) -> anyhow::Result<()> {
                 continue;
             }
             let key = cluster_key(l1, &mems);
-            for (id, _) in mems {
-                updates.push((id, key.clone()));
+            for (id, _) in &mems {
+                // A pinned image wins over the auto-computed key. Pinned
+                // images with the same binding key stay together; a split
+                // image with a different binding key separates even if the
+                // auto-cluster would have merged it back.
+                let final_key = binding_of.get(id).cloned().unwrap_or_else(|| key.clone());
+                updates.push((*id, final_key));
             }
         }
     }
 
+    if updates.is_empty() {
+        return Ok(());
+    }
     let tx = conn.unchecked_transaction()?;
     for (id, key) in &updates {
         tx.execute(
@@ -201,4 +269,44 @@ pub fn recluster_l2(db: &Db, source_id: i64) -> anyhow::Result<()> {
     }
     tx.commit()?;
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cluster_splits_distinct_prompts() {
+        let items = vec![
+            (1i64, "masterpiece, a girl in red".to_string()),
+            (2i64, "masterpiece, a girl in red".to_string()),
+            (3i64, "a dragon over a castle".to_string()),
+        ];
+        let out = cluster_l1(&items, 0.3);
+        let c1 = out.iter().find(|(id, _)| *id == 1).unwrap().1;
+        let c2 = out.iter().find(|(id, _)| *id == 2).unwrap().1;
+        let c3 = out.iter().find(|(id, _)| *id == 3).unwrap().1;
+        assert_eq!(c1, c2);
+        assert_ne!(c1, c3);
+    }
+
+    #[test]
+    fn chain_merges_single_linkage() {
+        // 1~2 and 2~3 similar at threshold, 1~3 disjoint: all three merge.
+        let items = vec![
+            (1i64, "alpha beta".to_string()),
+            (2i64, "beta gamma".to_string()),
+            (3i64, "gamma delta".to_string()),
+        ];
+        let out = cluster_l1(&items, 0.33);
+        let c1 = out.iter().find(|(id, _)| *id == 1).unwrap().1;
+        let c2 = out.iter().find(|(id, _)| *id == 2).unwrap().1;
+        let c3 = out.iter().find(|(id, _)| *id == 3).unwrap().1;
+        assert_eq!(c1, c2);
+        assert_eq!(c2, c3);
+    }
+
+    #[test]
+    fn empty_input() {
+        assert!(cluster_l1(&[], 0.3).is_empty());
+    }
 }

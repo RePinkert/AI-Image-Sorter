@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 use sysinfo::System;
 
 pub struct FoundSource {
@@ -74,8 +75,17 @@ fn dirs_home() -> Option<PathBuf> {
 }
 
 pub fn list_images_in(dir: &Path) -> Vec<PathBuf> {
+    list_images_with_newest(dir).0
+}
+
+/// One-pass directory walk that returns the image paths AND the newest
+/// file mtime (epoch seconds). Avoids the previous two-phase pattern of
+/// walking the tree and then `stat`-ing every file again just to compute
+/// the change-detection watermark — both come out of the same traversal.
+pub fn list_images_with_newest(dir: &Path) -> (Vec<PathBuf>, i64) {
     let mut files = Vec::new();
-    let exts = ["png", "jpg", "jpeg", "webp", "bmp"];
+    let mut newest: i64 = 0;
+    let exts = ["png", "jpg", "jpeg", "webp"];
     for entry in walkdir::WalkDir::new(dir)
         .max_depth(2)
         .into_iter()
@@ -90,10 +100,21 @@ pub fn list_images_in(dir: &Path) -> Vec<PathBuf> {
             .and_then(|e| e.to_str())
             .map(|s| s.to_lowercase())
             .unwrap_or_default();
-        if exts.contains(&ext.as_str()) {
-            files.push(path.to_path_buf());
+        if !exts.contains(&ext.as_str()) {
+            continue;
+        }
+        files.push(path.to_path_buf());
+        if let Ok(md) = entry.metadata() {
+            if let Ok(modified) = md.modified() {
+                if let Ok(age) = modified.duration_since(UNIX_EPOCH) {
+                    let m = age.as_secs() as i64;
+                    if m > newest {
+                        newest = m;
+                    }
+                }
+            }
         }
     }
     files.sort();
-    files
+    (files, newest)
 }

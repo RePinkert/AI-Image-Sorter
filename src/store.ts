@@ -1,8 +1,32 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import type { GroupInfo, Granularity, LabelRow, SourceRow } from './types'
+import type { GroupInfo, Granularity, LabelRow, SourceRow, SyncProgress } from './types'
 
-export type View = 'import' | 'groups' | 'swipe' | 'arena' | 'settings'
+export type View = 'import' | 'groups' | 'swipe' | 'arena' | 'folder' | 'settings'
+
+export interface SyncProgressState {
+  active: boolean
+  stage: string
+  sourceIndex: number
+  sourceTotal: number
+  sourcePath: string
+  found: number
+  processed: number
+  added: number
+  pending: number
+}
+
+export const IDLE_SYNC_PROGRESS: SyncProgressState = {
+  active: false,
+  stage: '',
+  sourceIndex: 0,
+  sourceTotal: 0,
+  sourcePath: '',
+  found: 0,
+  processed: 0,
+  added: 0,
+  pending: 0,
+}
 
 interface AppState {
   view: View
@@ -12,6 +36,18 @@ interface AppState {
   currentGroupKey: string | null
   granularity: Granularity
   labels: LabelRow[]
+  // L2 prompt-similarity Jaccard threshold — surfaced as a Settings slider
+  // and persisted across launches. Default 0.3 matches
+  // clustering.rs::DEFAULT_L2_THRESHOLD. The lower default is needed
+  // because AI prompts share a long common prefix (quality tags, style
+  // keywords) and only differ in a short varying suffix — Jaccard on
+  // raw tokens sees high overlap even for visually distinct outputs.
+  // The recluster_source command applies the user's choice live.
+  l2Threshold: number
+  syncStatus: 'idle' | 'syncing' | 'success' | 'error'
+  syncMessage: string
+  syncUpdatedAt: string | null
+  syncProgress: SyncProgressState
   setView: (v: View) => void
   setSources: (s: SourceRow[]) => void
   setCurrentSourceId: (id: number | null) => void
@@ -19,6 +55,10 @@ interface AppState {
   setCurrentGroupKey: (key: string | null) => void
   setGranularity: (g: Granularity) => void
   setLabels: (l: LabelRow[]) => void
+  setL2Threshold: (t: number) => void
+  setSyncState: (status: AppState['syncStatus'], message: string) => void
+  applySyncProgress: (p: SyncProgress) => void
+  resetSyncProgress: () => void
 }
 
 // Persist only UI/display state, not the bulky fetched data, so a relaunch
@@ -33,6 +73,11 @@ export const useStore = create<AppState>()(
       currentGroupKey: null,
       granularity: 3,
       labels: [],
+      l2Threshold: 0.3,
+      syncStatus: 'idle',
+      syncMessage: '',
+      syncUpdatedAt: null,
+      syncProgress: IDLE_SYNC_PROGRESS,
       setView: (v) => set({ view: v }),
       setSources: (s) => set({ sources: s }),
       setCurrentSourceId: (id) => set({ currentSourceId: id }),
@@ -40,12 +85,31 @@ export const useStore = create<AppState>()(
       setCurrentGroupKey: (key) => set({ currentGroupKey: key }),
       setGranularity: (g) => set({ granularity: g }),
       setLabels: (l) => set({ labels: l }),
+      setL2Threshold: (t) => set({ l2Threshold: t }),
+      setSyncState: (status, message) => set({ syncStatus: status, syncMessage: message, syncUpdatedAt: new Date().toISOString() }),
+      applySyncProgress: (p) =>
+        set({
+          syncProgress: {
+            active: true,
+            stage: p.stage,
+            sourceIndex: p.source_index,
+            sourceTotal: p.source_total,
+            sourcePath: p.source_path,
+            found: p.found,
+            processed: p.processed,
+            added: p.added,
+            pending: p.pending,
+          },
+        }),
+      resetSyncProgress: () => set({ syncProgress: { ...IDLE_SYNC_PROGRESS } }),
     }),
     {
       name: 'ai-image-sorter-ui',
       partialize: (s) => ({
         currentSourceId: s.currentSourceId,
         granularity: s.granularity,
+        currentGroupKey: s.currentGroupKey,
+        l2Threshold: s.l2Threshold,
       }),
     },
   ),

@@ -5,11 +5,34 @@ pub struct ImageMeta {
     pub prompt_pos: String,
     pub prompt_neg: String,
     pub checkpoint: String,
+    /// The primary diffusion model, kept separate from checkpoint for
+    /// workflows that use an UNET/Diffusion Model loader directly.
+    pub diffusion_model: String,
+    /// Ordered model-related nodes serialized for later workflow analysis.
+    pub model_chain: Vec<ModelChainItem>,
     pub loras: Vec<LoraInfo>,
     pub vae: String,
     pub samplers: Vec<SamplerInfo>,
     pub raw_ok: bool,
     pub source_kind: SourceKind,
+    /// Image dimensions in pixels, read without decoding pixels.
+    pub width: u32,
+    pub height: u32,
+    /// Workflow identity: XXH3 of the canonical topology
+    /// (sorted node classes + class-pair edges), independent of the
+    /// model/LoRA files actually loaded.
+    pub workflow_key: String,
+    /// Canonical topology `{"t": [...], "e": [...]}` used for template
+    /// (sub)graph matching.
+    pub workflow_graph_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelChainItem {
+    pub node_type: String,
+    pub model: String,
+    pub strength: Option<f64>,
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -39,13 +62,6 @@ pub struct SamplerInfo {
     pub steps: i64,
     pub cfg: f64,
     pub scheduler: String,
-}
-
-pub fn empty_comfy() -> ImageMeta {
-    ImageMeta {
-        source_kind: SourceKind::Comfy,
-        ..Default::default()
-    }
 }
 
 pub mod a1111_parse;

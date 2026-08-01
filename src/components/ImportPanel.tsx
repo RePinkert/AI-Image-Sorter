@@ -2,11 +2,12 @@ import { useEffect, useState } from 'react'
 import {
   addSourceAndScan,
   findComfySources,
+  findWorkflowTemplates,
   listGroups,
   listSources,
   pickFolder,
 } from '../api'
-import type { FoundSourceDto, ScanResult, SourceRow } from '../types'
+import type { FoundSourceDto, ScanResult, SourceRow, WorkflowTemplateDto } from '../types'
 import { useStore } from '../store'
 
 export function ImportPanel() {
@@ -16,11 +17,13 @@ export function ImportPanel() {
   const setCurrentSourceId = useStore((s) => s.setCurrentSourceId)
   const sources = useStore((s) => s.sources)
   const [found, setFound] = useState<FoundSourceDto[]>([])
+  const [templates, setTemplates] = useState<WorkflowTemplateDto[]>([])
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState('')
 
   useEffect(() => {
     findComfySources().then(setFound).catch(() => {})
+    findWorkflowTemplates().then(setTemplates).catch(() => {})
     listSources().then(setSources).catch(() => {})
   }, [setSources])
 
@@ -77,6 +80,18 @@ export function ImportPanel() {
           手动选择文件夹
         </button>
       </div>
+
+      <h3 style={{ marginTop: 16 }}>已保存的 ComfyUI Workflow</h3>
+      {templates.length === 0 && <p className="muted">未找到已保存 workflow。</p>}
+      <ul className="source-list">
+        {templates.map((template) => (
+          <li key={template.path}>
+            <span className="path">{template.name}</span>
+            <span className="origin">{template.node_count} 节点 · {template.diffusion_models.join(', ') || '模型未识别'}</span>
+            <span className="origin" title={template.path}>{template.topology_signature}</span>
+          </li>
+        ))}
+      </ul>
 
       <h3 style={{ marginTop: 16 }}>已注册的源</h3>
       {sources.length === 0 && <p className="muted">暂无已注册的源。</p>}

@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useMemo, useState } from 'react'
+import { useEffect, useCallback, useMemo, useRef, useState } from 'react'
 import { motion, type PanInfo } from 'framer-motion'
 import {
   arenaSuggested,
@@ -7,12 +7,26 @@ import {
   listLabels,
   setImageLabel,
   swipe as swipeApi,
+  toggleHidden as toggleHiddenApi,
 } from '../api'
 import type { ImageRow } from '../types'
 import { useStore } from '../store'
+import { Lightbox } from './Lightbox'
+import { Popover } from './Popover'
+import { ImageMetaPopover } from './ImageMetaPopover'
 
 const GESTURES = ['left', 'right', 'up', 'down'] as const
 type Gesture = (typeof GESTURES)[number]
+
+// Fly-off displacement per gesture. Tinder-style: left/right to fling
+// horizontally, up/down to fling vertically. The card animates to this
+// offset + opacity 0 then advances to the next card.
+const EXIT_VEC: Record<Gesture, { x: number; y: number }> = {
+  left: { x: -1400, y: 0 },
+  right: { x: 1400, y: 0 },
+  up: { x: 0, y: -1000 },
+  down: { x: 0, y: 1000 },
+}
 
 export function SwipeDeck() {
   const setView = useStore((s) => s.setView)
@@ -25,12 +39,25 @@ export function SwipeDeck() {
   const [scores, setScores] = useState<Record<number, number>>({})
   const [arenaHint, setArenaHint] = useState<{ left: number; right: number } | null>(null)
   const [busy, setBusy] = useState(false)
+  // Current fly-off vector; while non-null the top card is animating out
+  // and gesture inputs are ignored. onAnimationComplete clears it and
+  // advances the deck.
+  const [exitVec, setExitVec] = useState<{ x: number; y: number } | null>(null)
+  // Latest gesture that fired, to drive the matching button's flash. Keyed
+  // off a monotonic counter so repeated same-direction gestures re-trigger
+  // the CSS animation via React `key` remount.
+  const [flash, setFlash] = useState<{ g: Gesture; n: number } | null>(null)
+  const [lightbox, setLightbox] = useState<string | null>(null)
+  const [popoverOpen, setPopoverOpen] = useState(false)
+  const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
     if (currentGroupKey == null) return
     listGroupImages(currentGroupKey, granularity).then((imgs) => {
       setImages(imgs)
       setIdx(0)
+      setExitVec(null)
+      setBusy(false)
       const sc: Record<number, number> = {}
       imgs.forEach((i) => {
         if (i.score != null) sc[i.id] = i.score
@@ -43,43 +70,87 @@ export function SwipeDeck() {
   const current = images[idx]
   const next = images[idx + 1]
 
+  // Trigger a verdict: kick off the fly-off animation, flash the button,
+  // and fire the score/label/suggestion IPCs in the background. Visual
+  // advance is decoupled from IPC success — onAnimationComplete advances
+  // the deck regardless. Wrapped so a thrown IPC can never leak `busy`.
   const applyGesture = useCallback(
     async (gesture: Gesture) => {
-      if (!current || busy) return
+      if (!current || busy || exitVec) return
       setBusy(true)
-      const label = labels.find((l) => l.gesture === gesture)
-      if (label) {
-        await setImageLabel(current.id, label.id, true).catch(() => {})
-      }
-      if (gesture !== 'down') {
-        const newScore = await swipeApi(current.id, gesture)
-        setScores((s) => ({ ...s, [current.id]: newScore }))
-      }
-      // arena suggestion: compare with next
-      if (next) {
-        const suggested = await arenaSuggested(current.id, next.id).catch(() => false)
-        if (suggested) {
-          setArenaHint({ left: current.id, right: next.id })
+      setExitVec(EXIT_VEC[gesture])
+      setFlash({ g: gesture, n: (flash?.n ?? 0) + 1 })
+      if (flashTimer.current) clearTimeout(flashTimer.current)
+      flashTimer.current = setTimeout(() => setFlash(null), 320)
+      try {
+        const label = labels.find((l) => l.gesture === gesture)
+        if (label) {
+          await setImageLabel(current.id, label.id, true).catch(() => {})
         }
+        if (gesture !== 'down') {
+          const ns = await swipeApi(current.id, gesture).catch(() => null)
+          if (ns != null) setScores((s) => ({ ...s, [current.id]: ns }))
+        }
+        if (next) {
+          const suggested = await arenaSuggested(current.id, next.id).catch(() => false)
+          if (suggested) setArenaHint({ left: current.id, right: next.id })
+        }
+      } finally {
+        // busy is also released by onAnimationComplete as a safety net; we
+        // intentionally don't release here so a slow IPC can't unblock the
+        // guard before the fly-off finishes (double-firing would re-enter
+        // applyGesture while the card is mid-animation).
       }
-      setIdx((i) => i + 1)
-      setBusy(false)
     },
-    [current, next, busy, labels, scores],
+    [current, next, busy, exitVec, labels, flash],
   )
 
-  // keyboard
+  // keyboard — Tinder-style: left = 差 / right = 优 / up = 待优化 / down = 跳过.
+  // preventDefault so arrow keys don't scroll the page. Backspace rewinds
+  // the cursor (does NOT roll back the already-committed score). H hides
+  // the current card (score pinned to 0, advances to the next card).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'ArrowLeft') applyGesture('left')
-      else if (e.key === 'ArrowRight') applyGesture('right')
-      else if (e.key === 'ArrowUp') applyGesture('up')
-      else if (e.key === 'ArrowDown') applyGesture('down')
-      else if (e.key === 'Backspace') setIdx((i) => Math.max(0, i - 1))
+      if (lightbox) return
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault()
+        applyGesture('left')
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault()
+        applyGesture('right')
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        applyGesture('up')
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        applyGesture('down')
+      } else if (e.key === 'h' || e.key === 'H') {
+        e.preventDefault()
+        hideCard()
+      } else if (e.key === 'Backspace') {
+        setIdx((i) => Math.max(0, i - 1))
+      }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [applyGesture])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [applyGesture, lightbox])
+
+  // Hide the current card: pin its score to 0 (done backend-side) and
+  // fly it away like a swipe so the deck advances. Visual advance is
+  // decoupled from IPC success — onAnimationComplete advances regardless.
+  const hideCard = useCallback(async () => {
+    if (!current || busy || exitVec) return
+    setBusy(true)
+    setPopoverOpen(false)
+    setExitVec(EXIT_VEC.down)
+    try {
+      await toggleHiddenApi(current.id, true).catch(() => {})
+      setScores((s) => ({ ...s, [current.id]: 0 }))
+    } finally {
+      // busy released by onAnimationComplete (same contract as applyGesture)
+    }
+  }, [current, busy, exitVec])
 
   function onDragEnd(_: unknown, info: PanInfo) {
     const { offset, velocity } = info
@@ -144,6 +215,7 @@ export function SwipeDeck() {
         <span className="counter">
           {idx + 1}/{images.length}
         </span>
+        <button onClick={() => setView('folder')}>文件夹视角</button>
         <button onClick={() => setView('arena')}>擂台模式</button>
       </div>
 
@@ -157,11 +229,31 @@ export function SwipeDeck() {
           className="card"
           key={current.id}
           drag
-          dragSnapToOrigin
+          dragSnapToOrigin={false}
           onDragEnd={onDragEnd}
-          whileDrag={{ scale: 1.02 }}
+          whileDrag={{ scale: 1.04 }}
+          animate={exitVec ? { ...exitVec, opacity: 0 } : false}
+          transition={{ type: 'tween', duration: 0.22, ease: 'easeIn' }}
+          onAnimationComplete={() => {
+            if (!exitVec) return
+            setExitVec(null)
+            setIdx((i) => i + 1)
+            setBusy(false)
+          }}
         >
-          <img src={assetUrl(current.abs_path)} alt={current.filename} draggable={false} />
+          <img
+            src={assetUrl(current.abs_path)}
+            alt={current.filename}
+            draggable={false}
+            onClick={() => setLightbox(current.abs_path)}
+          />
+          <Popover
+            open={popoverOpen}
+            onOpenChange={setPopoverOpen}
+            trigger={<span className="more-btn">更多 ▾</span>}
+          >
+            <ImageMetaPopover img={current} onHide={hideCard} />
+          </Popover>
           <div className="card-badge">
             <span className="score">{score.toFixed(0)}</span>
             <span className="seed">seed: {current.seed}</span>
@@ -169,41 +261,67 @@ export function SwipeDeck() {
         </motion.div>
       </div>
 
-      <div className="swipe-meta">
-        <details>
-          <summary>Prompt / 元数据</summary>
-          <div className="meta-grid">
-            <div>
-              <strong>正 prompt</strong>
-              <pre>{current.prompt_pos || '(无)'}</pre>
-            </div>
-            <div>
-              <strong>负 prompt</strong>
-              <pre>{current.prompt_neg || '(无)'}</pre>
-            </div>
-            <div>
-              <strong>模型</strong>
-              <pre>{current.checkpoint || '(无)'}</pre>
-            </div>
-            <div>
-              <strong>LoRA / VAE</strong>
-              <pre>{current.loras || '(无)'}{"\n"}VAE: {current.vae || '(默认)'}</pre>
-            </div>
-          </div>
-        </details>
+      {/* Cross keypad: up = 待优化, mid = 差 / [empty] / 优, down = 跳过.
+          Layout matches arrow-key directions so muscle memory from the
+          keyboard carries straight over. */}
+      <div className="gesture-cross">
+        <div className="gesture-row">
+          <button
+            className="gesture-up ghost"
+            onClick={() => applyGesture('up')}
+            key={flash?.g === 'up' ? `up-${flash.n}` : 'up'}
+            data-flash={flash?.g === 'up' ? '1' : undefined}
+          >
+            {labels.find((l) => l.gesture === 'up')?.name ?? '待优化'}
+            <span className="kbd">↑</span>
+          </button>
+        </div>
+        <div className="gesture-row">
+          <button
+            className="gesture-left"
+            onClick={() => applyGesture('left')}
+            key={flash?.g === 'left' ? `left-${flash.n}` : 'left'}
+            data-flash={flash?.g === 'left' ? '1' : undefined}
+          >
+            {labels.find((l) => l.gesture === 'left')?.name ?? '差'}
+            <span className="kbd">←</span>
+          </button>
+          <span className="gesture-center" aria-hidden />
+          <button
+            className="gesture-right"
+            onClick={() => applyGesture('right')}
+            key={flash?.g === 'right' ? `right-${flash.n}` : 'right'}
+            data-flash={flash?.g === 'right' ? '1' : undefined}
+          >
+            {labels.find((l) => l.gesture === 'right')?.name ?? '优'}
+            <span className="kbd">→</span>
+          </button>
+        </div>
+        <div className="gesture-row">
+          <button
+            className="gesture-down ghost"
+            onClick={() => applyGesture('down')}
+            key={flash?.g === 'down' ? `down-${flash.n}` : 'down'}
+            data-flash={flash?.g === 'down' ? '1' : undefined}
+          >
+            {labels.find((l) => l.gesture === 'down')?.name ?? '跳过'}
+            <span className="kbd">↓</span>
+          </button>
+        </div>
       </div>
+      <div className="gesture-extra-row">
+        <button
+          className="gesture-hide"
+          onClick={hideCard}
+          disabled={busy}
+          title="屏蔽（赋 0 分，不参与评分，可在文件夹视角恢复）"
+        >
+          屏蔽 <span className="kbd">H</span>
+        </button>
+      </div>
+      <p className="muted hint">键盘 ← → ↑ ↓ 触发判定 · H 屏蔽当前卡 · Backspace 回退游标 · 单击图片放大 · "更多"查看 Prompt / 屏蔽</p>
 
-      <div className="gesture-bar">
-        {GESTURES.map((g) => {
-          const label = labels.find((l) => l.gesture === g)
-          return (
-            <button key={g} className={`gesture-${g}`} onClick={() => applyGesture(g)}>
-              {label ? label.name : g}
-            </button>
-          )
-        })}
-      </div>
-      <p className="muted hint">键盘 ← → ↑ ↓ / Backspace 撤销</p>
+      {lightbox && <Lightbox src={assetUrl(lightbox)} onClose={() => setLightbox(null)} />}
     </div>
   )
 }

@@ -5,6 +5,67 @@ import { useStore } from '../store'
 
 const GESTURES = ['left', 'right', 'up', 'down']
 
+function ClusterSection() {
+  const currentSourceId = useStore((s) => s.currentSourceId)
+  const l2Threshold = useStore((s) => s.l2Threshold)
+  const setL2Threshold = useStore((s) => s.setL2Threshold)
+  const setGroups = useStore((s) => s.setGroups)
+  const granularity = useStore((s) => s.granularity)
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState<string | null>(null)
+
+  async function apply(threshold: number) {
+    if (currentSourceId == null) {
+      setMsg('请先在分组列表选择一个数据源')
+      return
+    }
+    setBusy(true)
+    setMsg(null)
+    try {
+      const { reclusterSource } = await import('../api')
+      await reclusterSource(currentSourceId, threshold)
+      const { listGroups } = await import('../api')
+      const g = await listGroups(currentSourceId, granularity)
+      setGroups(g)
+      setMsg(`已按阈值 ${threshold.toFixed(2)} 重新聚类 L2 组`)
+    } catch (e) {
+      setMsg(`重新聚类失败：${String(e)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="msg">
+      <h3 style={{ marginTop: 0 }}>Prompt 相似度阈值（L2 聚类）</h3>
+      <p className="hint">
+        Jaccard 阈值：AI prompt 通常共享长前缀（质量标签、艺术家名等）而仅在尾部短句上有差异。
+        因此即使视觉输出明显不同，文本 Jaccard 也常高达 0.8+。
+        推荐范围 <strong>0.25 ~ 0.35</strong> 以区分基于 prompt 小改动获得的不同输出。
+        值越低，聚合越松；值越高，要求 prompt 文本越接近才归入同一组。
+      </p>
+      <div className="row">
+        <input
+          type="range"
+          min={0.2}
+          max={0.8}
+          step={0.05}
+          value={l2Threshold}
+          disabled={busy}
+          onChange={(e) => setL2Threshold(Number(e.target.value))}
+        />
+        <span style={{ minWidth: 50, color: 'var(--accent)', fontWeight: 700 }}>
+          {l2Threshold.toFixed(2)}
+        </span>
+        <button disabled={busy} onClick={() => apply(l2Threshold)}>
+          应用并重新聚类
+        </button>
+      </div>
+      {msg && <p className="hint">{msg}</p>}
+    </div>
+  )
+}
+
 export function Settings() {
   const setView = useStore((s) => s.setView)
   const setLabels = useStore((s) => s.setLabels)
@@ -90,6 +151,8 @@ export function Settings() {
         <button onClick={() => setView('groups')}>返回</button>
         <ExportButtons />
       </div>
+
+      <ClusterSection />
     </div>
   )
 }

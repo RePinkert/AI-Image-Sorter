@@ -8,14 +8,6 @@
   "permissions": [
     "core:default",
     "log:default",
-    "dialog:default",
-    "fs:default",
-    "fs:read-all",
-    "fs:write-all",
-    "fs:allow-mkdir",
-    "fs:allow-write-text-file",
-    "fs:allow-read-text-file",
-    "fs:allow-read-dir",
-    "fs:allow-copy-file"
+    "dialog:default"
   ]
 }
