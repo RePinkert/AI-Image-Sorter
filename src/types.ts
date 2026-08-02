@@ -89,6 +89,7 @@ export interface ScanResult {
   source_id: number
   scanned: number
   groups: number
+  parse_errors: number
 }
 
 export interface SyncProgress {
@@ -100,6 +101,7 @@ export interface SyncProgress {
   processed: number
   added: number
   pending: number
+  parse_errors: number
 }
 
 export interface SyncAllResult {
@@ -107,6 +109,7 @@ export interface SyncAllResult {
   added: number
   pending: number
   reclustered: boolean
+  parse_errors: number
 }
 
 export interface GroupThumbDto {
@@ -116,10 +119,39 @@ export interface GroupThumbDto {
 
 export interface PromptRecommendation {
   prompt_text: string
+  prompt_neg: string
   diffusion_model: string
+  checkpoint: string
+  loras: Array<{
+    name: string
+    strength: number
+    clip_strength?: number
+  }>
+  vae: string
+  sampler: string
+  scheduler: string
+  steps: number
+  cfg: number
+  width: number
+  height: number
+  aspect_ratio: number
+  sample_count: number
   max_score: number
   avg_score: number
+  median_score: number
+  score_variance: number
+  confidence: number
+  example_image_ids: number[]
   image_count: number
+}
+
+export interface ActionResult {
+  action_id: string
+  image_id: number
+  score: number
+  hidden: boolean
+  label_id: number | null
+  committed_at: string
 }
 
 export interface ManualGroupResult {

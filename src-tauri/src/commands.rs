@@ -35,6 +35,7 @@ pub struct SyncProgressDto {
     pub processed: usize,
     pub added: usize,
     pub pending: usize,
+    pub parse_errors: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,6 +44,7 @@ pub struct SyncAllResult {
     pub added: usize,
     pub pending: usize,
     pub reclustered: bool,
+    pub parse_errors: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -98,6 +100,7 @@ pub struct ScanResult {
     pub source_id: i64,
     pub scanned: usize,
     pub groups: usize,
+    pub parse_errors: usize,
 }
 
 /// Canonicalize a path for stable cross-rescan matching so that the same
@@ -172,7 +175,7 @@ pub async fn add_source_and_scan(
         .map_err(|e| e.to_string())?;
         let backfilled = backfill_source(&db, source_id, &norm_source)?;
         let mut affected = stats.affected.clone();
-        affected.extend(backfilled);
+        affected.extend(backfilled.0);
         if !affected.is_empty() {
             let threshold = db.get_source_threshold(source_id).unwrap_or(crate::clustering::DEFAULT_L2_THRESHOLD);
             crate::clustering::recluster_l2_keys(&db, source_id, &affected, threshold)
@@ -182,6 +185,7 @@ pub async fn add_source_and_scan(
             source_id,
             scanned: stats.found,
             groups: stats.affected.len(),
+            parse_errors: stats.parse_errors + backfilled.1,
         })
     })
     .await
@@ -194,6 +198,7 @@ struct ScanStats {
     added: usize,
     kept: usize,
     pending: usize,
+    parse_errors: usize,
     /// Max mtime over PROCESSED files only (kept + added). Pending files
     /// are deliberately excluded so a deferred file keeps the source
     /// "changed" until a later cycle actually parses it — otherwise the
@@ -270,7 +275,14 @@ fn scan_source(
             }
         }
 
-        let meta = parse_file(f).unwrap_or_else(|_| ImageMeta::default());
+        let meta = match parse_file(f) {
+            Ok(meta) => meta,
+            Err(error) => {
+                stats.parse_errors += 1;
+                log::warn!("image metadata parse failed for source {source_id}: {error}");
+                ImageMeta::default()
+            }
+        };
         let keys = compute_group_keys(&meta, norm_source);
         stats.affected.insert(keys.l1.clone());
         let size = std::fs::metadata(f).map(|m| m.len() as i64).unwrap_or(0);
@@ -325,6 +337,9 @@ fn scan_source(
             workflow_graph_json: meta.workflow_graph_json.clone(),
             workflow_template_id: None,
             workflow_match_confidence: None,
+            generation_recipe_json: meta.generation_recipe_json(),
+            recipe_signature: meta.recipe_signature(),
+            parser_version: crate::metadata::PARSER_VERSION.to_string(),
         };
         db.insert_image(&row).map_err(|e| e.to_string())?;
         stats.added += 1;
@@ -347,17 +362,25 @@ fn backfill_source(
     db: &crate::db::Db,
     source_id: i64,
     norm_source: &str,
-) -> Result<HashSet<String>, String> {
+) -> Result<(HashSet<String>, usize), String> {
     let rows = db
         .list_images_needing_reparse(source_id)
         .map_err(|e| e.to_string())?;
     let mut affected: HashSet<String> = HashSet::new();
+    let mut parse_errors = 0usize;
     for (id, abs) in rows {
         let path = PathBuf::from(&abs);
         if !path.exists() {
             continue;
         }
-        let meta = parse_file(&path).unwrap_or_else(|_| ImageMeta::default());
+        let meta = match parse_file(&path) {
+            Ok(meta) => meta,
+            Err(error) => {
+                parse_errors += 1;
+                log::warn!("image metadata backfill failed for source {source_id}: {error}");
+                ImageMeta::default()
+            }
+        };
         // Skip files that still yield nothing (e.g. still mid-write); the
         // next sync retries them. No churn for genuinely bare files.
         if !meta.raw_ok && meta.workflow_key.is_empty() && meta.prompt_pos.is_empty() {
@@ -403,13 +426,16 @@ fn backfill_source(
             workflow_graph_json: meta.workflow_graph_json.clone(),
             workflow_template_id: None,
             workflow_match_confidence: None,
+            generation_recipe_json: meta.generation_recipe_json(),
+            recipe_signature: meta.recipe_signature(),
+            parser_version: crate::metadata::PARSER_VERSION.to_string(),
         };
         let new_l1 = db
             .update_reparsed_image(id, &row, source_id)
             .map_err(|e| e.to_string())?;
         affected.insert(new_l1);
     }
-    Ok(affected)
+    Ok((affected, parse_errors))
 }
 
 /// Rescan the ComfyUI workflow template directories of every registered
@@ -492,11 +518,12 @@ fn run_sync(
     let source_total = sources.len();
     let mut total_added = 0usize;
     let mut total_pending = 0usize;
+    let mut total_parse_errors = 0usize;
     let mut any_recluster = false;
     let mut any_changed = false;
 
     for (index, src) in sources.iter().enumerate() {
-        let emit = |stage: &str, found: usize, processed: usize, added: usize, pending: usize| {
+        let emit = |stage: &str, found: usize, processed: usize, added: usize, pending: usize, parse_errors: usize| {
             let _ = app.emit(
                 "sync-progress",
                 SyncProgressDto {
@@ -508,6 +535,7 @@ fn run_sync(
                     processed,
                     added,
                     pending,
+                    parse_errors,
                 },
             );
         };
@@ -552,17 +580,26 @@ fn run_sync(
             processed = stats.kept + stats.added;
             added = stats.added;
             pending = stats.pending;
+            total_parse_errors += stats.parse_errors;
             total_added += stats.added;
             total_pending += stats.pending;
-            emit("scan", found, processed, added, pending);
+            emit("scan", found, processed, added, pending, stats.parse_errors);
         }
 
-        let backfilled = backfill_source(db, src.id, &norm_source)?;
+        let (backfilled, backfill_parse_errors) = backfill_source(db, src.id, &norm_source)?;
         let backfilled_count = backfilled.len();
+        total_parse_errors += backfill_parse_errors;
         affected.extend(backfilled);
 
         if !affected.is_empty() {
-            emit("recluster", found, processed + backfilled_count, added, pending);
+            emit(
+                "recluster",
+                found,
+                processed + backfilled_count,
+                added,
+                pending,
+                backfill_parse_errors,
+            );
             crate::clustering::recluster_l2_keys(
                 db,
                 src.id,
@@ -573,7 +610,14 @@ fn run_sync(
             any_recluster = true;
         }
         if changed || backfilled_count > 0 {
-            emit("scan-done", found, processed + backfilled_count, added, pending);
+            emit(
+                "scan-done",
+                found,
+                processed + backfilled_count,
+                added,
+                pending,
+                backfill_parse_errors,
+            );
         }
     }
 
@@ -608,6 +652,7 @@ fn run_sync(
         added: total_added,
         pending: total_pending,
         reclustered: any_recluster,
+        parse_errors: total_parse_errors,
     })
 }
 
@@ -692,21 +737,34 @@ pub fn swipe(
     gesture: String,
     state: State<'_, AppState>,
 ) -> Result<f64, String> {
-    let conn = state.db.0.lock().unwrap();
-    let cur: Option<f64> = conn
-        .query_row(
-            "SELECT internal_score FROM scores WHERE image_id=?1",
-            rusqlite::params![image_id],
-            |r| r.get(0),
-        )
-        .ok();
-    drop(conn);
-    let next = scoring::apply_swipe(cur, &gesture);
     state
         .db
-        .set_score(image_id, next, "swipe")
-        .map_err(|e| e.to_string())?;
-    Ok(next)
+        .apply_swipe_action(image_id, &gesture, None, None, None, None)
+        .map(|result| result.score)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn apply_swipe_action(
+    image_id: i64,
+    gesture: String,
+    label_id: Option<i64>,
+    session_id: Option<String>,
+    started_at: Option<String>,
+    context_signature: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<crate::db::ActionResult, String> {
+    state
+        .db
+        .apply_swipe_action(
+            image_id,
+            &gesture,
+            label_id,
+            session_id.as_deref(),
+            started_at.as_deref(),
+            context_signature.as_deref(),
+        )
+        .map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -715,46 +773,28 @@ pub struct ArenaArgs {
     pub left: i64,
     pub right: i64,
     pub winner_is_left: bool,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub context_signature: Option<String>,
 }
 
 #[tauri::command]
 pub fn arena_vote(args: ArenaArgs, state: State<'_, AppState>) -> Result<(f64, f64), String> {
-    let conn = state.db.0.lock().unwrap();
-    let l: f64 = conn
-        .query_row(
-            "SELECT internal_score FROM scores WHERE image_id=?1",
-            rusqlite::params![args.left],
-            |r| r.get(0),
-        )
-        .unwrap_or(scoring::BASE_SCORE);
-    let r: f64 = conn
-        .query_row(
-            "SELECT internal_score FROM scores WHERE image_id=?1",
-            rusqlite::params![args.right],
-            |r| r.get(0),
-        )
-        .unwrap_or(scoring::BASE_SCORE);
-    drop(conn);
-    let (nl, nr) = scoring::apply_arena(l, r, args.winner_is_left);
     state
         .db
-        .set_score(args.left, nl, "arena")
-        .map_err(|e| e.to_string())?;
-    state
-        .db
-        .set_score(args.right, nr, "arena")
-        .map_err(|e| e.to_string())?;
-    state
-        .db
-        .add_compare_pair(
+        .arena_vote_atomic(
             &args.group_key,
             args.left,
             args.right,
-            if args.winner_is_left { args.left } else { args.right },
-            (nl - l).abs(),
+            args.winner_is_left,
+            args.session_id.as_deref(),
+            args.started_at.as_deref(),
+            args.context_signature.as_deref(),
         )
-        .map_err(|e| e.to_string())?;
-    Ok((nl, nr))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -807,15 +847,30 @@ pub fn toggle_hidden(
 ) -> Result<(), String> {
     state
         .db
-        .set_image_hidden(image_id, hidden)
-        .map_err(|e| e.to_string())?;
-    if hidden {
-        state
-            .db
-            .set_score(image_id, 0.0, "hide")
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
+        .toggle_hidden_atomic(image_id, hidden, None, None, None)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn toggle_hidden_action(
+    image_id: i64,
+    hidden: bool,
+    session_id: Option<String>,
+    started_at: Option<String>,
+    context_signature: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<crate::db::ActionResult, String> {
+    state
+        .db
+        .toggle_hidden_atomic(
+            image_id,
+            hidden,
+            session_id.as_deref(),
+            started_at.as_deref(),
+            context_signature.as_deref(),
+        )
+        .map_err(|e| e.to_string())
 }
 
 /// Send an image file to the operating-system recycle bin (Windows:
@@ -1208,6 +1263,45 @@ pub fn recommend_prompts(
         .map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelemetryEventArgs {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub event_name: String,
+    pub schema_version: String,
+    #[serde(default)]
+    pub occurred_at: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    pub payload_json: String,
+    #[serde(default)]
+    pub severity: Option<String>,
+}
+
+#[tauri::command]
+pub fn record_telemetry_event(
+    args: TelemetryEventArgs,
+    state: State<'_, AppState>,
+) -> Result<crate::db::TelemetryEventResult, String> {
+    state
+        .db
+        .record_telemetry_event(
+            args.session_id.as_deref(),
+            &args.event_name,
+            &args.schema_version,
+            args.occurred_at.as_deref(),
+            args.mode.as_deref(),
+            &args.payload_json,
+            args.severity.as_deref(),
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn export_diagnostics(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    state.db.export_diagnostics(1000).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn db_path(app: tauri::AppHandle) -> String {
     let dir = app
@@ -1284,7 +1378,7 @@ mod e2e_tests {
             let norm = normalize_path(&PathBuf::from(&source.path));
             let (files, _) = comfy_finder::list_images_with_newest(&PathBuf::from(&norm));
             let stats = scan_source(&db, source.id, &norm, &files).unwrap();
-            let backfilled = backfill_source(&db, source.id, &norm).unwrap();
+            let (backfilled, _) = backfill_source(&db, source.id, &norm).unwrap();
             let mut affected = stats.affected.clone();
             affected.extend(backfilled);
             if !affected.is_empty() {

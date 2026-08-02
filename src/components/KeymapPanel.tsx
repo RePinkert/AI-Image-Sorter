@@ -144,7 +144,7 @@ export function KeymapPanel() {
       <div className="keymap-head">
         <h3 style={{ margin: 0 }}>键位设置（可视化）</h3>
         <div className="row" style={{ margin: 0 }}>
-          <button className="ghost" onClick={resetKeybindings} title="恢复所有按键为默认值">
+          <button type="button" className="ghost" onClick={resetKeybindings} title="恢复所有按键为默认值">
             恢复默认
           </button>
         </div>
@@ -193,7 +193,7 @@ export function KeymapPanel() {
                           {heldMods.length > 0 ? `已按：${heldMods.join('+')}，再按主键…` : '请按键（Esc 取消）'}
                         </span>
                       ) : (
-                        <button className="ghost" onClick={() => setCapturing(a.key)}>
+                        <button type="button" className="ghost" onClick={() => setCapturing(a.key)}>
                           改绑
                         </button>
                       )}

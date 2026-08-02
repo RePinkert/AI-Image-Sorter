@@ -45,10 +45,12 @@ pub fn run() {
             commands::delete_label,
             commands::set_image_label,
             commands::swipe,
+            commands::apply_swipe_action,
             commands::arena_vote,
             commands::arena_suggested,
             commands::list_group_images_all,
             commands::toggle_hidden,
+            commands::toggle_hidden_action,
             commands::trash_image,
             commands::recluster_source,
             commands::merge_groups,
@@ -58,6 +60,8 @@ pub fn run() {
             commands::db_path,
             commands::get_group_thumbnails,
             commands::recommend_prompts,
+            commands::record_telemetry_event,
+            commands::export_diagnostics,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

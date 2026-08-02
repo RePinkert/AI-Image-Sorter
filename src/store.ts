@@ -15,6 +15,25 @@ export interface SyncProgressState {
   processed: number
   added: number
   pending: number
+  parseErrors: number
+}
+
+export interface ReviewSession {
+  mode: 'swipe' | 'arena'
+  groupKey: string | null
+  granularity: Granularity
+  swipeOrder: number[]
+  swipeCursor: number
+  arenaPair: [number, number] | null
+}
+
+const EMPTY_REVIEW_SESSION: ReviewSession = {
+  mode: 'swipe',
+  groupKey: null,
+  granularity: 3,
+  swipeOrder: [],
+  swipeCursor: 0,
+  arenaPair: null,
 }
 
 export const IDLE_SYNC_PROGRESS: SyncProgressState = {
@@ -27,6 +46,7 @@ export const IDLE_SYNC_PROGRESS: SyncProgressState = {
   processed: 0,
   added: 0,
   pending: 0,
+  parseErrors: 0,
 }
 
 interface AppState {
@@ -53,6 +73,8 @@ interface AppState {
   syncMessage: string
   syncUpdatedAt: string | null
   syncProgress: SyncProgressState
+  reviewSession: ReviewSession
+  dataRevision: number
   setView: (v: View) => void
   setSources: (s: SourceRow[]) => void
   setCurrentSourceId: (id: number | null) => void
@@ -66,6 +88,8 @@ interface AppState {
   setSyncState: (status: AppState['syncStatus'], message: string) => void
   applySyncProgress: (p: SyncProgress) => void
   resetSyncProgress: () => void
+  updateReviewSession: (update: Partial<ReviewSession>) => void
+  bumpDataRevision: () => void
 }
 
 // Persist only UI/display state, not the bulky fetched data, so a relaunch
@@ -86,12 +110,30 @@ export const useStore = create<AppState>()(
       syncMessage: '',
       syncUpdatedAt: null,
       syncProgress: IDLE_SYNC_PROGRESS,
-      setView: (v) => set({ view: v }),
+      reviewSession: EMPTY_REVIEW_SESSION,
+      dataRevision: 0,
+      setView: (v) => set((s) => ({
+        view: v,
+        reviewSession: v === 'swipe' || v === 'arena'
+          ? { ...s.reviewSession, mode: v }
+          : s.reviewSession,
+      })),
       setSources: (s) => set({ sources: s }),
       setCurrentSourceId: (id) => set({ currentSourceId: id }),
       setGroups: (g) => set({ groups: g }),
-      setCurrentGroupKey: (key) => set({ currentGroupKey: key }),
-      setGranularity: (g) => set({ granularity: g }),
+      setCurrentGroupKey: (key) => set((s) => ({
+        currentGroupKey: key,
+        reviewSession: s.reviewSession.groupKey === key
+          ? s.reviewSession
+          : { ...EMPTY_REVIEW_SESSION, groupKey: key, granularity: s.granularity },
+      })),
+      setGranularity: (g) => set((s) => ({
+        granularity: g,
+        currentGroupKey: s.granularity === g ? s.currentGroupKey : null,
+        reviewSession: s.reviewSession.granularity === g
+          ? s.reviewSession
+          : { ...EMPTY_REVIEW_SESSION, granularity: g },
+      })),
       setLabels: (l) => set({ labels: l }),
       setL2Threshold: (t) => set({ l2Threshold: t }),
       setKeybinding: (action, binding) =>
@@ -110,9 +152,14 @@ export const useStore = create<AppState>()(
             processed: p.processed,
             added: p.added,
             pending: p.pending,
+            parseErrors: p.parse_errors,
           },
         }),
       resetSyncProgress: () => set({ syncProgress: { ...IDLE_SYNC_PROGRESS } }),
+      updateReviewSession: (update) => set((s) => ({
+        reviewSession: { ...s.reviewSession, ...update },
+      })),
+      bumpDataRevision: () => set((s) => ({ dataRevision: s.dataRevision + 1 })),
     }),
     {
       name: 'ai-image-sorter-ui',
@@ -122,6 +169,7 @@ export const useStore = create<AppState>()(
         currentGroupKey: s.currentGroupKey,
         l2Threshold: s.l2Threshold,
         keybindings: s.keybindings,
+        reviewSession: s.reviewSession,
       }),
     },
   ),

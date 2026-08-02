@@ -50,5 +50,6 @@ pub fn parse_jpeg_webp(path: &Path) -> Result<ImageMeta> {
             meta.height = dims.1;
         }
     }
+    meta.refresh_generation_recipe();
     Ok(meta)
 }

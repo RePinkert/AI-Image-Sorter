@@ -1,7 +1,7 @@
 import { useEffect } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { useStore } from './store'
-import { isWebDev, listGroups, listSources, syncAll } from './api'
+import { errorMessage, isWebDev, listGroups, listSources, syncAll } from './api'
 import type { SyncProgress } from './types'
 import { ImportPanel } from './components/ImportPanel'
 import { GroupList } from './components/GroupList'
@@ -9,6 +9,7 @@ import { SwipeDeck } from './components/SwipeDeck'
 import { Arena } from './components/Arena'
 import { FolderView } from './components/FolderView'
 import { Settings } from './components/Settings'
+import { track, trackDwell, trackView } from './telemetry'
 
 export default function App() {
   const view = useStore((s) => s.view)
@@ -25,6 +26,17 @@ export default function App() {
   const syncProgress = useStore((s) => s.syncProgress)
   const applySyncProgress = useStore((s) => s.applySyncProgress)
   const resetSyncProgress = useStore((s) => s.resetSyncProgress)
+  const bumpDataRevision = useStore((s) => s.bumpDataRevision)
+
+  useEffect(() => {
+    const enteredAt = Date.now()
+    trackView(view, 'enter')
+    return () => {
+      const duration = Date.now() - enteredAt
+      trackView(view, 'exit', duration)
+      trackDwell(view, duration)
+    }
+  }, [view])
 
   // One-shot bootstrap: re-hydrate the registered sources list and, if we
   // still have a valid persisted currentSourceId (and a currentGroupKey),
@@ -49,10 +61,15 @@ export default function App() {
           setGroups(groups)
           const validGroup = currentGroupKey && groups.some((g) => g.group_key === currentGroupKey)
           if (!validGroup) setCurrentGroupKey(null)
-          setView(validGroup ? 'swipe' : 'groups')
+          if (cancelled) return
+          const session = useStore.getState().reviewSession
+          const resumeMode = validGroup && session.groupKey === currentGroupKey
+            ? session.mode
+            : 'swipe'
+          setView(validGroup ? resumeMode : 'groups')
         }
       })
-      .catch(() => {})
+      .catch((error) => setSyncState('error', `初始化失败：${errorMessage(error)}`))
     return () => {
       cancelled = true
     }
@@ -69,7 +86,7 @@ export default function App() {
       const p = e.payload
       applySyncProgress(p)
       if (p.stage === 'scan') {
-        setSyncState('syncing', `扫描 ${p.source_index + 1}/${p.source_total}: 已发现 ${p.found} 张 · 已处理 ${p.processed} 张 · 新增 ${p.added} 张${p.pending > 0 ? ` · 待扫描 ${p.pending} 张` : ''}`)
+          setSyncState('syncing', `扫描 ${p.source_index + 1}/${p.source_total}: 已发现 ${p.found} 张 · 已处理 ${p.processed} 张 · 新增 ${p.added} 张${p.pending > 0 ? ` · 待扫描 ${p.pending} 张` : ''}${p.parse_errors > 0 ? ` · 解析失败 ${p.parse_errors} 张` : ''}`)
       } else if (p.stage === 'recluster') {
         setSyncState('syncing', '重新聚类相似分组…')
       } else if (p.stage === 'scan-done') {
@@ -91,6 +108,8 @@ export default function App() {
     if (isWebDev()) return
     let running = false
     let hideTimer: ReturnType<typeof setTimeout> | null = null
+    let lastErrorTrackAt = 0
+    let lastPending: number | null = null
     const refreshGroups = async () => {
       const state = useStore.getState()
       if (state.currentSourceId == null) return
@@ -104,20 +123,37 @@ export default function App() {
     const sync = async () => {
       if (running) return
       running = true
+      const startedAt = Date.now()
       try {
         const result = await syncAll()
         // Only refresh the group list when the sync actually did something.
         // No-op polls (nothing new, nothing pending, no recluster) skip the
         // refetch so the UI doesn't churn every 8 seconds.
-        const hadWork = result.added > 0 || result.pending > 0 || result.reclustered
-        if (hadWork) await refreshGroups()
+        const pendingChanged = result.pending > 0 && result.pending !== lastPending
+        lastPending = result.pending
+        const hadWork = result.added > 0 || pendingChanged || result.reclustered || result.parse_errors > 0
+        if (hadWork) {
+          const sources = await listSources()
+          setSources(sources)
+          await refreshGroups()
+          bumpDataRevision()
+          track('sync', {
+            success: true,
+            source_count: result.sources,
+            added_count: result.added,
+            pending_count: result.pending,
+            parse_error_count: result.parse_errors,
+            reclustered: result.reclustered,
+            duration_ms: Date.now() - startedAt,
+          })
+        }
         // No-op polls stay silent; only surface the bar when real work
         // happened, and auto-hide the success message after a moment.
         if (!hadWork) {
           setSyncState('idle', '')
           resetSyncProgress()
         } else {
-          setSyncState('success', `同步完成：已检查 ${result.sources} 个目录${result.added > 0 ? `，新增 ${result.added} 张` : ''}${result.pending > 0 ? `，待扫描 ${result.pending} 张` : ''}`)
+          setSyncState('success', `同步完成：已检查 ${result.sources} 个目录${result.added > 0 ? `，新增 ${result.added} 张` : ''}${result.pending > 0 ? `，待扫描 ${result.pending} 张` : ''}${result.parse_errors > 0 ? `，解析失败 ${result.parse_errors} 张` : ''}`)
           // Once nothing is left pending the stale progress would otherwise
           // keep the "还有 X 张未扫描" warning alive forever on no-op polls.
           if (result.pending === 0) resetSyncProgress()
@@ -127,7 +163,12 @@ export default function App() {
           }, 3000)
         }
       } catch (error) {
-        setSyncState('error', `同步失败：${String(error)}`)
+        setSyncState('error', `同步失败：${errorMessage(error)}`)
+        const now = Date.now()
+        if (now - lastErrorTrackAt >= 60_000) {
+          lastErrorTrackAt = now
+          track('sync', { success: false, duration_ms: now - startedAt })
+        }
       } finally {
         running = false
       }
@@ -138,7 +179,7 @@ export default function App() {
       window.clearInterval(timer)
       if (hideTimer) clearTimeout(hideTimer)
     }
-  }, [setCurrentGroupKey, setGroups, setSources, setSyncState, setView, resetSyncProgress])
+  }, [bumpDataRevision, setCurrentGroupKey, setGroups, setSources, setSyncState, setView, resetSyncProgress])
 
   const pendingText =
     syncProgress.active && syncProgress.pending > 0

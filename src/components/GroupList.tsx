@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { assetUrl, getGroupThumbnails, listGroups, mergeGroups } from '../api'
+import { useEffect, useRef, useState } from 'react'
+import { assetUrl, errorMessage, getGroupThumbnails, listGroups, mergeGroups } from '../api'
 import type { Granularity, GroupInfo, GroupThumbDto } from '../types'
 import { useStore } from '../store'
 
@@ -21,15 +21,24 @@ export function GroupList() {
   const granularity = useStore((s) => s.granularity)
   const setGranularity = useStore((s) => s.setGranularity)
   const sources = useStore((s) => s.sources)
+  const dataRevision = useStore((s) => s.dataRevision)
   const [thumbs, setThumbs] = useState<Record<string, string[]>>({})
   const [loadingThumbs, setLoadingThumbs] = useState(false)
   const [mergeMode, setMergeMode] = useState(false)
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set())
   const [mergeBusy, setMergeBusy] = useState(false)
   const [mergeMsg, setMergeMsg] = useState<string | null>(null)
+  const [loadingGroups, setLoadingGroups] = useState(groups.length === 0)
+  const [groupError, setGroupError] = useState('')
+  const [thumbError, setThumbError] = useState('')
+  const groupRequestRef = useRef(0)
+  const thumbRequestRef = useRef(0)
 
   async function loadGroups(sourceId: number | null, level: Granularity) {
+    const request = ++groupRequestRef.current
     setCurrentSourceId(sourceId)
+    setLoadingGroups(true)
+    setGroupError('')
     // The source's persisted threshold is authoritative — keep the Settings
     // slider / merge suggestions in sync with what the backend actually
     // re-clusters at.
@@ -37,17 +46,35 @@ export function GroupList() {
       const src = sources.find((s) => s.id === sourceId)
       if (src?.l2_threshold != null) setL2Threshold(src.l2_threshold)
     }
-    const g = await listGroups(sourceId ?? undefined, level)
-    setGroups(g)
-    setThumbs({})
+    try {
+      const g = await listGroups(sourceId ?? undefined, level)
+      if (request !== groupRequestRef.current) return
+      setGroups(g)
+      setThumbs({})
+    } catch (error) {
+      if (request !== groupRequestRef.current) return
+      setGroupError(errorMessage(error))
+    } finally {
+      if (request === groupRequestRef.current) setLoadingGroups(false)
+    }
   }
 
   useEffect(() => {
     if (groups.length === 0 && sources.length > 0) {
-      loadGroups(sources[0].id, granularity)
+      void loadGroups(currentSourceId ?? sources[0].id, granularity)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sources])
+
+  useEffect(() => {
+    if (dataRevision > 0) void loadGroups(currentSourceId, granularity)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataRevision])
+
+  useEffect(() => () => {
+    groupRequestRef.current += 1
+    thumbRequestRef.current += 1
+  }, [])
 
   useEffect(() => {
     if (groups.length > 0) {
@@ -58,7 +85,9 @@ export function GroupList() {
 
   async function loadThumbs(gs: GroupInfo[]) {
     if (gs.length === 0) return
+    const request = ++thumbRequestRef.current
     setLoadingThumbs(true)
+    setThumbError('')
     const keys = gs.map((g) => g.group_key)
     try {
       const dtos: GroupThumbDto[] = await getGroupThumbnails(keys, granularity)
@@ -66,18 +95,18 @@ export function GroupList() {
       dtos.forEach((d) => {
         map[d.group_key] = d.thumb_paths
       })
-      setThumbs(map)
-    } catch {
-      // ignore
+      if (request === thumbRequestRef.current) setThumbs(map)
+    } catch (error) {
+      if (request === thumbRequestRef.current) setThumbError(errorMessage(error))
     } finally {
-      setLoadingThumbs(false)
+      if (request === thumbRequestRef.current) setLoadingThumbs(false)
     }
   }
 
   function onLevelChange(level: Granularity) {
     setGranularity(level)
     if (level !== 2) exitMergeMode()
-    loadGroups(currentSourceId, level)
+    void loadGroups(currentSourceId, level)
   }
 
   function exitMergeMode() {
@@ -97,9 +126,7 @@ export function GroupList() {
 
   async function reloadGroupsAtLevel() {
     if (currentSourceId == null) return
-    const g = await listGroups(currentSourceId, granularity)
-    setGroups(g)
-    setThumbs({})
+    await loadGroups(currentSourceId, granularity)
   }
 
   async function doMerge() {
@@ -113,7 +140,7 @@ export function GroupList() {
       setSelectedKeys(new Set())
       await reloadGroupsAtLevel()
     } catch (e) {
-      setMergeMsg(`合并失败：${String(e)}`)
+      setMergeMsg(`合并失败：${errorMessage(e)}`)
     } finally {
       setMergeBusy(false)
     }
@@ -152,7 +179,7 @@ export function GroupList() {
             if (currentSourceId !== (e.target.value ? Number(e.target.value) : null)) {
               exitMergeMode()
             }
-            loadGroups(e.target.value ? Number(e.target.value) : null, granularity)
+            void loadGroups(e.target.value ? Number(e.target.value) : null, granularity)
           }}
         >
           <option value="">所有源</option>
@@ -162,10 +189,11 @@ export function GroupList() {
             </option>
           ))}
         </select>
-        <button onClick={() => setView('import')}>+ 导入新源</button>
-        <button onClick={() => setView('settings')}>标签设置 / 导出</button>
+        <button type="button" onClick={() => setView('import')}>+ 导入新源</button>
+        <button type="button" onClick={() => setView('settings')}>标签设置 / 导出</button>
         {granularity === 2 && (
           <button
+            type="button"
             className={mergeMode ? 'gran-active' : ''}
             disabled={mergeBusy}
             onClick={() => (mergeMode ? exitMergeMode() : setMergeMode(true))}
@@ -179,6 +207,7 @@ export function GroupList() {
       <div className="granularity-bar">
         {LEVELS.map((l) => (
           <button
+            type="button"
             key={l.value}
             className={granularity === l.value ? 'gran-active' : ''}
             onClick={() => onLevelChange(l.value)}
@@ -188,20 +217,28 @@ export function GroupList() {
         ))}
       </div>
 
-      {groups.length === 0 && <p className="muted">暂无分组，请先导入。</p>}
+      {loadingGroups && <p className="muted" role="status">正在加载分组…</p>}
+      {groupError && (
+        <div className="action-error" role="alert">
+          <span>分组加载失败：{groupError}</span>
+          <button type="button" onClick={() => void loadGroups(currentSourceId, granularity)}>重试</button>
+        </div>
+      )}
+      {!loadingGroups && !groupError && groups.length === 0 && <p className="muted">暂无分组，请先导入。</p>}
       {loadingThumbs && groups.length > 0 && (
         <p className="muted hint">读取组预览中…</p>
       )}
+      {thumbError && <p className="muted hint" role="alert">组预览加载失败：{thumbError}</p>}
       {syncing && (
         <p className="sync-warn">扫描进行中，分组数据可能不完整。</p>
       )}
       {mergeMode && granularity === 2 && (
         <div className="merge-bar">
           <span>已选 {selectedKeys.size} 组（至少选 2 组）</span>
-          <button disabled={mergeBusy || selectedKeys.size < 2} onClick={doMerge}>
+          <button type="button" disabled={mergeBusy || selectedKeys.size < 2} onClick={() => void doMerge()}>
             合并所选
           </button>
-          <button className="ghost" disabled={mergeBusy} onClick={exitMergeMode}>
+          <button type="button" className="ghost" disabled={mergeBusy} onClick={exitMergeMode}>
             退出
           </button>
           {mergeMsg && <span className="merge-msg">{mergeMsg}</span>}
@@ -213,6 +250,14 @@ export function GroupList() {
             key={g.group_key}
             className={`group-card ${mergeMode && granularity === 2 && selectedKeys.has(g.group_key) ? 'merge-selected' : ''}`}
             onClick={() => (mergeMode && granularity === 2 ? toggleMergeSelect(g.group_key) : openGroup(g))}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault()
+                mergeMode && granularity === 2 ? toggleMergeSelect(g.group_key) : openGroup(g)
+              }
+            }}
             title={displayLabel(g)}
           >
             {mergeMode && granularity === 2 && (
@@ -247,17 +292,18 @@ export function GroupList() {
             )}
             <div className="group-meta">
               {g.checkpoint || '—'} · {g.source_kind}
-              <span
+              <button
+                type="button"
                 className="folder-link"
                 onClick={(e) => {
                   e.stopPropagation()
                   openFolder(g)
                 }}
                 title="文件夹视角（速览评分 / 屏蔽 / 删除）"
-                style={{ marginLeft: 8, color: 'var(--accent)', cursor: 'pointer' }}
+                style={{ marginLeft: 8 }}
               >
-                📁 文件夹视角
-              </span>
+                文件夹视角
+              </button>
             </div>
             {granularity === 1 && g.model_facets && g.model_facets.length > 0 && (
               <div className="model-facets">

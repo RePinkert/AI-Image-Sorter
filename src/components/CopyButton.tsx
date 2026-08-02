@@ -5,9 +5,10 @@ interface CopyButtonProps {
   text: string
   className?: string
   label?: string
+  onCopied?: (success: boolean) => void
 }
 
-export function CopyButton({ text, className = '', label = '复制' }: CopyButtonProps) {
+export function CopyButton({ text, className = '', label = '复制', onCopied }: CopyButtonProps) {
   const [done, setDone] = useState(false)
 
   return (
@@ -18,6 +19,7 @@ export function CopyButton({ text, className = '', label = '复制' }: CopyButto
       onClick={(e) => {
         e.stopPropagation()
         void copyText(text).then((ok) => {
+          onCopied?.(ok)
           if (ok) {
             setDone(true)
             setTimeout(() => setDone(false), 1200)

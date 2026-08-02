@@ -58,5 +58,6 @@ pub fn parse_png(path: &Path) -> Result<ImageMeta> {
     }
     meta.width = reader.info().width;
     meta.height = reader.info().height;
+    meta.refresh_generation_recipe();
     Ok(meta)
 }

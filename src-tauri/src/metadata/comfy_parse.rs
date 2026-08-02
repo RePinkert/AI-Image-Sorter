@@ -286,9 +286,11 @@ pub fn parse_comfy_workflow(json_str: &str) -> ImageMeta {
                         .get("strength_model")
                         .and_then(|v| v.as_f64())
                         .unwrap_or(1.0);
+                    let clip_strength = inputs.get("strength_clip").and_then(|v| v.as_f64());
                     meta.loras.push(LoraInfo {
                         name: name.to_string(),
                         strength,
+                        clip_strength,
                     });
                     meta.model_chain.push(ModelChainItem {
                         node_type: class.to_string(), model: name.to_string(), strength: Some(strength), enabled: None,
@@ -347,6 +349,7 @@ pub fn parse_comfy_workflow(json_str: &str) -> ImageMeta {
         }
     }
 
+    meta.refresh_generation_recipe();
     meta
 }
 

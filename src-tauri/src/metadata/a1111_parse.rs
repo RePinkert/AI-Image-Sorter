@@ -61,18 +61,36 @@ pub fn parse_a1111_parameters(p: &str) -> ImageMeta {
                     meta.loras.push(LoraInfo {
                         name,
                         strength: 1.0,
+                        clip_strength: None,
                     });
                 }
             }
+        }
+        if let Some(size) = kv.get("Size") {
+            if let Some((width, height)) = size.split_once('x') {
+                meta.width = width.trim().parse().unwrap_or(0);
+                meta.height = height.trim().parse().unwrap_or(0);
+            }
+        }
+        if let Some(width) = kv.get("Width") {
+            meta.width = width.trim().parse().unwrap_or(meta.width);
+        }
+        if let Some(height) = kv.get("Height") {
+            meta.height = height.trim().parse().unwrap_or(meta.height);
         }
         meta.samplers.push(SamplerInfo {
             sampler,
             seed,
             steps,
             cfg,
-            scheduler: kv.get("Scheduler").cloned().unwrap_or_default(),
+            scheduler: kv
+                .get("Scheduler")
+                .or_else(|| kv.get("Schedule type"))
+                .cloned()
+                .unwrap_or_default(),
         });
     }
+    meta.refresh_generation_recipe();
     meta
 }
 

@@ -121,6 +121,7 @@ export function ImageMetaPopover({ img, comparePrompt, diffColor, onHide }: Imag
       </div>
       {onHide && (
         <button
+          type="button"
           className="meta-hide-btn"
           onClick={() => onHide(img)}
           title="屏蔽（赋 0 分，不参与评分，可在文件夹视角恢复）"

@@ -1,12 +1,133 @@
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
+use rusqlite::Transaction;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 pub struct Db(pub Mutex<Connection>);
+
+static EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
+const MAX_TELEMETRY_PAYLOAD_BYTES: usize = 16 * 1024;
+
+fn next_id(prefix: &str) -> String {
+    format!(
+        "{}-{}-{:x}",
+        prefix,
+        Utc::now().timestamp_micros(),
+        EVENT_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn validate_token(name: &str, value: &str, max_len: usize, allow_empty: bool) -> Result<()> {
+    if value.is_empty() && allow_empty {
+        return Ok(());
+    }
+    if value.is_empty() || value.len() > max_len {
+        return Err(anyhow::anyhow!("{name} has invalid length"));
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+    {
+        return Err(anyhow::anyhow!("{name} contains unsupported characters"));
+    }
+    Ok(())
+}
+
+fn normalize_started_at(value: Option<&str>) -> Result<Option<String>> {
+    let Some(value) = value else { return Ok(None) };
+    if value.len() > 64 {
+        return Err(anyhow::anyhow!("started_at is too long"));
+    }
+    let parsed = DateTime::parse_from_rfc3339(value)
+        .map_err(|_| anyhow::anyhow!("started_at must be RFC3339"))?;
+    Ok(Some(parsed.to_rfc3339()))
+}
+
+fn action_duration_ms(started_at: Option<&str>, committed_at: &str) -> Option<i64> {
+    let started = started_at.and_then(|s| DateTime::parse_from_rfc3339(s).ok());
+    let committed = DateTime::parse_from_rfc3339(committed_at).ok()?;
+    Some((committed.signed_duration_since(started?).num_milliseconds()).max(0))
+}
+
+fn contains_sensitive_json_key(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+            let key = key.to_ascii_lowercase();
+            key.contains("prompt") || key.contains("path") || contains_sensitive_json_key(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(contains_sensitive_json_key),
+        _ => false,
+    }
+}
+
+fn insert_score_tx(tx: &Transaction<'_>, image_id: i64, score: f64, mode: &str) -> Result<()> {
+    tx.execute(
+        "INSERT INTO scores (image_id, internal_score, updated_at, last_mode)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(image_id) DO UPDATE SET internal_score=excluded.internal_score,
+             updated_at=excluded.updated_at, last_mode=excluded.last_mode",
+        rusqlite::params![image_id, score, Utc::now().to_rfc3339(), mode],
+    )?;
+    Ok(())
+}
+
+fn current_score_tx(tx: &Transaction<'_>, image_id: i64) -> Result<Option<f64>> {
+    Ok(tx
+        .query_row(
+            "SELECT internal_score FROM scores WHERE image_id=?1",
+            rusqlite::params![image_id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+fn insert_review_action(
+    tx: &Transaction<'_>,
+    action_id: &str,
+    session_id: Option<&str>,
+    mode: &str,
+    image_id: Option<i64>,
+    left_image_id: Option<i64>,
+    right_image_id: Option<i64>,
+    gesture: Option<&str>,
+    winner: Option<i64>,
+    group_key: Option<&str>,
+    started_at: Option<&str>,
+    committed_at: &str,
+    context_signature: Option<&str>,
+    result_json: &str,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO review_actions (
+             action_id, session_id, mode, image_id, left_image_id, right_image_id,
+             gesture, winner, group_key, started_at, committed_at, duration_ms,
+             context_signature, result_json
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        rusqlite::params![
+            action_id,
+            session_id,
+            mode,
+            image_id,
+            left_image_id,
+            right_image_id,
+            gesture,
+            winner,
+            group_key,
+            started_at,
+            committed_at,
+            action_duration_ms(started_at, committed_at),
+            context_signature,
+            result_json,
+        ],
+    )?;
+    Ok(())
+}
 
 pub fn open(path: &std::path::Path) -> Result<Db> {
     if let Some(parent) = path.parent() {
@@ -98,7 +219,7 @@ impl Db {
 mod migrations {
     use super::*;
 
-    pub(crate) const CURRENT_VERSION: i32 = 11;
+    pub(crate) const CURRENT_VERSION: i32 = 12;
 
     pub fn run(conn: &Connection) -> Result<()> {
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -161,6 +282,19 @@ mod migrations {
         if !cols.contains("workflow_match_confidence") {
             conn.execute_batch("ALTER TABLE images ADD COLUMN workflow_match_confidence REAL;")?;
         }
+        if !cols.contains("generation_recipe_json") {
+            conn.execute_batch(
+                "ALTER TABLE images ADD COLUMN generation_recipe_json TEXT NOT NULL DEFAULT '{}';",
+            )?;
+        }
+        if !cols.contains("recipe_signature") {
+            conn.execute_batch("ALTER TABLE images ADD COLUMN recipe_signature TEXT;")?;
+        }
+        if !cols.contains("parser_version") {
+            conn.execute_batch(
+                "ALTER TABLE images ADD COLUMN parser_version TEXT NOT NULL DEFAULT '';",
+            )?;
+        }
         let src_cols = source_columns(conn)?;
         if !src_cols.contains("file_count") {
             conn.execute_batch(
@@ -197,6 +331,10 @@ mod migrations {
         )?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_images_workflow_key ON images(workflow_key);",
+        )?;
+        backfill_generation_recipes(conn)?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_images_recipe_signature ON images(recipe_signature);",
         )?;
         conn.execute_batch(&format!("PRAGMA user_version = {};", CURRENT_VERSION))?;
         Ok(())
@@ -266,11 +404,14 @@ mod migrations {
                 hidden INTEGER NOT NULL DEFAULT 0,
                 diffusion_model TEXT,
                 model_chain_json TEXT NOT NULL DEFAULT '[]',
-                workflow_key TEXT,
-                workflow_graph_json TEXT,
-                workflow_template_id INTEGER,
-                workflow_match_confidence REAL,
-                FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
+                 workflow_key TEXT,
+                 workflow_graph_json TEXT,
+                 workflow_template_id INTEGER,
+                 workflow_match_confidence REAL,
+                 generation_recipe_json TEXT NOT NULL DEFAULT '{}',
+                 recipe_signature TEXT,
+                 parser_version TEXT NOT NULL DEFAULT '',
+                 FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_images_l0 ON images(group_key_l0);
             CREATE INDEX IF NOT EXISTS idx_images_l1 ON images(group_key_l1);
@@ -320,17 +461,148 @@ mod migrations {
             -- prompt-deviation group key so `recluster_l2` never re-splits
             -- manually merged groups or re-absorbs manually split images.
             -- kind: 'merge' (every member of merged groups pinned) | 'split'
-            CREATE TABLE IF NOT EXISTS manual_group_bindings (
+             CREATE TABLE IF NOT EXISTS manual_group_bindings (
                 level INTEGER NOT NULL,
                 image_id INTEGER NOT NULL,
                 group_key TEXT NOT NULL,
                 kind TEXT NOT NULL DEFAULT 'merge',
                 created_at TEXT,
-                PRIMARY KEY(level, image_id),
-                FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE
-            );
-            ",
+                 PRIMARY KEY(level, image_id),
+                 FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS review_actions (
+                 action_id TEXT PRIMARY KEY NOT NULL,
+                 session_id TEXT,
+                 mode TEXT NOT NULL,
+                 image_id INTEGER,
+                 left_image_id INTEGER,
+                 right_image_id INTEGER,
+                 gesture TEXT,
+                 winner INTEGER,
+                 group_key TEXT,
+                 started_at TEXT,
+                 committed_at TEXT NOT NULL,
+                 duration_ms INTEGER,
+                 context_signature TEXT,
+                 result_json TEXT NOT NULL DEFAULT '{}'
+             );
+             CREATE INDEX IF NOT EXISTS idx_review_actions_session_time
+                 ON review_actions(session_id, committed_at);
+             CREATE INDEX IF NOT EXISTS idx_review_actions_mode_time
+                 ON review_actions(mode, committed_at);
+             CREATE INDEX IF NOT EXISTS idx_review_actions_image_time
+                 ON review_actions(image_id, committed_at);
+             CREATE INDEX IF NOT EXISTS idx_review_actions_pair_time
+                 ON review_actions(left_image_id, right_image_id, committed_at);
+             CREATE INDEX IF NOT EXISTS idx_review_actions_right_time
+                 ON review_actions(right_image_id, committed_at);
+             CREATE INDEX IF NOT EXISTS idx_review_actions_group_time
+                 ON review_actions(group_key, committed_at);
+             CREATE TRIGGER IF NOT EXISTS review_actions_no_update
+                 BEFORE UPDATE ON review_actions BEGIN
+                 SELECT RAISE(ABORT, 'review_actions is append-only');
+             END;
+             CREATE TRIGGER IF NOT EXISTS review_actions_no_delete
+                 BEFORE DELETE ON review_actions BEGIN
+                 SELECT RAISE(ABORT, 'review_actions is append-only');
+             END;
+             CREATE TABLE IF NOT EXISTS telemetry_events (
+                 event_id TEXT PRIMARY KEY NOT NULL,
+                 session_id TEXT,
+                 event_name TEXT NOT NULL,
+                 schema_version TEXT NOT NULL,
+                 occurred_at TEXT NOT NULL,
+                 mode TEXT,
+                 payload_json TEXT NOT NULL DEFAULT '{}',
+                 severity TEXT NOT NULL DEFAULT 'info'
+             );
+             CREATE INDEX IF NOT EXISTS idx_telemetry_events_session_time
+                 ON telemetry_events(session_id, occurred_at);
+             CREATE INDEX IF NOT EXISTS idx_telemetry_events_name_time
+                 ON telemetry_events(event_name, occurred_at);
+             CREATE INDEX IF NOT EXISTS idx_telemetry_events_mode_time
+                 ON telemetry_events(mode, occurred_at);
+             CREATE TRIGGER IF NOT EXISTS telemetry_events_no_update
+                 BEFORE UPDATE ON telemetry_events BEGIN
+                 SELECT RAISE(ABORT, 'telemetry_events is append-only');
+             END;
+             CREATE TRIGGER IF NOT EXISTS telemetry_events_no_delete
+                 BEFORE DELETE ON telemetry_events BEGIN
+                 SELECT RAISE(ABORT, 'telemetry_events is append-only');
+             END;
+             ",
         )?;
+        Ok(())
+    }
+
+    fn backfill_generation_recipes(conn: &Connection) -> Result<()> {
+        let mut stmt = conn.prepare(
+            "SELECT id, checkpoint, diffusion_model, loras, vae, samplers,
+                    width, height, generation_recipe_json
+             FROM images
+             WHERE generation_recipe_json IS NULL OR generation_recipe_json='' OR generation_recipe_json='{}'",
+        )?;
+        let rows: Vec<(
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        )> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        for (id, checkpoint, diffusion_model, loras_json, vae, samplers_json, width, height, _) in
+            rows
+        {
+            let loras: Vec<crate::metadata::LoraInfo> = loras_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            let sampler = samplers_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Vec<crate::metadata::SamplerInfo>>(s).ok())
+                .and_then(|v| v.into_iter().next())
+                .unwrap_or_default();
+            let recipe = crate::metadata::GenerationRecipe {
+                checkpoint: checkpoint.unwrap_or_default(),
+                diffusion_model: diffusion_model.unwrap_or_default(),
+                loras,
+                vae: vae.unwrap_or_default(),
+                sampler: sampler.sampler,
+                scheduler: sampler.scheduler,
+                steps: sampler.steps,
+                cfg: sampler.cfg,
+                width: width.unwrap_or(0).max(0) as u32,
+                height: height.unwrap_or(0).max(0) as u32,
+                aspect_ratio: 0.0,
+            }
+            .normalized();
+            let json = serde_json::to_string(&recipe).unwrap_or_else(|_| "{}".to_string());
+            let signature = recipe.signature();
+            conn.execute(
+                "UPDATE images SET generation_recipe_json=?1, recipe_signature=?2,
+                    parser_version=?3 WHERE id=?4",
+                rusqlite::params![json, signature, "legacy-backfill-v1", id],
+            )?;
+        }
         Ok(())
     }
 
@@ -537,10 +809,43 @@ pub struct WorkflowTemplateRow {
 #[derive(Debug, Clone, Serialize)]
 pub struct PromptRecommendation {
     pub prompt_text: String,
+    pub prompt_neg: String,
     pub diffusion_model: String,
+    pub checkpoint: String,
+    pub loras: Vec<crate::metadata::LoraInfo>,
+    pub vae: String,
+    pub sampler: String,
+    pub scheduler: String,
+    pub steps: i64,
+    pub cfg: f64,
+    pub width: i64,
+    pub height: i64,
+    pub aspect_ratio: f64,
+    pub sample_count: i64,
     pub max_score: f64,
     pub avg_score: f64,
+    pub median_score: f64,
+    pub score_variance: f64,
+    pub confidence: f64,
+    pub example_image_ids: Vec<i64>,
+    /// Kept as an alias for existing callers while they migrate to
+    /// `sample_count`.
     pub image_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ActionResult {
+    pub action_id: String,
+    pub image_id: i64,
+    pub score: f64,
+    pub hidden: bool,
+    pub label_id: Option<i64>,
+    pub committed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TelemetryEventResult {
+    pub event_id: String,
 }
 
 impl Db {
@@ -614,15 +919,16 @@ impl Db {
                 source_id, rel_path, abs_path, filename, size, width, height,
                 prompt_pos, prompt_neg, checkpoint, loras, vae, samplers, seed, steps, cfg,
                 group_key_l0, group_key_l1, group_key_l2, group_key_l3,
-                sha256, meta_ok, source_kind, scanned_at,
-                diffusion_model, model_chain_json,
-                workflow_key, workflow_graph_json,
-                workflow_template_id, workflow_match_confidence
-            ) VALUES (
-                ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
-                ?17,?18,?19,?20,?21,?22,?23,?24,
-                ?25,?26,?27,?28,?29,?30
-            )",
+                 sha256, meta_ok, source_kind, scanned_at,
+                 diffusion_model, model_chain_json,
+                 workflow_key, workflow_graph_json,
+                 workflow_template_id, workflow_match_confidence,
+                 generation_recipe_json, recipe_signature, parser_version
+             ) VALUES (
+                 ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
+                 ?17,?18,?19,?20,?21,?22,?23,?24,
+                 ?25,?26,?27,?28,?29,?30,?31,?32,?33
+             )",
             rusqlite::params![
                 row.source_id,
                 row.rel_path,
@@ -654,6 +960,9 @@ impl Db {
                 row.workflow_graph_json,
                 row.workflow_template_id,
                 row.workflow_match_confidence,
+                row.generation_recipe_json,
+                row.recipe_signature,
+                row.parser_version,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -674,10 +983,11 @@ impl Db {
                 source_id=?2, prompt_pos=?3, prompt_neg=?4, checkpoint=?5,
                 loras=?6, vae=?7, samplers=?8, seed=?9, steps=?10, cfg=?11,
                 group_key_l0=?12, group_key_l1=?13, group_key_l2=?14, group_key_l3=?15,
-                meta_ok=?16, source_kind=?17, width=?18, height=?19,
-                diffusion_model=?20, model_chain_json=?21,
-                workflow_key=?22, workflow_graph_json=?23,
-                workflow_template_id=?24, workflow_match_confidence=?25
+                 meta_ok=?16, source_kind=?17, width=?18, height=?19,
+                 diffusion_model=?20, model_chain_json=?21,
+                 workflow_key=?22, workflow_graph_json=?23,
+                 workflow_template_id=?24, workflow_match_confidence=?25,
+                 generation_recipe_json=?26, recipe_signature=?27, parser_version=?28
              WHERE id=?1",
             rusqlite::params![
                 image_id,
@@ -705,6 +1015,9 @@ impl Db {
                 row.workflow_graph_json,
                 row.workflow_template_id,
                 row.workflow_match_confidence,
+                row.generation_recipe_json,
+                row.recipe_signature,
+                row.parser_version,
             ],
         )?;
         Ok(row.group_key_l1.clone())
@@ -899,18 +1212,6 @@ impl Db {
         Ok(out)
     }
 
-    /// Toggle the hidden flag on an image. Hidden images are excluded from
-    /// swipe/arena (see list_groups / list_group_images) but remain visible
-    /// in FolderView so the user can un-block them.
-    pub fn set_image_hidden(&self, image_id: i64, hidden: bool) -> Result<()> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
-            "UPDATE images SET hidden=?1 WHERE id=?2",
-            rusqlite::params![hidden as i64, image_id],
-        )?;
-        Ok(())
-    }
-
     /// Look up the abs_path for an image (used by trash_image to find the
     /// file to send to the recycle bin). Returns None if the row is gone.
     pub fn image_abs_path(&self, image_id: i64) -> Result<Option<String>> {
@@ -937,10 +1238,9 @@ impl Db {
         Ok(())
     }
 
-    /// Recommend high-scoring prompts within a group. Groups by distinct
-    /// prompt_pos, computes max/avg score and image count, ordered by max
-    /// score descending. Paginated via offset/limit. Only available at
-    /// granularity 0/1/2 — L3 has a single prompt per group by definition.
+    /// Recommend only existing, complete prompt + generation-recipe pairs.
+    /// Scores are ranked by a mean shrunk toward BASE_SCORE so one lucky
+    /// sample does not outrank a well-supported configuration.
     pub fn recommend_prompts(
         &self,
         group_key: &str,
@@ -951,6 +1251,11 @@ impl Db {
         if level >= 3 {
             return Ok(Vec::new());
         }
+        let page_offset = offset.max(0);
+        let page_limit = limit.max(0).min(100);
+        if page_limit == 0 {
+            return Ok(Vec::new());
+        }
         let conn = self.0.lock().unwrap();
         let key_col = match level {
             0 => "group_key_l0",
@@ -958,36 +1263,129 @@ impl Db {
             _ => "group_key_l2",
         };
         let sql = format!(
-            "SELECT i.prompt_pos, COALESCE(i.diffusion_model, ''),
-                    MAX(COALESCE(s.internal_score, 50.0)) AS max_score,
-                    AVG(COALESCE(s.internal_score, 50.0)) AS avg_score,
-                    COUNT(*) AS cnt
+            "SELECT i.id, i.prompt_pos, COALESCE(i.prompt_neg, ''), i.generation_recipe_json,
+                    COALESCE(s.internal_score, 50.0)
              FROM images i
              LEFT JOIN scores s ON s.image_id = i.id
              WHERE i.{col}=?1 AND i.hidden=0 AND i.prompt_pos != ''
-             GROUP BY i.prompt_pos, i.diffusion_model
-             ORDER BY max_score DESC
-             LIMIT ?2 OFFSET ?3",
+               AND i.generation_recipe_json IS NOT NULL
+               AND i.generation_recipe_json != '' AND i.generation_recipe_json != '{{}}'",
             col = key_col
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params![group_key, limit, offset],
-            |r| {
-                Ok(PromptRecommendation {
-                    prompt_text: r.get(0)?,
-                    diffusion_model: r.get(1)?,
-                    max_score: r.get(2)?,
-                    avg_score: r.get(3)?,
-                    image_count: r.get(4)?,
-                })
-            },
-        )?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
+        let rows = stmt.query_map(rusqlite::params![group_key], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, f64>(4)?,
+            ))
+        })?;
+        struct RecommendationAccum {
+            prompt_text: String,
+            prompt_neg: String,
+            recipe: crate::metadata::GenerationRecipe,
+            scored_ids: Vec<(i64, f64)>,
         }
-        Ok(out)
+        let mut grouped: HashMap<(String, String, String), RecommendationAccum> = HashMap::new();
+        for r in rows {
+            let (image_id, prompt_text, prompt_neg, recipe_json, score) = r?;
+            let recipe =
+                match serde_json::from_str::<crate::metadata::GenerationRecipe>(&recipe_json) {
+                    Ok(recipe) => recipe.normalized(),
+                    Err(_) => continue,
+                };
+            if !recipe.is_complete() {
+                continue;
+            }
+            let key = (prompt_text.clone(), prompt_neg.clone(), recipe.signature());
+            grouped
+                .entry(key)
+                .or_insert_with(|| RecommendationAccum {
+                    prompt_text,
+                    prompt_neg,
+                    recipe,
+                    scored_ids: Vec::new(),
+                })
+                .scored_ids
+                .push((
+                    image_id,
+                    if score.is_finite() {
+                        score
+                    } else {
+                        crate::scoring::BASE_SCORE
+                    },
+                ));
+        }
+        drop(stmt);
+
+        let mut ranked: Vec<(f64, PromptRecommendation)> = Vec::new();
+        for accum in grouped.into_values() {
+            let mut scores: Vec<f64> = accum.scored_ids.iter().map(|(_, score)| *score).collect();
+            scores.sort_by(f64::total_cmp);
+            let sample_count = scores.len() as i64;
+            if sample_count == 0 {
+                continue;
+            }
+            let sum: f64 = scores.iter().sum();
+            let avg_score = sum / sample_count as f64;
+            let median_score = if scores.len() % 2 == 1 {
+                scores[scores.len() / 2]
+            } else {
+                (scores[scores.len() / 2 - 1] + scores[scores.len() / 2]) / 2.0
+            };
+            let score_variance = scores
+                .iter()
+                .map(|score| (score - avg_score).powi(2))
+                .sum::<f64>()
+                / sample_count as f64;
+            let confidence = sample_count as f64 / (sample_count as f64 + 5.0);
+            let shrink_score =
+                avg_score * confidence + crate::scoring::BASE_SCORE * (1.0 - confidence);
+            let max_score = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let mut examples = accum.scored_ids.clone();
+            examples.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            examples.truncate(4);
+            let recipe = accum.recipe;
+            ranked.push((
+                shrink_score,
+                PromptRecommendation {
+                    prompt_text: accum.prompt_text,
+                    prompt_neg: accum.prompt_neg,
+                    diffusion_model: recipe.diffusion_model.clone(),
+                    checkpoint: recipe.checkpoint.clone(),
+                    loras: recipe.loras.clone(),
+                    vae: recipe.vae.clone(),
+                    sampler: recipe.sampler.clone(),
+                    scheduler: recipe.scheduler.clone(),
+                    steps: recipe.steps,
+                    cfg: recipe.cfg,
+                    width: recipe.width as i64,
+                    height: recipe.height as i64,
+                    aspect_ratio: recipe.aspect_ratio,
+                    sample_count,
+                    max_score,
+                    avg_score,
+                    median_score,
+                    score_variance,
+                    confidence,
+                    example_image_ids: examples.into_iter().map(|(id, _)| id).collect(),
+                    image_count: sample_count,
+                },
+            ));
+        }
+        ranked.sort_by(|a, b| {
+            b.0.total_cmp(&a.0)
+                .then_with(|| b.1.avg_score.total_cmp(&a.1.avg_score))
+                .then_with(|| b.1.sample_count.cmp(&a.1.sample_count))
+        });
+        Ok(ranked
+            .into_iter()
+            .skip(page_offset as usize)
+            .take(page_limit as usize)
+            .map(|(_, recommendation)| recommendation)
+            .collect())
     }
 
     fn labels_for(&self, conn: &Connection, image_id: i64) -> Result<Vec<LabelRow>> {
@@ -1067,32 +1465,361 @@ impl Db {
         Ok(())
     }
 
-    pub fn set_score(&self, image_id: i64, score: f64, mode: &str) -> Result<()> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
-            "INSERT INTO scores (image_id, internal_score, updated_at, last_mode)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(image_id) DO UPDATE SET internal_score=excluded.internal_score, updated_at=excluded.updated_at, last_mode=excluded.last_mode",
-            rusqlite::params![image_id, score, Utc::now().to_rfc3339(), mode],
+    pub fn apply_swipe_action(
+        &self,
+        image_id: i64,
+        gesture: &str,
+        label_id: Option<i64>,
+        session_id: Option<&str>,
+        started_at: Option<&str>,
+        context_signature: Option<&str>,
+    ) -> Result<ActionResult> {
+        if !matches!(gesture, "left" | "right" | "up" | "down") {
+            return Err(anyhow::anyhow!("unsupported gesture"));
+        }
+        if let Some(session_id) = session_id {
+            validate_token("session_id", session_id, 128, false)?;
+        }
+        if let Some(signature) = context_signature {
+            validate_token("context_signature", signature, 256, false)?;
+        }
+        let started_at = normalize_started_at(started_at)?;
+        let action_id = next_id("act");
+        let committed_at = Utc::now().to_rfc3339();
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        let (group_key, image_hidden): (Option<String>, bool) = tx
+            .query_row(
+                "SELECT group_key_l3, hidden FROM images WHERE id=?1",
+                rusqlite::params![image_id],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("image row not found"))?;
+        if let Some(label_id) = label_id {
+            let exists: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM labels WHERE id=?1",
+                rusqlite::params![label_id],
+                |r| r.get(0),
+            )?;
+            if exists == 0 {
+                return Err(anyhow::anyhow!("label row not found"));
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO image_labels (image_id, label_id) VALUES (?1, ?2)",
+                rusqlite::params![image_id, label_id],
+            )?;
+        }
+        let current = current_score_tx(&tx, image_id)?;
+        let score = crate::scoring::apply_swipe(current, gesture);
+        insert_score_tx(&tx, image_id, score, "swipe")?;
+        let result_json = serde_json::json!({
+            "score": score,
+            "label_id": label_id,
+            "hidden": image_hidden,
+        })
+        .to_string();
+        insert_review_action(
+            &tx,
+            &action_id,
+            session_id,
+            "swipe",
+            Some(image_id),
+            None,
+            None,
+            Some(gesture),
+            None,
+            group_key.as_deref(),
+            started_at.as_deref(),
+            &committed_at,
+            context_signature,
+            &result_json,
         )?;
-        Ok(())
+        tx.commit()?;
+        Ok(ActionResult {
+            action_id,
+            image_id,
+            score,
+            hidden: image_hidden,
+            label_id,
+            committed_at,
+        })
     }
 
-    pub fn add_compare_pair(
+    pub fn arena_vote_atomic(
         &self,
         group_key: &str,
         left: i64,
         right: i64,
-        winner: i64,
-        delta: f64,
-    ) -> Result<()> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        winner_is_left: bool,
+        session_id: Option<&str>,
+        started_at: Option<&str>,
+        context_signature: Option<&str>,
+    ) -> Result<(f64, f64)> {
+        validate_token("group_key", group_key, 256, true)?;
+        if let Some(session_id) = session_id {
+            validate_token("session_id", session_id, 128, false)?;
+        }
+        if let Some(signature) = context_signature {
+            validate_token("context_signature", signature, 256, false)?;
+        }
+        let started_at = normalize_started_at(started_at)?;
+        let action_id = next_id("act");
+        let committed_at = Utc::now().to_rfc3339();
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        for image_id in [left, right] {
+            let exists: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM images WHERE id=?1",
+                rusqlite::params![image_id],
+                |r| r.get(0),
+            )?;
+            if exists == 0 {
+                return Err(anyhow::anyhow!("image row not found"));
+            }
+        }
+        let left_score = current_score_tx(&tx, left)?.unwrap_or(crate::scoring::BASE_SCORE);
+        let right_score = current_score_tx(&tx, right)?.unwrap_or(crate::scoring::BASE_SCORE);
+        let (new_left, new_right) =
+            crate::scoring::apply_arena(left_score, right_score, winner_is_left);
+        insert_score_tx(&tx, left, new_left, "arena")?;
+        insert_score_tx(&tx, right, new_right, "arena")?;
+        let winner = if winner_is_left { left } else { right };
+        tx.execute(
             "INSERT INTO compare_pairs (group_key, left_img, right_img, winner, delta, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![group_key, left, right, winner, delta, Utc::now().to_rfc3339()],
+            rusqlite::params![
+                group_key,
+                left,
+                right,
+                winner,
+                (new_left - left_score).abs(),
+                &committed_at,
+            ],
         )?;
-        Ok(())
+        let result_json = serde_json::json!({
+            "left_score": new_left,
+            "right_score": new_right,
+            "winner": winner,
+        })
+        .to_string();
+        insert_review_action(
+            &tx,
+            &action_id,
+            session_id,
+            "arena",
+            None,
+            Some(left),
+            Some(right),
+            None,
+            Some(winner),
+            Some(group_key),
+            started_at.as_deref(),
+            &committed_at,
+            context_signature,
+            &result_json,
+        )?;
+        tx.commit()?;
+        Ok((new_left, new_right))
+    }
+
+    pub fn toggle_hidden_atomic(
+        &self,
+        image_id: i64,
+        hidden: bool,
+        session_id: Option<&str>,
+        started_at: Option<&str>,
+        context_signature: Option<&str>,
+    ) -> Result<ActionResult> {
+        if let Some(session_id) = session_id {
+            validate_token("session_id", session_id, 128, false)?;
+        }
+        if let Some(signature) = context_signature {
+            validate_token("context_signature", signature, 256, false)?;
+        }
+        let started_at = normalize_started_at(started_at)?;
+        let action_id = next_id("act");
+        let committed_at = Utc::now().to_rfc3339();
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        let group_key: Option<String> = tx
+            .query_row(
+                "SELECT group_key_l3 FROM images WHERE id=?1",
+                rusqlite::params![image_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("image row not found"))?;
+        tx.execute(
+            "UPDATE images SET hidden=?1 WHERE id=?2",
+            rusqlite::params![hidden as i64, image_id],
+        )?;
+        let score = if hidden {
+            0.0
+        } else {
+            current_score_tx(&tx, image_id)?.unwrap_or(crate::scoring::BASE_SCORE)
+        };
+        insert_score_tx(&tx, image_id, score, if hidden { "hide" } else { "unhide" })?;
+        let result_json = serde_json::json!({
+            "hidden": hidden,
+            "score": score,
+        })
+        .to_string();
+        insert_review_action(
+            &tx,
+            &action_id,
+            session_id,
+            if hidden { "hide" } else { "unhide" },
+            Some(image_id),
+            None,
+            None,
+            None,
+            None,
+            group_key.as_deref(),
+            started_at.as_deref(),
+            &committed_at,
+            context_signature,
+            &result_json,
+        )?;
+        tx.commit()?;
+        Ok(ActionResult {
+            action_id,
+            image_id,
+            score,
+            hidden,
+            label_id: None,
+            committed_at,
+        })
+    }
+
+    pub fn record_telemetry_event(
+        &self,
+        session_id: Option<&str>,
+        event_name: &str,
+        schema_version: &str,
+        occurred_at: Option<&str>,
+        mode: Option<&str>,
+        payload_json: &str,
+        severity: Option<&str>,
+    ) -> Result<TelemetryEventResult> {
+        if event_name.is_empty()
+            || event_name.len() > 96
+            || !event_name.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'.')
+            })
+        {
+            return Err(anyhow::anyhow!("event_name is not controlled"));
+        }
+        validate_token("schema_version", schema_version, 32, false)?;
+        if let Some(session_id) = session_id {
+            validate_token("session_id", session_id, 128, false)?;
+        }
+        if let Some(mode) = mode {
+            validate_token("mode", mode, 32, false)?;
+        }
+        let severity = severity.unwrap_or("info");
+        if !matches!(severity, "debug" | "info" | "warn" | "error") {
+            return Err(anyhow::anyhow!("severity is not controlled"));
+        }
+        if payload_json.as_bytes().len() > MAX_TELEMETRY_PAYLOAD_BYTES {
+            return Err(anyhow::anyhow!("telemetry payload is too large"));
+        }
+        let payload: serde_json::Value = serde_json::from_str(payload_json)
+            .map_err(|_| anyhow::anyhow!("payload_json must be valid JSON"))?;
+        if contains_sensitive_json_key(&payload) {
+            return Err(anyhow::anyhow!(
+                "telemetry payload contains a restricted field"
+            ));
+        }
+        let payload_json = serde_json::to_string(&payload)?;
+        let occurred_at =
+            normalize_started_at(occurred_at)?.unwrap_or_else(|| Utc::now().to_rfc3339());
+        let event_id = next_id("evt");
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO telemetry_events
+                 (event_id, session_id, event_name, schema_version, occurred_at, mode, payload_json, severity)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![
+                event_id,
+                session_id,
+                event_name,
+                schema_version,
+                occurred_at,
+                mode,
+                payload_json,
+                severity,
+            ],
+        )?;
+        Ok(TelemetryEventResult { event_id })
+    }
+
+    pub fn export_diagnostics(&self, limit: i64) -> Result<serde_json::Value> {
+        let limit = limit.clamp(1, 1000);
+        let conn = self.0.lock().unwrap();
+        let mut telemetry = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT event_id, session_id, event_name, schema_version, occurred_at,
+                    mode, payload_json, severity
+             FROM telemetry_events ORDER BY occurred_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit], |r| {
+            let payload_json: String = r.get(6)?;
+            let payload = serde_json::from_str::<serde_json::Value>(&payload_json)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            Ok(serde_json::json!({
+                "event_id": r.get::<_, String>(0)?,
+                "session_id": r.get::<_, Option<String>>(1)?,
+                "event_name": r.get::<_, String>(2)?,
+                "schema_version": r.get::<_, String>(3)?,
+                "occurred_at": r.get::<_, String>(4)?,
+                "mode": r.get::<_, Option<String>>(5)?,
+                "payload": payload,
+                "severity": r.get::<_, String>(7)?,
+            }))
+        })?;
+        for row in rows {
+            telemetry.push(row?);
+        }
+        drop(stmt);
+
+        let mut reviews = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT action_id, session_id, mode, image_id, left_image_id,
+                    right_image_id, gesture, winner, group_key, started_at,
+                    committed_at, duration_ms, context_signature, result_json
+             FROM review_actions ORDER BY committed_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit], |r| {
+            let result_json: String = r.get(13)?;
+            let result = serde_json::from_str::<serde_json::Value>(&result_json)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            Ok(serde_json::json!({
+                "action_id": r.get::<_, String>(0)?,
+                "session_id": r.get::<_, Option<String>>(1)?,
+                "mode": r.get::<_, String>(2)?,
+                "image_id": r.get::<_, Option<i64>>(3)?,
+                "left_image_id": r.get::<_, Option<i64>>(4)?,
+                "right_image_id": r.get::<_, Option<i64>>(5)?,
+                "gesture": r.get::<_, Option<String>>(6)?,
+                "winner": r.get::<_, Option<i64>>(7)?,
+                "group_key": r.get::<_, Option<String>>(8)?,
+                "started_at": r.get::<_, Option<String>>(9)?,
+                "committed_at": r.get::<_, String>(10)?,
+                "duration_ms": r.get::<_, Option<i64>>(11)?,
+                "context_signature": r.get::<_, Option<String>>(12)?,
+                "result": result,
+            }))
+        })?;
+        for row in rows {
+            reviews.push(row?);
+        }
+
+        Ok(serde_json::json!({
+            "schema_version": "diagnostics-v1",
+            "telemetry_events": telemetry,
+            "review_actions": reviews,
+        }))
     }
 
     pub fn record_archive(&self, image_id: i64, dest: &str) -> Result<()> {
@@ -1378,6 +2105,9 @@ pub struct ImageInsert {
     pub workflow_graph_json: String,
     pub workflow_template_id: Option<i64>,
     pub workflow_match_confidence: Option<f64>,
+    pub generation_recipe_json: String,
+    pub recipe_signature: String,
+    pub parser_version: String,
 }
 
 #[allow(dead_code)]
@@ -1438,4 +2168,5 @@ mod tests {
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(version, migrations::CURRENT_VERSION);
     }
+
 }

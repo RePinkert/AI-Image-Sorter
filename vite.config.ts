@@ -31,36 +31,23 @@ function webBridge() {
 
         try {
           const url = new URL(req.url, 'http://localhost')
-          const db = new Database(dbPath)
-          for (const column of ['diffusion_model TEXT', "model_chain_json TEXT NOT NULL DEFAULT '[]'", 'workflow_key TEXT', 'workflow_graph_json TEXT', 'workflow_template_id INTEGER', 'workflow_match_confidence REAL']) {
-            const name = column.split(' ')[0]
-            const exists = db.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('images') WHERE name = ?").get(name) as { count: number }
-            if (!exists.count) db.exec(`ALTER TABLE images ADD COLUMN ${column}`)
+          const db = new Database(dbPath, { readonly: true, fileMustExist: true })
+          const tableExists = (name: string) => {
+            const row = db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name=?").get(name) as { count: number }
+            return row.count > 0
           }
-          db.exec(`CREATE TABLE IF NOT EXISTS workflow_templates (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            path TEXT NOT NULL UNIQUE,
-            workflow_id TEXT,
-            topology_signature TEXT NOT NULL,
-            graph_json TEXT NOT NULL,
-            node_count INTEGER NOT NULL,
-            diffusion_models TEXT NOT NULL DEFAULT '[]',
-            model_chain TEXT NOT NULL DEFAULT '[]',
-            scanned_at TEXT
-          )`)
-          // Keep the browser bridge aligned with the desktop migration. This
-          // is idempotent and fixes databases created before L0 was rebuilt
-          // from the normalized source path.
-          const sourceRows = db.prepare('SELECT id, path FROM sources').all() as Array<{ id: number; path: string }>
-          const updateL0 = db.prepare('UPDATE images SET group_key_l0 = ? WHERE source_id = ?')
-          const rebuildL0 = db.transaction(() => {
-            for (const source of sourceRows) {
-              const normalized = source.path.replaceAll('\\', '/').replace(/\/$/, '')
-              updateL0.run(xx.h64ToString(normalized), source.id)
-            }
-          })
-          rebuildL0()
+          const imageColumns = new Set(
+            (db.prepare("SELECT name FROM pragma_table_info('images')").all() as Array<{ name: string }>).map((row) => row.name),
+          )
+          const hasWorkflowJoin = tableExists('workflow_templates') && imageColumns.has('workflow_template_id')
+          const workflowJoin = hasWorkflowJoin
+            ? 'LEFT JOIN workflow_templates wt ON wt.id = i.workflow_template_id'
+            : ''
+          const workflowName = hasWorkflowJoin ? 'MIN(wt.name)' : 'NULL'
+          const imageWorkflowName = hasWorkflowJoin ? 'wt.name' : 'NULL'
+          const diffusionModel = imageColumns.has('diffusion_model')
+            ? "COALESCE(NULLIF(i.diffusion_model, ''), '')"
+            : "COALESCE(NULLIF(i.checkpoint, ''), '')"
           const level = Number(url.searchParams.get('level') ?? 3)
           const keyColumn = ['group_key_l0', 'group_key_l1', 'group_key_l2', 'group_key_l3'][level] ?? 'group_key_l3'
 
@@ -69,9 +56,15 @@ function webBridge() {
           } else if (url.pathname === '/api/labels') {
             send(200, db.prepare('SELECT id, name, gesture, color FROM labels ORDER BY id').all())
           } else if (url.pathname === '/api/workflow-templates') {
+            if (!tableExists('workflow_templates')) {
+              send(200, [])
+              db.close()
+              return
+            }
             const fromTable = db.prepare('SELECT id, name, path, workflow_id, topology_signature, graph_json, node_count, diffusion_models, model_chain FROM workflow_templates ORDER BY name').all()
             if (fromTable.length > 0) {
               send(200, fromTable)
+              db.close()
               return
             }
             const sources = db.prepare('SELECT path FROM sources').all() as Array<{ path: string }>
@@ -120,14 +113,15 @@ function webBridge() {
               SELECT ${keyColumn} AS group_key, COUNT(*) AS count,
                      MIN(i.prompt_pos) AS prompt_pos, MIN(i.checkpoint) AS checkpoint,
                      MIN(i.source_kind) AS source_kind, MIN(s.path) AS source_path,
-                     MIN(wt.name) AS workflow_name
+                     ${workflowName} AS workflow_name
               FROM images i JOIN sources s ON s.id = i.source_id
-              LEFT JOIN workflow_templates wt ON wt.id = i.workflow_template_id
+              ${workflowJoin}
               WHERE ${where} ${keyColumn} IS NOT NULL AND i.hidden = 0
               GROUP BY ${keyColumn} ORDER BY count DESC
             `).all() as Array<Record<string, unknown> & { group_key: string }>
             if (level === 1) {
-              const facetStmt = db.prepare(`SELECT COALESCE(NULLIF(diffusion_model, ''), '(未知)') AS model, COUNT(*) AS count
+              const facetColumn = imageColumns.has('diffusion_model') ? 'diffusion_model' : 'checkpoint'
+              const facetStmt = db.prepare(`SELECT COALESCE(NULLIF(${facetColumn}, ''), '(未知)') AS model, COUNT(*) AS count
                 FROM images WHERE group_key_l1 = ? AND hidden = 0 GROUP BY model ORDER BY count DESC`)
               for (const group of rows) {
                 group.model_facets = facetStmt.all(group.group_key)
@@ -150,28 +144,99 @@ function webBridge() {
             const rows = db.prepare(`SELECT i.id, i.source_id, i.abs_path, i.filename, i.width, i.height,
               i.prompt_pos, i.prompt_neg, i.checkpoint, i.loras, i.vae, i.samplers, i.seed,
               i.meta_ok, i.source_kind, i.hidden, i.size,
-              COALESCE(NULLIF(i.diffusion_model, ''), '') AS diffusion_model, wt.name AS workflow_name,
+              ${diffusionModel} AS diffusion_model, ${imageWorkflowName} AS workflow_name,
               (SELECT internal_score FROM scores WHERE scores.image_id = i.id) AS score
-              FROM images i LEFT JOIN workflow_templates wt ON wt.id = i.workflow_template_id
+              FROM images i ${workflowJoin}
               WHERE i.${keyColumn} = ? ${hidden} ORDER BY i.seed, i.filename`).all(groupKey)
             send(200, rows.map((row: any) => ({ ...row, labels: [], hidden: Boolean(row.hidden), meta_ok: Boolean(row.meta_ok) })))
           } else if (url.pathname === '/api/recommend-prompts') {
             if (level >= 3) {
               send(200, [])
+            } else if (!imageColumns.has('generation_recipe_json')) {
+              // Legacy databases must be migrated by the desktop app. The
+              // read-only dev bridge never mutates production schema.
+              send(200, [])
             } else {
               const groupKey = url.searchParams.get('groupKey') ?? ''
               const offset = Math.max(0, Number(url.searchParams.get('offset') ?? 0))
               const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit') ?? 10)))
-              const rows = db.prepare(`SELECT i.prompt_pos AS prompt_text,
-                COALESCE(i.diffusion_model, '') AS diffusion_model,
-                MAX(COALESCE(s.internal_score, 50.0)) AS max_score,
-                AVG(COALESCE(s.internal_score, 50.0)) AS avg_score,
-                COUNT(*) AS image_count
+              const rows = db.prepare(`SELECT i.id, i.prompt_pos AS prompt_text,
+                COALESCE(i.prompt_neg, '') AS prompt_neg,
+                i.generation_recipe_json,
+                COALESCE(s.internal_score, 50.0) AS score
                 FROM images i LEFT JOIN scores s ON s.image_id = i.id
                 WHERE i.${keyColumn} = ? AND i.hidden = 0 AND i.prompt_pos != ''
-                GROUP BY i.prompt_pos, i.diffusion_model ORDER BY max_score DESC
-                LIMIT ? OFFSET ?`).all(groupKey, limit, offset)
-              send(200, rows)
+                  AND i.generation_recipe_json IS NOT NULL
+                  AND i.generation_recipe_json != '' AND i.generation_recipe_json != '{}'`).all(groupKey) as Array<{
+                    id: number
+                    prompt_text: string
+                    prompt_neg: string
+                    generation_recipe_json: string
+                    score: number
+                  }>
+              const grouped = new Map<string, {
+                prompt_text: string
+                prompt_neg: string
+                recipe: Record<string, any>
+                samples: Array<{ id: number; score: number }>
+              }>()
+              for (const row of rows) {
+                try {
+                  const recipe = JSON.parse(row.generation_recipe_json) as Record<string, any>
+                  const complete = Boolean(recipe.checkpoint || recipe.diffusion_model)
+                    && Boolean(recipe.sampler) && Boolean(recipe.scheduler)
+                    && Number(recipe.steps) > 0 && Number.isFinite(Number(recipe.cfg))
+                    && Number(recipe.width) > 0 && Number(recipe.height) > 0
+                  if (!complete) continue
+                  const key = JSON.stringify([row.prompt_text, row.prompt_neg, recipe])
+                  const entry = grouped.get(key) ?? {
+                    prompt_text: row.prompt_text,
+                    prompt_neg: row.prompt_neg,
+                    recipe,
+                    samples: [],
+                  }
+                  entry.samples.push({ id: row.id, score: Number.isFinite(row.score) ? row.score : 50 })
+                  grouped.set(key, entry)
+                } catch {
+                  // Ignore malformed legacy recipe rows.
+                }
+              }
+              const ranked = Array.from(grouped.values()).map((entry) => {
+                const scores = entry.samples.map((sample) => sample.score).sort((a, b) => a - b)
+                const sampleCount = scores.length
+                const avgScore = scores.reduce((sum, score) => sum + score, 0) / sampleCount
+                const middle = Math.floor(sampleCount / 2)
+                const medianScore = sampleCount % 2 === 1 ? scores[middle] : (scores[middle - 1] + scores[middle]) / 2
+                const scoreVariance = scores.reduce((sum, score) => sum + (score - avgScore) ** 2, 0) / sampleCount
+                const confidence = sampleCount / (sampleCount + 5)
+                const shrinkScore = avgScore * confidence + 50 * (1 - confidence)
+                const examples = [...entry.samples].sort((a, b) => b.score - a.score || a.id - b.id).slice(0, 4)
+                return {
+                  rank: shrinkScore,
+                  prompt_text: entry.prompt_text,
+                  prompt_neg: entry.prompt_neg,
+                  diffusion_model: String(entry.recipe.diffusion_model ?? ''),
+                  checkpoint: String(entry.recipe.checkpoint ?? ''),
+                  loras: Array.isArray(entry.recipe.loras) ? entry.recipe.loras : [],
+                  vae: String(entry.recipe.vae ?? ''),
+                  sampler: String(entry.recipe.sampler ?? ''),
+                  scheduler: String(entry.recipe.scheduler ?? ''),
+                  steps: Number(entry.recipe.steps),
+                  cfg: Number(entry.recipe.cfg),
+                  width: Number(entry.recipe.width),
+                  height: Number(entry.recipe.height),
+                  aspect_ratio: Number(entry.recipe.aspect_ratio) || Number(entry.recipe.width) / Number(entry.recipe.height),
+                  sample_count: sampleCount,
+                  max_score: Math.max(...scores),
+                  avg_score: avgScore,
+                  median_score: medianScore,
+                  score_variance: scoreVariance,
+                  confidence,
+                  example_image_ids: examples.map((sample) => sample.id),
+                  image_count: sampleCount,
+                }
+              }).sort((a, b) => b.rank - a.rank || b.avg_score - a.avg_score || b.sample_count - a.sample_count)
+              send(200, ranked.slice(offset, offset + limit).map(({ rank: _rank, ...item }) => item))
             }
           } else if (url.pathname === '/api/arena-suggested') {
             const left = Number(url.searchParams.get('left'))
@@ -181,11 +246,14 @@ function webBridge() {
           } else if (url.pathname === '/api/file') {
             const filePath = url.searchParams.get('path')
             if (!filePath) send(400, { error: 'missing path' })
-            else if (!fs.existsSync(filePath)) send(404, { error: 'file not found' })
             else {
               const ext = path.extname(filePath).toLowerCase()
               const types: Record<string, string> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.bmp': 'image/bmp' }
-              send(200, fs.readFileSync(filePath), types[ext] ?? 'application/octet-stream')
+              const registered = db.prepare('SELECT COUNT(*) AS count FROM images WHERE abs_path = ?').get(filePath) as { count: number }
+              if (!registered.count) send(403, { error: 'file is not registered' })
+              else if (!types[ext]) send(415, { error: 'unsupported image type' })
+              else if (!fs.existsSync(filePath)) send(404, { error: 'file not found' })
+              else send(200, fs.readFileSync(filePath), types[ext])
             }
           } else {
             send(404, { error: 'unknown api route' })

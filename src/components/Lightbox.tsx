@@ -84,6 +84,7 @@ export function Lightbox({ src, onClose }: Props) {
       </motion.div>
       <div className="lightbox-hud">
         <button
+          type="button"
           onClick={(e) => {
             e.stopPropagation()
             setScale((s) => clamp(s - 0.2, MIN, MAX))
@@ -93,6 +94,7 @@ export function Lightbox({ src, onClose }: Props) {
         </button>
         <span className="lb-scale">{Math.round(scale * 100)}%</span>
         <button
+          type="button"
           onClick={(e) => {
             e.stopPropagation()
             setScale((s) => clamp(s + 0.2, MIN, MAX))
@@ -101,6 +103,7 @@ export function Lightbox({ src, onClose }: Props) {
           ＋
         </button>
         <button
+          type="button"
           onClick={(e) => {
             e.stopPropagation()
             setPos({ x: 0, y: 0 })
@@ -109,7 +112,7 @@ export function Lightbox({ src, onClose }: Props) {
         >
           适合
         </button>
-        <button onClick={(e) => { e.stopPropagation(); onClose() }}>关闭</button>
+        <button type="button" onClick={(e) => { e.stopPropagation(); onClose() }}>关闭</button>
       </div>
       <p className="muted hint lb-hint">单击切换 1×/2× · 双击重置 · 滚轮缩放 · 拖动平移 · ESC 关闭</p>
     </div>

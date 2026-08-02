@@ -1,16 +1,18 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   assetUrl,
   confirmAction,
+  errorMessage,
   listGroupImagesAll,
   splitImages,
-  toggleHidden as toggleHiddenApi,
+  toggleHiddenAction,
   trashImage as trashImageApi,
 } from '../api'
 import type { ImageRow } from '../types'
 import { useStore } from '../store'
 import { Lightbox } from './Lightbox'
 import { PromptRecommendPanel } from './PromptRecommendPanel'
+import { getTelemetrySessionId, trackAction } from '../telemetry'
 
 type SortKey = 'score-desc' | 'score-asc' | 'filename' | 'seed' | 'size-desc' | 'size-asc'
 
@@ -18,6 +20,7 @@ export function FolderView() {
   const setView = useStore((s) => s.setView)
   const currentGroupKey = useStore((s) => s.currentGroupKey)
   const granularity = useStore((s) => s.granularity)
+  const dataRevision = useStore((s) => s.dataRevision)
   const [images, setImages] = useState<ImageRow[]>([])
   const [busy, setBusy] = useState<number | null>(null)
   const [lightbox, setLightbox] = useState<string | null>(null)
@@ -26,13 +29,36 @@ export function FolderView() {
   const [showHiddenOnly, setShowHiddenOnly] = useState(false)
   const [batchMode, setBatchMode] = useState(false)
   const [selected, setSelected] = useState<Set<number>>(new Set())
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
+  const [actionError, setActionError] = useState('')
+  const loadRequestRef = useRef(0)
+
+  const loadImages = useCallback(async () => {
+    if (currentGroupKey == null) return
+    const request = ++loadRequestRef.current
+    setLoading(true)
+    setLoadError('')
+    try {
+      const rows = await listGroupImagesAll(currentGroupKey, granularity)
+      if (request !== loadRequestRef.current) return
+      setImages(rows)
+      setLoading(false)
+    } catch (error) {
+      if (request !== loadRequestRef.current) return
+      setLoadError(errorMessage(error))
+      setLoading(false)
+    }
+  }, [currentGroupKey, granularity])
 
   useEffect(() => {
-    if (currentGroupKey == null) return
-    listGroupImagesAll(currentGroupKey, granularity).then(setImages).catch(() => {})
+    void loadImages()
     setSelected(new Set())
     setBatchMode(false)
-  }, [currentGroupKey, granularity])
+    return () => {
+      loadRequestRef.current += 1
+    }
+  }, [loadImages, dataRevision])
 
   const sorted = useMemo(() => {
     const arr = [...images]
@@ -67,11 +93,25 @@ export function FolderView() {
   async function toggleHidden(img: ImageRow) {
     if (busy !== null) return
     setBusy(img.id)
+    setActionError('')
+    const startedMs = Date.now()
     try {
-      await toggleHiddenApi(img.id, !img.hidden)
+      await toggleHiddenAction(img.id, !img.hidden, {
+        sessionId: getTelemetrySessionId(),
+        startedAt: new Date().toISOString(),
+        contextSignature: currentGroupKey ?? undefined,
+      })
       setImages((arr) =>
         arr.map((x) => (x.id === img.id ? { ...x, hidden: !img.hidden } : x)),
       )
+      trackAction('hide', {
+        hidden: !img.hidden,
+        mode: 'folder',
+        duration_ms: Date.now() - startedMs,
+        image_id: img.id,
+      })
+    } catch (error) {
+      setActionError(errorMessage(error))
     } finally {
       setBusy(null)
     }
@@ -80,12 +120,13 @@ export function FolderView() {
   async function trash(img: ImageRow) {
     if (busy !== null) return
     setBusy(img.id)
+    setActionError('')
     setConfirm(null)
     try {
       await trashImageApi(img.id)
       setImages((arr) => arr.filter((x) => x.id !== img.id))
     } catch (e) {
-      alert(`删除失败：${String(e)}`)
+      setActionError(`删除失败：${errorMessage(e)}`)
     } finally {
       setBusy(null)
     }
@@ -107,40 +148,65 @@ export function FolderView() {
   async function batchDelete() {
     const ids = Array.from(selected)
     if (ids.length === 0) return
-    const ok = await confirmAction(
-      `确定要删除选中的 ${ids.length} 张图片吗？`,
-      '文件将送入系统回收站，可从桌面恢复。',
-    )
+    let ok = false
+    try {
+      ok = await confirmAction(
+        `确定要删除选中的 ${ids.length} 张图片吗？`,
+        '文件将送入系统回收站，可从桌面恢复。',
+      )
+    } catch (error) {
+      setActionError(`无法打开确认窗口：${errorMessage(error)}`)
+      return
+    }
     if (!ok) return
     setBusy(-1)
-    let failed = 0
-    for (const id of ids) {
-      try {
-        await trashImageApi(id)
-      } catch {
-        failed += 1
+    setActionError('')
+    const succeeded = new Set<number>()
+    try {
+      for (const id of ids) {
+        try {
+          await trashImageApi(id)
+          succeeded.add(id)
+        } catch {
+          // Keep failed rows selected so the user can retry them.
+        }
       }
+      setImages((arr) => arr.filter((x) => !succeeded.has(x.id)))
+      const failedIds = ids.filter((id) => !succeeded.has(id))
+      setSelected(new Set(failedIds))
+      if (failedIds.length > 0) setActionError(`${failedIds.length} 张删除失败，可重试剩余项目。`)
+    } finally {
+      setBusy(null)
     }
-    setImages((arr) => arr.filter((x) => !selected.has(x.id)))
-    setSelected(new Set())
-    setBusy(null)
-    if (failed > 0) alert(`${failed} 张删除失败`)
   }
 
   async function batchUnhide() {
     const ids = Array.from(selected)
     if (ids.length === 0) return
     setBusy(-1)
-    for (const id of ids) {
-      try {
-        await toggleHiddenApi(id, false)
-      } catch {
-        // ignore individual failures
+    setActionError('')
+    const succeeded = new Set<number>()
+    try {
+      for (const id of ids) {
+        try {
+          await toggleHiddenAction(id, false, {
+            sessionId: getTelemetrySessionId(),
+            startedAt: new Date().toISOString(),
+            contextSignature: currentGroupKey ?? undefined,
+          })
+          succeeded.add(id)
+          trackAction('hide', { hidden: false, mode: 'folder', image_id: id })
+        } catch {
+          // Keep failed rows selected so the user can retry them.
+        }
       }
+      setImages((arr) => arr.map((x) => (succeeded.has(x.id) ? { ...x, hidden: false } : x)))
+      const failedIds = ids.filter((id) => !succeeded.has(id))
+      setSelected(new Set(failedIds))
+      if (failedIds.length > 0) setActionError(`${failedIds.length} 张取消屏蔽失败，可重试剩余项目。`)
+    } finally {
+      setBusy(null)
     }
-    setImages((arr) => arr.map((x) => (selected.has(x.id) ? { ...x, hidden: false } : x)))
-    setSelected(new Set())
-    setBusy(null)
   }
 
   // Manual 拆组: pull the selected images out of the current L2 group into
@@ -150,13 +216,14 @@ export function FolderView() {
     const ids = Array.from(selected)
     if (ids.length === 0 || granularity !== 2) return
     setBusy(-1)
+    setActionError('')
     try {
       const r = await splitImages(2, ids)
       setImages((arr) => arr.filter((x) => !selected.has(x.id)))
       setSelected(new Set())
       alert(`已拆出 ${r.moved} 张为新分组`)
     } catch (e) {
-      alert(`拆组失败：${String(e)}`)
+      setActionError(`拆组失败：${errorMessage(e)}`)
     } finally {
       setBusy(null)
     }
@@ -166,7 +233,20 @@ export function FolderView() {
     return (
       <div className="panel">
         <p>未选择分组。</p>
-        <button onClick={() => setView('groups')}>返回</button>
+        <button type="button" onClick={() => setView('groups')}>返回</button>
+      </div>
+    )
+  }
+
+  if (loading) {
+    return <div className="panel state-panel" role="status"><p className="muted">正在加载文件夹内容…</p></div>
+  }
+
+  if (loadError) {
+    return (
+      <div className="panel state-panel" role="alert">
+        <p>加载失败：{loadError}</p>
+        <button type="button" onClick={() => void loadImages()}>重试</button>
       </div>
     )
   }
@@ -190,16 +270,16 @@ export function FolderView() {
   return (
     <div className="folder-view">
       <div className="folder-topbar">
-        <button onClick={() => setView('groups')}>← 返回分组</button>
+        <button type="button" onClick={() => setView('groups')}>← 返回分组</button>
         <span className="counter">文件夹视角</span>
         <span style={{ flex: 1 }} />
         {batchMode ? (
-          <button onClick={() => { setBatchMode(false); setSelected(new Set()) }}>
+          <button type="button" onClick={() => { setBatchMode(false); setSelected(new Set()) }}>
             退出批量
           </button>
         ) : (
           <>
-            <button onClick={() => setBatchMode(true)}>批量管理</button>
+            <button type="button" onClick={() => setBatchMode(true)}>批量管理</button>
             <select
               className="sort-select"
               value={sortKey}
@@ -215,8 +295,8 @@ export function FolderView() {
             </select>
           </>
         )}
-        <button onClick={() => setView('swipe')}>滑卡模式</button>
-        <button onClick={() => setView('arena')}>擂台模式</button>
+        <button type="button" onClick={() => setView('swipe')}>滑卡模式</button>
+        <button type="button" onClick={() => setView('arena')}>擂台模式</button>
       </div>
       <div className="folder-toolbar">
         共 {images.length} 张 · 可评分 {summary.visible} 张 · 已屏蔽 {summary.hidden} 张 ·
@@ -232,10 +312,11 @@ export function FolderView() {
         {batchMode && (
           <span className="batch-bar">
             已选 {selected.size} 张
-            <button onClick={selectAll} disabled={busy !== null}>全选</button>
-            <button onClick={batchUnhide} disabled={selected.size === 0 || busy !== null}>批量取消屏蔽</button>
+            <button type="button" onClick={selectAll} disabled={busy !== null}>全选</button>
+            <button type="button" onClick={() => void batchUnhide()} disabled={selected.size === 0 || busy !== null}>批量取消屏蔽</button>
             {granularity === 2 && (
               <button
+                type="button"
                 onClick={batchSplit}
                 disabled={selected.size === 0 || busy !== null}
                 title="将选中的图片拆出为新的 Prompt偏差 分组（自动重聚类不会重新并入）"
@@ -244,6 +325,7 @@ export function FolderView() {
               </button>
             )}
             <button
+              type="button"
               onClick={batchDelete}
               disabled={selected.size === 0 || busy !== null}
               style={{ borderColor: 'var(--bad)' }}
@@ -254,6 +336,7 @@ export function FolderView() {
         )}
         <PromptRecommendPanel groupKey={currentGroupKey} granularity={granularity} />
       </div>
+      {actionError && <div className="action-error" role="alert"><span>{actionError}</span></div>}
       {visible.length === 0 ? (
         <div className="panel">
           <p className="muted">{showHiddenOnly ? '没有已屏蔽的图片。' : '该组无图片。'}</p>
@@ -268,6 +351,14 @@ export function FolderView() {
                 className={`folder-item ${img.hidden ? 'blocked' : ''} ${batchMode ? 'batch' : ''} ${isSelected ? 'selected' : ''}`}
                 key={img.id}
                 onClick={batchMode ? () => toggleSelect(img.id) : undefined}
+                role={batchMode ? 'button' : undefined}
+                tabIndex={batchMode ? 0 : undefined}
+                onKeyDown={batchMode ? (event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault()
+                    toggleSelect(img.id)
+                  }
+                } : undefined}
               >
                 {batchMode && (
                   <input
@@ -285,6 +376,7 @@ export function FolderView() {
                 {!batchMode && (
                   <div className="folder-actions">
                     <button
+                      type="button"
                       onClick={(e) => { e.stopPropagation(); toggleHidden(img) }}
                       disabled={busy !== null}
                       title={img.hidden ? '取消屏蔽（重新参与评分）' : '屏蔽（赋 0 分，可恢复）'}
@@ -292,6 +384,7 @@ export function FolderView() {
                       {img.hidden ? '取消屏蔽' : '屏蔽'}
                     </button>
                     <button
+                      type="button"
                       onClick={(e) => { e.stopPropagation(); confirm === img.id ? trash(img) : setConfirm(img.id) }}
                       disabled={busy !== null}
                       title="送入系统回收站"
