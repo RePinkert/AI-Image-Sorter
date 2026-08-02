@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type ReactElement } from 'react'
 import { recommendPrompts } from '../api'
 import type { PromptRecommendation } from '../types'
+import { CopyButton } from './CopyButton'
 
 interface Props {
   groupKey: string
@@ -130,6 +131,7 @@ export function PromptRecommendPanel({ groupKey, granularity }: Props) {
                     <span className="rec-max">最高 {r.max_score.toFixed(0)}</span>
                     <span className="rec-avg">均分 {r.avg_score.toFixed(1)}</span>
                     <span className="rec-count">{r.image_count} 张</span>
+                    <CopyButton text={r.prompt_text} className="rec-copy-btn" />
                   </div>
                   <pre className="recommend-text">
                     {commonTokens.size > 0

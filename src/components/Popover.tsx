@@ -79,7 +79,17 @@ export function Popover({ trigger, children, open: controlledOpen, onOpenChange 
       </div>
       {open &&
         createPortal(
-          <div ref={panelRef} className="popover-panel" style={style}>
+          <div
+            ref={panelRef}
+            className="popover-panel"
+            style={style}
+            // The panel is portaled to <body>, but React synthetic events
+            // bubble through the *component* tree, so a click inside the panel
+            // would otherwise reach card-level handlers (e.g. Arena's
+            // "click = vote"). Stop it here so interacting with the popover
+            // (selecting/copying a prompt, clicking 屏蔽) never fires one.
+            onClick={(e) => e.stopPropagation()}
+          >
             {children}
           </div>,
           document.body,

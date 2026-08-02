@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { arenaVote, assetUrl, listGroupImages, toggleHidden as toggleHiddenApi } from '../api'
 import type { ImageRow } from '../types'
 import { useStore } from '../store'
+import { bindingDisplay, matchesBinding } from '../keymap'
 import { Lightbox } from './Lightbox'
 import { Popover } from './Popover'
 import { ImageMetaPopover } from './ImageMetaPopover'
@@ -19,6 +20,7 @@ export function Arena() {
   const setView = useStore((s) => s.setView)
   const currentGroupKey = useStore((s) => s.currentGroupKey)
   const granularity = useStore((s) => s.granularity)
+  const keybindings = useStore((s) => s.keybindings)
   const [images, setImages] = useState<ImageRow[]>([])
   const [left, setLeft] = useState<ImageRow | null>(null)
   const [right, setRight] = useState<ImageRow | null>(null)
@@ -32,7 +34,7 @@ export function Arena() {
   const [leftPopoverOpen, setLeftPopoverOpen] = useState(false)
   const [rightPopoverOpen, setRightPopoverOpen] = useState(false)
   const bothOpen = leftPopoverOpen && rightPopoverOpen
-  // 待屏蔽悬停态：按 H 进入，←/→ 选定要屏蔽的卡，↓ 退出。
+  // 待屏蔽悬停态：按住 Shift 触发提示（松开 Shift 取消），Shift+←/→ 屏蔽对应卡。
   const [pendingHide, setPendingHide] = useState(false)
   // 最近一次屏蔽的卡（用于 Backspace 撤销，分数保持 0）。
   const lastHidden = useRef<ImageRow | null>(null)
@@ -118,10 +120,10 @@ export function Arena() {
   }
 
   // 屏蔽一张卡：赋 0 分（后端）、移出候选集、立即重抽下一对。
+  // 待屏蔽提示由 Shift 的 keyup 复位（按住 Shift 可连续屏蔽多张），这里不清除。
   async function hideCard(img: ImageRow) {
     if (busy) return
     setBusy(true)
-    setPendingHide(false)
     setLeftPopoverOpen(false)
     setRightPopoverOpen(false)
     try {
@@ -157,46 +159,49 @@ export function Arena() {
     }
   }
 
-  // 键盘：左 → 左胜 / 右 → 右胜（与按钮方向一致）/ 空格 → 下一对。
-  // H 进入待屏蔽悬停态；待屏蔽态下 ←/→ 选卡、↓ 退出。
+  // 键盘：左 → 左胜 / 右 → 右胜 / 空格 → 下一对。
+  // 屏蔽为组合键：按住 Shift 触发待屏蔽提示（不松开即可看到），
+  // Shift+← / Shift+→ 直接屏蔽对应卡；松开 Shift 取消提示。
   // Backspace 撤销最近一次屏蔽。
+  // 弹窗或灯箱打开时不响应擂台键，避免复制 Prompt 时误触发投票/屏蔽。
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
+    const onKeyDown = (e: KeyboardEvent) => {
       if (lightbox) return
-      if (pendingHide) {
-        if (e.key === 'ArrowLeft') {
-          e.preventDefault()
-          if (left) hideCard(left)
-        } else if (e.key === 'ArrowRight') {
-          e.preventDefault()
-          if (right) hideCard(right)
-        } else if (e.key === 'ArrowDown') {
-          e.preventDefault()
-          setPendingHide(false)
-        }
-        return
-      }
-      if (e.key === 'ArrowLeft') {
-        e.preventDefault()
-        vote(true)
-      } else if (e.key === 'ArrowRight') {
-        e.preventDefault()
-        vote(false)
-      } else if (e.key === ' ' || e.key === 'Spacebar' || e.key.toLowerCase() === 's') {
-        e.preventDefault()
-        if (!busy) pickPair(images, scores)
-      } else if (e.key === 'h' || e.key === 'H') {
+      if (leftPopoverOpen || rightPopoverOpen) return
+      if (matchesBinding(keybindings.arenaArmHide, e)) {
         e.preventDefault()
         if (!busy) setPendingHide(true)
-      } else if (e.key === 'Backspace') {
+      } else if (matchesBinding(keybindings.arenaHideLeft, e)) {
+        e.preventDefault()
+        if (left && !busy) hideCard(left)
+      } else if (matchesBinding(keybindings.arenaHideRight, e)) {
+        e.preventDefault()
+        if (right && !busy) hideCard(right)
+      } else if (matchesBinding(keybindings.arenaVoteLeft, e)) {
+        e.preventDefault()
+        vote(true)
+      } else if (matchesBinding(keybindings.arenaVoteRight, e)) {
+        e.preventDefault()
+        vote(false)
+      } else if (matchesBinding(keybindings.arenaSkip, e)) {
+        e.preventDefault()
+        if (!busy) pickPair(images, scores)
+      } else if (matchesBinding(keybindings.arenaUndoHide, e)) {
         e.preventDefault()
         undoLastHide()
       }
     }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Shift') setPendingHide(false)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    window.addEventListener('keyup', onKeyUp)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+      window.removeEventListener('keyup', onKeyUp)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [left, right, busy, images, scores, lightbox, pendingHide])
+  }, [left, right, busy, images, scores, lightbox, leftPopoverOpen, rightPopoverOpen, keybindings])
 
   const leftScore = left ? scores[left.id] ?? 50 : 0
   const rightScore = right ? scores[right.id] ?? 50 : 0
@@ -222,7 +227,8 @@ export function Arena() {
       </div>
       {pendingHide && (
         <div className="arena-pending-hint">
-          待屏蔽悬停态：按 ← 屏蔽左卡 · 按 → 屏蔽右卡 · 按 ↓ 取消
+          待屏蔽：按住 Shift，{bindingDisplay(keybindings.arenaHideLeft)} 屏蔽左卡 ·{' '}
+          {bindingDisplay(keybindings.arenaHideRight)} 屏蔽右卡 · 松开 Shift 取消
         </div>
       )}
       <div className="arena-stage">
@@ -284,7 +290,13 @@ export function Arena() {
           <div className="arena-label">{pendingHide ? '→ 屏蔽此卡' : '点击/→ 胜出'}</div>
         </div>
       </div>
-      <p className="muted hint">← / → 选胜方 · 空格或 S 跳过 · H 进入屏蔽（←/→ 选卡、↓ 取消）· Backspace 撤销最近屏蔽 · 单击图片放大 · 两侧"更多"可屏蔽并查看 Prompt 差异高亮</p>
+      <p className="muted hint">
+        {bindingDisplay(keybindings.arenaVoteLeft)} / {bindingDisplay(keybindings.arenaVoteRight)} 选胜方 ·{' '}
+        {bindingDisplay(keybindings.arenaSkip)} 跳过 · 按住{' '}
+        {bindingDisplay(keybindings.arenaArmHide)} 后按{' '}
+        {bindingDisplay(keybindings.arenaHideLeft)} / {bindingDisplay(keybindings.arenaHideRight)}{' '}
+        屏蔽对应卡 · {bindingDisplay(keybindings.arenaUndoHide)} 撤销最近屏蔽 · 单击图片放大 · 两侧"更多"可屏蔽并查看 Prompt 差异高亮
+      </p>
       {lightbox && <Lightbox src={assetUrl(lightbox)} onClose={() => setLightbox(null)} />}
     </div>
   )

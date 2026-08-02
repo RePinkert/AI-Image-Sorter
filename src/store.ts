@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type { GroupInfo, Granularity, LabelRow, SourceRow, SyncProgress } from './types'
+import { DEFAULT_KEYMAP, type Binding, type Keymap } from './keymap'
 
 export type View = 'import' | 'groups' | 'swipe' | 'arena' | 'folder' | 'settings'
 
@@ -44,6 +45,10 @@ interface AppState {
   // raw tokens sees high overlap even for visually distinct outputs.
   // The recluster_source command applies the user's choice live.
   l2Threshold: number
+  // Persisted keyboard shortcuts. Defaults match the historical hardcoded
+  // keys; the arena hide action moved to the Shift combo (hold Shift to arm,
+  // Shift+←/→ to hide the matching card).
+  keybindings: Keymap
   syncStatus: 'idle' | 'syncing' | 'success' | 'error'
   syncMessage: string
   syncUpdatedAt: string | null
@@ -56,6 +61,8 @@ interface AppState {
   setGranularity: (g: Granularity) => void
   setLabels: (l: LabelRow[]) => void
   setL2Threshold: (t: number) => void
+  setKeybinding: (action: keyof Keymap, binding: Binding) => void
+  resetKeybindings: () => void
   setSyncState: (status: AppState['syncStatus'], message: string) => void
   applySyncProgress: (p: SyncProgress) => void
   resetSyncProgress: () => void
@@ -74,6 +81,7 @@ export const useStore = create<AppState>()(
       granularity: 3,
       labels: [],
       l2Threshold: 0.3,
+      keybindings: DEFAULT_KEYMAP,
       syncStatus: 'idle',
       syncMessage: '',
       syncUpdatedAt: null,
@@ -86,6 +94,9 @@ export const useStore = create<AppState>()(
       setGranularity: (g) => set({ granularity: g }),
       setLabels: (l) => set({ labels: l }),
       setL2Threshold: (t) => set({ l2Threshold: t }),
+      setKeybinding: (action, binding) =>
+        set((s) => ({ keybindings: { ...s.keybindings, [action]: binding } })),
+      resetKeybindings: () => set({ keybindings: DEFAULT_KEYMAP }),
       setSyncState: (status, message) => set({ syncStatus: status, syncMessage: message, syncUpdatedAt: new Date().toISOString() }),
       applySyncProgress: (p) =>
         set({
@@ -110,6 +121,7 @@ export const useStore = create<AppState>()(
         granularity: s.granularity,
         currentGroupKey: s.currentGroupKey,
         l2Threshold: s.l2Threshold,
+        keybindings: s.keybindings,
       }),
     },
   ),

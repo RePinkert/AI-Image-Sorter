@@ -1084,3 +1084,169 @@ select {
   font-weight: 700;
   color: #8affa8;
 }
+
+/* Copy buttons */
+.copy-btn {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 6px;
+  margin-left: 8px;
+  color: var(--accent);
+  border-color: var(--border);
+  background: transparent;
+  white-space: nowrap;
+}
+.copy-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+}
+.meta-field > strong .copy-btn {
+  vertical-align: middle;
+  margin-left: 8px;
+}
+.rec-copy-btn {
+  margin-left: auto;
+}
+
+/* ---------- Keymap panel (TraceBoard-style keyboard visualization) ---------- */
+.keymap-panel {
+  margin-top: 16px;
+  padding: 16px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.keymap-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.keymap-head .ghost {
+  background: transparent;
+}
+.keyboard-vis {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 14px 0 20px;
+  padding: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow-x: auto;
+}
+.kb-row {
+  display: flex;
+  gap: 5px;
+  justify-content: center;
+  flex-wrap: nowrap;
+}
+.kb-row-center {
+  justify-content: center;
+}
+.kb-key {
+  position: relative;
+  flex: 0 1 auto;
+  min-width: 40px;
+  height: 46px;
+  padding: 4px 5px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 2px;
+  overflow: hidden;
+}
+.kb-key.kb-wide {
+  flex: 1.6 1 auto;
+  min-width: 60px;
+}
+.kb-key.kb-space {
+  flex: 4 1 auto;
+  min-width: 130px;
+}
+.kb-key.kb-conflict {
+  border-color: var(--bad);
+  box-shadow: 0 0 0 1px var(--bad) inset;
+}
+.kb-cap {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1;
+}
+.kb-mod-dot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.kb-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  min-height: 0;
+}
+.kb-chip {
+  font-size: 9px;
+  line-height: 1.2;
+  font-weight: 700;
+  padding: 0 3px;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.35);
+  white-space: nowrap;
+}
+.keymap-group h4 {
+  margin: 18px 0 6px;
+  color: var(--muted);
+}
+.keymap-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.keymap-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  vertical-align: middle;
+}
+.keymap-table tr.km-conflict {
+  background: color-mix(in srgb, var(--bad) 10%, transparent);
+}
+.km-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  margin-right: 8px;
+  vertical-align: middle;
+}
+.km-binding code {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  padding: 1px 6px;
+  border-radius: 5px;
+  font-size: 12px;
+}
+.km-warn {
+  margin-left: 8px;
+  color: var(--bad);
+  font-size: 11px;
+}
+.km-actions {
+  text-align: right;
+}
+.km-actions button {
+  font-size: 12px;
+  padding: 3px 10px;
+}
+.km-capturing {
+  color: var(--warn);
+  font-size: 12px;
+}

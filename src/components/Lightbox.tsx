@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { motion, type PanInfo } from 'framer-motion'
+import { useStore } from '../store'
+import { matchesBinding } from '../keymap'
 
 // Minimal lightbox mirroring the conventions users already expect from
 // image viewers: click to zoom-to-fit, wheel to scale, drag to pan, ESC
@@ -18,18 +20,20 @@ export function Lightbox({ src, onClose }: Props) {
   const [scale, setScale] = useState(FIT)
   const [pos, setPos] = useState({ x: 0, y: 0 })
   const wheelAccum = useRef(0)
+  const closeBinding = useStore((s) => s.keybindings.closeLightbox)
 
-  // ESC closes; reset transform on unmount so a future open starts clean.
+  // Close key (default Esc) closes; reset transform on unmount so a future
+  // open starts clean.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
+      if (matchesBinding(closeBinding, e)) {
         e.preventDefault()
         onClose()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+  }, [onClose, closeBinding])
 
   function clamp(v: number, lo: number, hi: number) {
     return Math.max(lo, Math.min(hi, v))

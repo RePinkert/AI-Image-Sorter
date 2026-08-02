@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { deleteLabel, listLabels, upsertLabel } from '../api'
 import type { LabelRow } from '../types'
 import { useStore } from '../store'
+import { KeymapPanel } from './KeymapPanel'
 
 const GESTURES = ['left', 'right', 'up', 'down']
 
@@ -71,6 +72,7 @@ export function Settings() {
   const setLabels = useStore((s) => s.setLabels)
   const [rows, setRows] = useState<LabelRow[]>([])
   const [draft, setDraft] = useState({ name: '', gesture: 'left', color: '#888888' })
+  const [showKeymap, setShowKeymap] = useState(false)
 
   async function refresh() {
     const l = await listLabels()
@@ -149,8 +151,13 @@ export function Settings() {
 
       <div className="row">
         <button onClick={() => setView('groups')}>返回</button>
+        <button className={showKeymap ? 'gran-active' : ''} onClick={() => setShowKeymap(!showKeymap)}>
+          {showKeymap ? '收起键位设置' : '键位设置'}
+        </button>
         <ExportButtons />
       </div>
+
+      {showKeymap && <KeymapPanel />}
 
       <ClusterSection />
     </div>

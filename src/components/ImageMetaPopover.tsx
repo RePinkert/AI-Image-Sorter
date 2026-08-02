@@ -1,5 +1,6 @@
 import { useMemo, type ReactElement } from 'react'
 import type { ImageRow } from '../types'
+import { CopyButton } from './CopyButton'
 
 interface ImageMetaPopoverProps {
   img: ImageRow
@@ -72,6 +73,7 @@ export function ImageMetaPopover({ img, comparePrompt, diffColor, onHide }: Imag
               {diffColor === 'left' ? '左独有' : '右独有'}高亮
             </span>
           )}
+          <CopyButton text={img.prompt_pos || ''} className="meta-copy-btn" />
         </strong>
         <pre>{promptDisplay}</pre>
       </div>

@@ -11,6 +11,7 @@ import {
 } from '../api'
 import type { ImageRow } from '../types'
 import { useStore } from '../store'
+import { bindingDisplay, matchesBinding } from '../keymap'
 import { Lightbox } from './Lightbox'
 import { Popover } from './Popover'
 import { ImageMetaPopover } from './ImageMetaPopover'
@@ -28,14 +29,31 @@ const EXIT_VEC: Record<Gesture, { x: number; y: number }> = {
   down: { x: 0, y: 1000 },
 }
 
+// Fisher-Yates (Knuth) shuffle: uniform, in-place, O(n).
+function shuffle<T>(arr: T[]): T[] {
+  const a = [...arr]
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[a[i], a[j]] = [a[j], a[i]]
+  }
+  return a
+}
+
 export function SwipeDeck() {
   const setView = useStore((s) => s.setView)
   const currentGroupKey = useStore((s) => s.currentGroupKey)
   const granularity = useStore((s) => s.granularity)
+  const keybindings = useStore((s) => s.keybindings)
   const labels = useStore((s) => s.labels)
   const setLabels = useStore((s) => s.setLabels)
   const [images, setImages] = useState<ImageRow[]>([])
   const [idx, setIdx] = useState(0)
+  // When hiding a card we let the fly-off animation finish with the card
+  // still present (so `current` keeps its identity), then on
+  // onAnimationComplete we drop it from the deck. Because the element is
+  // removed rather than the cursor advanced, Backspace rewind and replay can
+  // never surface it again within this session.
+  const hiddenPendingRef = useRef<number | null>(null)
   const [scores, setScores] = useState<Record<number, number>>({})
   const [arenaHint, setArenaHint] = useState<{ left: number; right: number } | null>(null)
   const [busy, setBusy] = useState(false)
@@ -54,7 +72,10 @@ export function SwipeDeck() {
   useEffect(() => {
     if (currentGroupKey == null) return
     listGroupImages(currentGroupKey, granularity).then((imgs) => {
-      setImages(imgs)
+      // Shuffle on entry so every visit (and every "重新过一遍") re-randomizes
+      // the order instead of replaying the deterministic seed/filename sort.
+      setImages(shuffle(imgs))
+      hiddenPendingRef.current = null
       setIdx(0)
       setExitVec(null)
       setBusy(false)
@@ -106,44 +127,48 @@ export function SwipeDeck() {
   )
 
   // keyboard — Tinder-style: left = 差 / right = 优 / up = 待优化 / down = 跳过.
-  // preventDefault so arrow keys don't scroll the page. Backspace rewinds
-  // the cursor (does NOT roll back the already-committed score). H hides
-  // the current card (score pinned to 0, advances to the next card).
+  // All bindings come from the persisted keymap (Settings → 键位设置).
+  // preventDefault so keys don't scroll the page. Backspace rewinds the
+  // cursor (does NOT roll back the already-committed score). Hide blocks the
+  // current card (score pinned to 0, advances to the next card).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (lightbox) return
-      if (e.key === 'ArrowLeft') {
+      if (matchesBinding(keybindings.swipeLeft, e)) {
         e.preventDefault()
         applyGesture('left')
-      } else if (e.key === 'ArrowRight') {
+      } else if (matchesBinding(keybindings.swipeRight, e)) {
         e.preventDefault()
         applyGesture('right')
-      } else if (e.key === 'ArrowUp') {
+      } else if (matchesBinding(keybindings.swipeUp, e)) {
         e.preventDefault()
         applyGesture('up')
-      } else if (e.key === 'ArrowDown') {
+      } else if (matchesBinding(keybindings.swipeDown, e)) {
         e.preventDefault()
         applyGesture('down')
-      } else if (e.key === 'h' || e.key === 'H') {
+      } else if (matchesBinding(keybindings.swipeHide, e)) {
         e.preventDefault()
         hideCard()
-      } else if (e.key === 'Backspace') {
+      } else if (matchesBinding(keybindings.swipeRewind, e)) {
+        e.preventDefault()
         setIdx((i) => Math.max(0, i - 1))
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [applyGesture, lightbox])
+  }, [applyGesture, lightbox, keybindings])
 
-  // Hide the current card: pin its score to 0 (done backend-side) and
-  // fly it away like a swipe so the deck advances. Visual advance is
-  // decoupled from IPC success — onAnimationComplete advances regardless.
+  // Hide the current card: pin its score to 0 (done backend-side), flag it
+  // for removal after the fly-off, and fly it away like a swipe so the deck
+  // advances. Visual advance is decoupled from IPC success — onAnimationComplete
+  // removes the card regardless.
   const hideCard = useCallback(async () => {
     if (!current || busy || exitVec) return
     setBusy(true)
     setPopoverOpen(false)
     setExitVec(EXIT_VEC.down)
+    hiddenPendingRef.current = current.id
     try {
       await toggleHiddenApi(current.id, true).catch(() => {})
       setScores((s) => ({ ...s, [current.id]: 0 }))
@@ -197,7 +222,16 @@ export function SwipeDeck() {
         )}
         <div className="row">
           <button onClick={() => setView('groups')}>返回分组</button>
-          <button onClick={() => setIdx(0)}>重新过一遍</button>
+          <button
+            onClick={() => {
+              hiddenPendingRef.current = null
+              setImages((arr) => shuffle(arr))
+              setIdx(0)
+              setExitVec(null)
+            }}
+          >
+            重新洗牌再过一遍
+          </button>
         </div>
       </div>
     )
@@ -237,7 +271,15 @@ export function SwipeDeck() {
           onAnimationComplete={() => {
             if (!exitVec) return
             setExitVec(null)
-            setIdx((i) => i + 1)
+            const hiddenId = hiddenPendingRef.current
+            if (hiddenId != null) {
+              // Hiding: drop the card from the deck instead of advancing the
+              // cursor, so the deck naturally moves to the next card.
+              hiddenPendingRef.current = null
+              setImages((arr) => arr.filter((i) => i.id !== hiddenId))
+            } else {
+              setIdx((i) => i + 1)
+            }
             setBusy(false)
           }}
         >
@@ -273,7 +315,7 @@ export function SwipeDeck() {
             data-flash={flash?.g === 'up' ? '1' : undefined}
           >
             {labels.find((l) => l.gesture === 'up')?.name ?? '待优化'}
-            <span className="kbd">↑</span>
+            <span className="kbd">{bindingDisplay(keybindings.swipeUp)}</span>
           </button>
         </div>
         <div className="gesture-row">
@@ -284,7 +326,7 @@ export function SwipeDeck() {
             data-flash={flash?.g === 'left' ? '1' : undefined}
           >
             {labels.find((l) => l.gesture === 'left')?.name ?? '差'}
-            <span className="kbd">←</span>
+            <span className="kbd">{bindingDisplay(keybindings.swipeLeft)}</span>
           </button>
           <span className="gesture-center" aria-hidden />
           <button
@@ -294,7 +336,7 @@ export function SwipeDeck() {
             data-flash={flash?.g === 'right' ? '1' : undefined}
           >
             {labels.find((l) => l.gesture === 'right')?.name ?? '优'}
-            <span className="kbd">→</span>
+            <span className="kbd">{bindingDisplay(keybindings.swipeRight)}</span>
           </button>
         </div>
         <div className="gesture-row">
@@ -305,7 +347,7 @@ export function SwipeDeck() {
             data-flash={flash?.g === 'down' ? '1' : undefined}
           >
             {labels.find((l) => l.gesture === 'down')?.name ?? '跳过'}
-            <span className="kbd">↓</span>
+            <span className="kbd">{bindingDisplay(keybindings.swipeDown)}</span>
           </button>
         </div>
       </div>
@@ -316,10 +358,15 @@ export function SwipeDeck() {
           disabled={busy}
           title="屏蔽（赋 0 分，不参与评分，可在文件夹视角恢复）"
         >
-          屏蔽 <span className="kbd">H</span>
+          屏蔽 <span className="kbd">{bindingDisplay(keybindings.swipeHide)}</span>
         </button>
       </div>
-      <p className="muted hint">键盘 ← → ↑ ↓ 触发判定 · H 屏蔽当前卡 · Backspace 回退游标 · 单击图片放大 · "更多"查看 Prompt / 屏蔽</p>
+      <p className="muted hint">
+        键盘 {bindingDisplay(keybindings.swipeLeft)} {bindingDisplay(keybindings.swipeRight)}{' '}
+        {bindingDisplay(keybindings.swipeUp)} {bindingDisplay(keybindings.swipeDown)} 触发判定 ·{' '}
+        {bindingDisplay(keybindings.swipeHide)} 屏蔽当前卡 ·{' '}
+        {bindingDisplay(keybindings.swipeRewind)} 回退游标 · 单击图片放大 · "更多"查看 Prompt / 屏蔽
+      </p>
 
       {lightbox && <Lightbox src={assetUrl(lightbox)} onClose={() => setLightbox(null)} />}
     </div>
