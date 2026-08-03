@@ -24,7 +24,15 @@ export interface ReviewSession {
   granularity: Granularity
   swipeOrder: number[]
   swipeCursor: number
+  swipeUndoStack: Array<{
+    actionId: string
+    imageId: number
+    index: number
+    kind: 'swipe' | 'hide'
+  }>
   arenaPair: [number, number] | null
+  arenaLastHideActionId: string | null
+  arenaLastHiddenImageId: number | null
 }
 
 const EMPTY_REVIEW_SESSION: ReviewSession = {
@@ -33,7 +41,10 @@ const EMPTY_REVIEW_SESSION: ReviewSession = {
   granularity: 3,
   swipeOrder: [],
   swipeCursor: 0,
+  swipeUndoStack: [],
   arenaPair: null,
+  arenaLastHideActionId: null,
+  arenaLastHiddenImageId: null,
 }
 
 export const IDLE_SYNC_PROGRESS: SyncProgressState = {

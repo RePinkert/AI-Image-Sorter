@@ -154,6 +154,17 @@ export interface ActionResult {
   committed_at: string
 }
 
+export interface UndoActionResult {
+  action_id: string
+  undone_action_id: string
+  image_id: number
+  restored_score: number | null
+  hidden: boolean
+  label_id: number | null
+  gesture: string | null
+  committed_at: string
+}
+
 export interface ManualGroupResult {
   group_key: string
   moved: number

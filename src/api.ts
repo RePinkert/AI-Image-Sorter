@@ -14,6 +14,7 @@ import type {
   ScanResult,
   SourceRow,
   SyncAllResult,
+  UndoActionResult,
   WorkflowTemplateDto,
 } from './types'
 
@@ -269,6 +270,17 @@ export async function toggleHiddenAction(
     sessionId: context.sessionId ?? null,
     startedAt: context.startedAt ?? null,
     contextSignature: context.contextSignature ?? null,
+  })
+}
+
+export async function undoReviewAction(
+  actionId: string,
+  sessionId?: string,
+): Promise<UndoActionResult> {
+  if (isWebDev()) return unavailable('浏览器模式暂不支持撤销，请使用桌面版')
+  return apiInvoke('undo_review_action', {
+    actionId,
+    sessionId: sessionId ?? null,
   })
 }
 

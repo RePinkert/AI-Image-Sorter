@@ -8,6 +8,7 @@ import {
   listGroupImages,
   listLabels,
   toggleHiddenAction,
+  undoReviewAction,
 } from '../api'
 import type { ImageRow } from '../types'
 import { useStore } from '../store'
@@ -19,6 +20,14 @@ import { ImageMetaPopover } from './ImageMetaPopover'
 
 const GESTURES = ['left', 'right', 'up', 'down'] as const
 type Gesture = (typeof GESTURES)[number]
+type RetryAction = Gesture | 'hide' | 'undo'
+
+function isEditableTarget(target: EventTarget | null) {
+  return target instanceof HTMLElement && (
+    target.matches('input, textarea, select, [contenteditable="true"]') ||
+    target.closest('[contenteditable="true"]') != null
+  )
+}
 
 const EXIT_VEC: Record<Gesture, { x: number; y: number }> = {
   left: { x: -1400, y: 0 },
@@ -54,7 +63,6 @@ export function SwipeDeck() {
   const keybindings = useStore((s) => s.keybindings)
   const labels = useStore((s) => s.labels)
   const setLabels = useStore((s) => s.setLabels)
-  const dataRevision = useStore((s) => s.dataRevision)
   const updateReviewSession = useStore((s) => s.updateReviewSession)
   const [images, setImages] = useState<ImageRow[]>([])
   const [idx, setIdx] = useState(0)
@@ -63,7 +71,7 @@ export function SwipeDeck() {
   const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading')
   const [loadError, setLoadError] = useState('')
   const [actionError, setActionError] = useState('')
-  const [retryAction, setRetryAction] = useState<Gesture | 'hide' | null>(null)
+  const [retryAction, setRetryAction] = useState<RetryAction | null>(null)
   const [busy, setBusy] = useState(false)
   const [exitVec, setExitVec] = useState<{ x: number; y: number } | null>(null)
   const [flash, setFlash] = useState<{ g: Gesture; n: number } | null>(null)
@@ -127,10 +135,9 @@ export function SwipeDeck() {
     void load()
     return () => {
       loadRequestRef.current += 1
-      actionRequestRef.current += 1
       if (flashTimer.current) clearTimeout(flashTimer.current)
     }
-  }, [load, dataRevision])
+  }, [load])
 
   const current = images[idx]
   const next = images[idx + 1]
@@ -159,6 +166,16 @@ export function SwipeDeck() {
         contextSignature: currentGroupKey ?? undefined,
       })
       if (request !== actionRequestRef.current) return
+      const session = useStore.getState().reviewSession
+      const undoStack = session.swipeUndoStack ?? []
+      updateReviewSession({
+        swipeUndoStack: [...undoStack, {
+          actionId: result.action_id,
+          imageId: current.id,
+          index: idx,
+          kind: 'swipe' as const,
+        }].slice(-100),
+      })
       setScores((value) => ({ ...value, [current.id]: result.score }))
       trackAction('swipe_commit', {
         gesture,
@@ -180,7 +197,7 @@ export function SwipeDeck() {
       setRetryAction(gesture)
       setActionError(errorMessage(error))
     }
-  }, [busy, current, currentGroupKey, exitVec, flash?.n, labels, next])
+  }, [busy, current, currentGroupKey, exitVec, flash?.n, idx, labels, next, updateReviewSession])
 
   const hideCard = useCallback(async () => {
     if (!current || busy || exitVec) return
@@ -198,6 +215,16 @@ export function SwipeDeck() {
         contextSignature: currentGroupKey ?? undefined,
       })
       if (request !== actionRequestRef.current) return
+      const session = useStore.getState().reviewSession
+      const undoStack = session.swipeUndoStack ?? []
+      updateReviewSession({
+        swipeUndoStack: [...undoStack, {
+          actionId: result.action_id,
+          imageId: current.id,
+          index: idx,
+          kind: 'hide' as const,
+        }].slice(-100),
+      })
       hiddenPendingRef.current = current.id
       setScores((value) => ({ ...value, [current.id]: result.score }))
       trackAction('hide', {
@@ -216,11 +243,69 @@ export function SwipeDeck() {
       setRetryAction('hide')
       setActionError(errorMessage(error))
     }
-  }, [busy, current, currentGroupKey, exitVec])
+  }, [busy, current, currentGroupKey, exitVec, idx, updateReviewSession])
+
+  const undoLastAction = useCallback(async () => {
+    if (busy || exitVec) return
+    const session = useStore.getState().reviewSession
+    const undoStack = session.swipeUndoStack ?? []
+    const entry = undoStack[undoStack.length - 1]
+    if (!entry) return
+    const request = ++actionRequestRef.current
+    actionInFlightRef.current = true
+    setBusy(true)
+    setActionError('')
+    setRetryAction(null)
+    try {
+      const result = await undoReviewAction(entry.actionId, getTelemetrySessionId())
+      if (request !== actionRequestRef.current) return
+      const nextStack = undoStack.slice(0, -1)
+      if (entry.kind === 'hide' && currentGroupKey != null) {
+        const loaded = await listGroupImages(currentGroupKey, granularity)
+        if (request !== actionRequestRef.current) return
+        const order = useStore.getState().reviewSession.swipeOrder
+        const ordered = restoreOrder(loaded, order)
+        const nextScores: Record<number, number> = {}
+        loaded.forEach((image) => {
+          if (image.score != null) nextScores[image.id] = image.score
+        })
+        setImages(ordered)
+        setScores(nextScores)
+        updateReviewSession({
+          swipeOrder: ordered.map((image) => image.id),
+          swipeCursor: entry.index,
+          swipeUndoStack: nextStack,
+        })
+      } else {
+        setScores((value) => {
+          const nextScores = { ...value }
+          if (result.restored_score == null) delete nextScores[result.image_id]
+          else nextScores[result.image_id] = result.restored_score
+          return nextScores
+        })
+        updateReviewSession({
+          swipeCursor: entry.index,
+          swipeUndoStack: nextStack,
+        })
+      }
+      setIdx(entry.index)
+      hiddenPendingRef.current = null
+      setExitVec(null)
+      actionInFlightRef.current = false
+      setBusy(false)
+    } catch (error) {
+      if (request !== actionRequestRef.current) return
+      actionInFlightRef.current = false
+      setBusy(false)
+      setRetryAction('undo')
+      setActionError(errorMessage(error))
+    }
+  }, [busy, currentGroupKey, exitVec, granularity, updateReviewSession])
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (lightbox || popoverOpen) return
+      if (isEditableTarget(event.target)) return
       if (matchesBinding(keybindings.swipeLeft, event)) {
         event.preventDefault()
         void applyGesture('left')
@@ -238,16 +323,12 @@ export function SwipeDeck() {
         void hideCard()
       } else if (matchesBinding(keybindings.swipeRewind, event) && !busy) {
         event.preventDefault()
-        setIdx((value) => {
-          const nextCursor = Math.max(0, value - 1)
-          updateReviewSession({ swipeCursor: nextCursor })
-          return nextCursor
-        })
+        void undoLastAction()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [applyGesture, busy, hideCard, keybindings, lightbox, popoverOpen, updateReviewSession])
+  }, [applyGesture, busy, hideCard, keybindings, lightbox, popoverOpen, undoLastAction])
 
   function onDragEnd(_: unknown, info: PanInfo) {
     const { offset, velocity } = info
@@ -296,7 +377,11 @@ export function SwipeDeck() {
               setImages(ordered)
               setIdx(0)
               setExitVec(null)
-              updateReviewSession({ swipeOrder: ordered.map((image) => image.id), swipeCursor: 0 })
+              updateReviewSession({
+                swipeOrder: ordered.map((image) => image.id),
+                swipeCursor: 0,
+                swipeUndoStack: [],
+              })
             }}
           >
             重新洗牌再过一遍
@@ -311,11 +396,11 @@ export function SwipeDeck() {
   return (
     <div className="swipe-view">
       <div className="swipe-topbar">
-        <button type="button" disabled={busy} onClick={() => setView('groups')}>← 返回</button>
+        <button type="button" onClick={() => setView('groups')}>← 返回</button>
         <div className="progress"><div className="progress-bar" style={{ width: `${progress}%` }} /></div>
         <span className="counter">{idx + 1}/{images.length}</span>
-        <button type="button" disabled={busy} onClick={() => setView('folder')}>文件夹视角</button>
-        <button type="button" disabled={busy} onClick={() => setView('arena')}>擂台模式</button>
+        <button type="button" onClick={() => setView('folder')}>文件夹视角</button>
+        <button type="button" onClick={() => setView('arena')}>擂台模式</button>
       </div>
 
       {actionError && (
@@ -324,7 +409,11 @@ export function SwipeDeck() {
           <button
             type="button"
             disabled={busy}
-            onClick={() => retryAction === 'hide' ? void hideCard() : retryAction && void applyGesture(retryAction)}
+            onClick={() => {
+              if (retryAction === 'hide') void hideCard()
+              else if (retryAction === 'undo') void undoLastAction()
+              else if (retryAction) void applyGesture(retryAction)
+            }}
           >
             重试
           </button>
@@ -350,7 +439,7 @@ export function SwipeDeck() {
               hiddenPendingRef.current = null
               setImages((value) => {
                 const nextImages = value.filter((image) => image.id !== hiddenId)
-                updateReviewSession({ swipeOrder: nextImages.map((image) => image.id), swipeCursor: idx })
+                updateReviewSession({ swipeCursor: idx })
                 return nextImages
               })
             } else {
@@ -403,7 +492,7 @@ export function SwipeDeck() {
         键盘 {bindingDisplay(keybindings.swipeLeft)} {bindingDisplay(keybindings.swipeRight)}{' '}
         {bindingDisplay(keybindings.swipeUp)} {bindingDisplay(keybindings.swipeDown)} 触发判定 ·{' '}
         {bindingDisplay(keybindings.swipeHide)} 屏蔽当前卡 ·{' '}
-        {bindingDisplay(keybindings.swipeRewind)} 回退游标 · 单击图片放大 · "更多"查看 Prompt / 屏蔽
+        {bindingDisplay(keybindings.swipeRewind)} 撤销上一步 · 单击图片放大 · "更多"查看 Prompt / 屏蔽
       </p>
       {lightbox && <Lightbox src={assetUrl(lightbox)} onClose={() => setLightbox(null)} />}
     </div>

@@ -110,14 +110,28 @@ export default function App() {
     let hideTimer: ReturnType<typeof setTimeout> | null = null
     let lastErrorTrackAt = 0
     let lastPending: number | null = null
+    let refreshRequest = 0
     const refreshGroups = async () => {
       const state = useStore.getState()
       if (state.currentSourceId == null) return
-      const groups = await listGroups(state.currentSourceId, state.granularity)
+      const sourceId = state.currentSourceId
+      const level = state.granularity
+      const request = ++refreshRequest
+      const groups = await listGroups(sourceId, level)
+      const latest = useStore.getState()
+      if (
+        request !== refreshRequest ||
+        latest.currentSourceId !== sourceId ||
+        latest.granularity !== level
+      ) return
       setGroups(groups)
-      if (state.currentGroupKey && !groups.some((g) => g.group_key === state.currentGroupKey)) {
+      if (
+        latest.currentGroupKey &&
+        !groups.some((g) => g.group_key === latest.currentGroupKey) &&
+        !['swipe', 'arena', 'folder'].includes(latest.view)
+      ) {
         setCurrentGroupKey(null)
-        if (state.view !== 'import') setView('groups')
+        if (latest.view !== 'import') setView('groups')
       }
     }
     const sync = async () => {
@@ -178,6 +192,7 @@ export default function App() {
     return () => {
       window.clearInterval(timer)
       if (hideTimer) clearTimeout(hideTimer)
+      refreshRequest += 1
     }
   }, [bumpDataRevision, setCurrentGroupKey, setGroups, setSources, setSyncState, setView, resetSyncProgress])
 

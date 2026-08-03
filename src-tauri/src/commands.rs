@@ -873,6 +873,18 @@ pub fn toggle_hidden_action(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub fn undo_review_action(
+    action_id: String,
+    session_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<crate::db::UndoActionResult, String> {
+    state
+        .db
+        .undo_review_action(&action_id, session_id.as_deref())
+        .map_err(|e| e.to_string())
+}
+
 /// Send an image file to the operating-system recycle bin (Windows:
 /// SHFileOperation with FOF_ALLOWUNDO — fully reversible from the desktop
 /// Recycle Bin) and remove its DB row. Scores/labels cascade-delete with

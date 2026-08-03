@@ -20,7 +20,6 @@ export function FolderView() {
   const setView = useStore((s) => s.setView)
   const currentGroupKey = useStore((s) => s.currentGroupKey)
   const granularity = useStore((s) => s.granularity)
-  const dataRevision = useStore((s) => s.dataRevision)
   const [images, setImages] = useState<ImageRow[]>([])
   const [busy, setBusy] = useState<number | null>(null)
   const [lightbox, setLightbox] = useState<string | null>(null)
@@ -58,7 +57,7 @@ export function FolderView() {
     return () => {
       loadRequestRef.current += 1
     }
-  }, [loadImages, dataRevision])
+  }, [loadImages])
 
   const sorted = useMemo(() => {
     const arr = [...images]

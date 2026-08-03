@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { arenaVote, assetUrl, errorMessage, listGroupImages, toggleHiddenAction } from '../api'
+import { arenaVote, assetUrl, errorMessage, listGroupImages, toggleHiddenAction, undoReviewAction } from '../api'
 import type { ImageRow } from '../types'
 import { useStore } from '../store'
 import { bindingDisplay, matchesBinding } from '../keymap'
@@ -23,6 +23,13 @@ function pairAll(images: ImageRow[]): [ImageRow, ImageRow][] {
   return result
 }
 
+function isEditableTarget(target: EventTarget | null) {
+  return target instanceof HTMLElement && (
+    target.matches('input, textarea, select, [contenteditable="true"]') ||
+    target.closest('[contenteditable="true"]') != null
+  )
+}
+
 type RetryAction =
   | { kind: 'vote'; winnerIsLeft: boolean }
   | { kind: 'hide'; image: ImageRow }
@@ -33,7 +40,6 @@ export function Arena() {
   const currentGroupKey = useStore((s) => s.currentGroupKey)
   const granularity = useStore((s) => s.granularity)
   const keybindings = useStore((s) => s.keybindings)
-  const dataRevision = useStore((s) => s.dataRevision)
   const updateReviewSession = useStore((s) => s.updateReviewSession)
   const [images, setImages] = useState<ImageRow[]>([])
   const [left, setLeft] = useState<ImageRow | null>(null)
@@ -50,7 +56,6 @@ export function Arena() {
   const [rightPopoverOpen, setRightPopoverOpen] = useState(false)
   const [pendingHide, setPendingHide] = useState(false)
   const recent = useRef<Set<string>>(new Set())
-  const lastHidden = useRef<ImageRow | null>(null)
   const loadRequestRef = useRef(0)
   const actionRequestRef = useRef(0)
   const actionInFlightRef = useRef(false)
@@ -132,10 +137,9 @@ export function Arena() {
     void load()
     return () => {
       loadRequestRef.current += 1
-      actionRequestRef.current += 1
       if (transitionTimerRef.current) clearTimeout(transitionTimerRef.current)
     }
-  }, [load, dataRevision])
+  }, [load])
 
   async function vote(winnerIsLeft: boolean) {
     if (!left || !right || !currentGroupKey || busy) return
@@ -201,7 +205,7 @@ export function Arena() {
     setLeftPopoverOpen(false)
     setRightPopoverOpen(false)
     try {
-      await toggleHiddenAction(image.id, true, {
+      const result = await toggleHiddenAction(image.id, true, {
         sessionId: getTelemetrySessionId(),
         startedAt: startedAtRef.current,
         contextSignature: currentGroupKey ?? undefined,
@@ -209,7 +213,10 @@ export function Arena() {
       if (request !== actionRequestRef.current) return
       const nextImages = images.filter((item) => item.id !== image.id)
       const nextScores = { ...scores, [image.id]: 0 }
-      lastHidden.current = image
+      updateReviewSession({
+        arenaLastHideActionId: result.action_id,
+        arenaLastHiddenImageId: image.id,
+      })
       setImages(nextImages)
       setScores(nextScores)
       trackAction('hide', {
@@ -235,25 +242,32 @@ export function Arena() {
   }
 
   async function undoLastHide() {
-    const image = lastHidden.current
-    if (!image || busy) return
+    const session = useStore.getState().reviewSession
+    const actionId = session.arenaLastHideActionId
+    const hiddenImageId = session.arenaLastHiddenImageId
+    if (!actionId || hiddenImageId == null || busy || currentGroupKey == null) return
     const request = ++actionRequestRef.current
     actionInFlightRef.current = true
     setBusy(true)
     setActionError('')
     setRetryAction(null)
     try {
-      await toggleHiddenAction(image.id, false, {
-        sessionId: getTelemetrySessionId(),
-        startedAt: new Date().toISOString(),
-        contextSignature: currentGroupKey ?? undefined,
-      })
+      await undoReviewAction(actionId, getTelemetrySessionId())
       if (request !== actionRequestRef.current) return
-      lastHidden.current = null
-      const nextImages = images.some((item) => item.id === image.id) ? images : [...images, image]
+      const nextImages = await listGroupImages(currentGroupKey, granularity)
+      if (request !== actionRequestRef.current) return
+      const nextScores: Record<number, number> = {}
+      nextImages.forEach((image) => {
+        if (image.score != null) nextScores[image.id] = image.score
+      })
       setImages(nextImages)
-      trackAction('hide', { hidden: false, mode: 'arena', image_id: image.id })
-      selectPair(nextImages, scores)
+      setScores(nextScores)
+      updateReviewSession({
+        arenaLastHideActionId: null,
+        arenaLastHiddenImageId: null,
+      })
+      trackAction('hide', { hidden: false, mode: 'arena', image_id: hiddenImageId })
+      selectPair(nextImages, nextScores)
       actionInFlightRef.current = false
       setBusy(false)
       if (reloadAfterActionRef.current) {
@@ -283,6 +297,7 @@ export function Arena() {
     }
     const onKeyDown = (event: KeyboardEvent) => {
       if (lightbox || leftPopoverOpen || rightPopoverOpen) return
+      if (isEditableTarget(event.target)) return
       if (matchesBinding(keybindings.arenaArmHide, event)) {
         event.preventDefault()
         if (!busy) setPendingHide(true)
@@ -338,9 +353,9 @@ export function Arena() {
   return (
     <div className="arena-view">
       <div className="swipe-topbar">
-        <button type="button" disabled={busy} onClick={() => setView('swipe')}>← 返回滑卡</button>
+        <button type="button" onClick={() => setView('swipe')}>← 返回滑卡</button>
         <span className="counter">擂台模式</span>
-        <button type="button" disabled={busy} onClick={() => setView('folder')}>文件夹视角</button>
+        <button type="button" onClick={() => setView('folder')}>文件夹视角</button>
         <button type="button" onClick={() => selectPair(images, scores)} disabled={busy}>下一对</button>
       </div>
       {actionError && (

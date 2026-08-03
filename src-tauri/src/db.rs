@@ -219,7 +219,7 @@ impl Db {
 mod migrations {
     use super::*;
 
-    pub(crate) const CURRENT_VERSION: i32 = 12;
+    pub(crate) const CURRENT_VERSION: i32 = 13;
 
     pub fn run(conn: &Connection) -> Result<()> {
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -331,6 +331,20 @@ mod migrations {
         )?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_images_workflow_key ON images(workflow_key);",
+        )?;
+        let has_undo_of: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('review_actions') WHERE name='undo_of_action_id'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_undo_of == 0 {
+            conn.execute_batch(
+                "ALTER TABLE review_actions ADD COLUMN undo_of_action_id TEXT;",
+            )?;
+        }
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_review_actions_undo_of
+             ON review_actions(undo_of_action_id) WHERE undo_of_action_id IS NOT NULL;",
         )?;
         backfill_generation_recipes(conn)?;
         conn.execute_batch(
@@ -483,9 +497,10 @@ mod migrations {
                  started_at TEXT,
                  committed_at TEXT NOT NULL,
                  duration_ms INTEGER,
-                 context_signature TEXT,
-                 result_json TEXT NOT NULL DEFAULT '{}'
-             );
+                  context_signature TEXT,
+                  result_json TEXT NOT NULL DEFAULT '{}',
+                  undo_of_action_id TEXT
+              );
              CREATE INDEX IF NOT EXISTS idx_review_actions_session_time
                  ON review_actions(session_id, committed_at);
              CREATE INDEX IF NOT EXISTS idx_review_actions_mode_time
@@ -840,6 +855,18 @@ pub struct ActionResult {
     pub score: f64,
     pub hidden: bool,
     pub label_id: Option<i64>,
+    pub committed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UndoActionResult {
+    pub action_id: String,
+    pub undone_action_id: String,
+    pub image_id: i64,
+    pub restored_score: Option<f64>,
+    pub hidden: bool,
+    pub label_id: Option<i64>,
+    pub gesture: Option<String>,
     pub committed_at: String,
 }
 
@@ -1496,6 +1523,8 @@ impl Db {
             )
             .optional()?
             .ok_or_else(|| anyhow::anyhow!("image row not found"))?;
+        let previous_score = current_score_tx(&tx, image_id)?;
+        let mut label_already_present = false;
         if let Some(label_id) = label_id {
             let exists: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM labels WHERE id=?1",
@@ -1505,18 +1534,26 @@ impl Db {
             if exists == 0 {
                 return Err(anyhow::anyhow!("label row not found"));
             }
+            label_already_present = tx.query_row(
+                "SELECT COUNT(*) FROM image_labels WHERE image_id=?1 AND label_id=?2",
+                rusqlite::params![image_id, label_id],
+                |r| r.get::<_, i64>(0),
+            )? > 0;
             tx.execute(
                 "INSERT OR IGNORE INTO image_labels (image_id, label_id) VALUES (?1, ?2)",
                 rusqlite::params![image_id, label_id],
             )?;
         }
-        let current = current_score_tx(&tx, image_id)?;
-        let score = crate::scoring::apply_swipe(current, gesture);
+        let score = crate::scoring::apply_swipe(previous_score, gesture);
         insert_score_tx(&tx, image_id, score, "swipe")?;
         let result_json = serde_json::json!({
             "score": score,
             "label_id": label_id,
+            "label_already_present": label_already_present,
             "hidden": image_hidden,
+            "previous_hidden": image_hidden,
+            "previous_score": previous_score,
+            "had_previous_score": previous_score.is_some(),
         })
         .to_string();
         insert_review_action(
@@ -1642,14 +1679,15 @@ impl Db {
         let committed_at = Utc::now().to_rfc3339();
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction()?;
-        let group_key: Option<String> = tx
+        let (group_key, previous_hidden): (Option<String>, bool) = tx
             .query_row(
-                "SELECT group_key_l3 FROM images WHERE id=?1",
+                "SELECT group_key_l3, hidden FROM images WHERE id=?1",
                 rusqlite::params![image_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
             )
             .optional()?
             .ok_or_else(|| anyhow::anyhow!("image row not found"))?;
+        let previous_score = current_score_tx(&tx, image_id)?;
         tx.execute(
             "UPDATE images SET hidden=?1 WHERE id=?2",
             rusqlite::params![hidden as i64, image_id],
@@ -1663,6 +1701,9 @@ impl Db {
         let result_json = serde_json::json!({
             "hidden": hidden,
             "score": score,
+            "previous_hidden": previous_hidden,
+            "previous_score": previous_score,
+            "had_previous_score": previous_score.is_some(),
         })
         .to_string();
         insert_review_action(
@@ -1688,6 +1729,140 @@ impl Db {
             score,
             hidden,
             label_id: None,
+            committed_at,
+        })
+    }
+
+    pub fn undo_review_action(
+        &self,
+        action_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<UndoActionResult> {
+        validate_token("action_id", action_id, 128, false)?;
+        if let Some(session_id) = session_id {
+            validate_token("session_id", session_id, 128, false)?;
+        }
+        let undo_action_id = next_id("act");
+        let committed_at = Utc::now().to_rfc3339();
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        let (mode, image_id, gesture, group_key, result_json): (
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = tx
+            .query_row(
+                "SELECT mode, image_id, gesture, group_key, result_json
+                 FROM review_actions WHERE action_id=?1",
+                rusqlite::params![action_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("review action not found"))?;
+        if !matches!(mode.as_str(), "swipe" | "hide") {
+            return Err(anyhow::anyhow!("review action is not reversible"));
+        }
+        let image_id = image_id.ok_or_else(|| anyhow::anyhow!("review action has no image"))?;
+        let existing_undo: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT action_id, committed_at, result_json FROM review_actions
+                 WHERE undo_of_action_id=?1",
+                rusqlite::params![action_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((existing_id, existing_committed_at, existing_result_json)) = existing_undo {
+            let existing_result: serde_json::Value = serde_json::from_str(&existing_result_json)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            return Ok(UndoActionResult {
+                action_id: existing_id,
+                undone_action_id: action_id.to_string(),
+                image_id,
+                restored_score: existing_result
+                    .get("restored_score")
+                    .and_then(|value| value.as_f64()),
+                hidden: existing_result
+                    .get("hidden")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                label_id: existing_result.get("label_id").and_then(|value| value.as_i64()),
+                gesture,
+                committed_at: existing_committed_at,
+            });
+        }
+        let snapshot: serde_json::Value = serde_json::from_str(&result_json)
+            .map_err(|_| anyhow::anyhow!("review action snapshot is invalid"))?;
+        let previous_hidden = snapshot
+            .get("previous_hidden")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let had_previous_score = snapshot
+            .get("had_previous_score")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let previous_score = snapshot.get("previous_score").and_then(|value| value.as_f64());
+        let label_id = snapshot.get("label_id").and_then(|value| value.as_i64());
+        let label_already_present = snapshot
+            .get("label_already_present")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+
+        tx.execute(
+            "UPDATE images SET hidden=?1 WHERE id=?2",
+            rusqlite::params![previous_hidden as i64, image_id],
+        )?;
+        if had_previous_score {
+            let score = previous_score
+                .ok_or_else(|| anyhow::anyhow!("review action previous score is missing"))?;
+            insert_score_tx(&tx, image_id, score, "undo")?;
+        } else {
+            tx.execute(
+                "DELETE FROM scores WHERE image_id=?1",
+                rusqlite::params![image_id],
+            )?;
+        }
+        if let Some(label_id) = label_id {
+            if !label_already_present {
+                tx.execute(
+                    "DELETE FROM image_labels WHERE image_id=?1 AND label_id=?2",
+                    rusqlite::params![image_id, label_id],
+                )?;
+            }
+        }
+        let undo_result = serde_json::json!({
+            "restored_score": previous_score,
+            "had_previous_score": had_previous_score,
+            "hidden": previous_hidden,
+            "label_id": label_id,
+        })
+        .to_string();
+        tx.execute(
+            "INSERT INTO review_actions (
+                 action_id, session_id, mode, image_id, gesture, group_key,
+                 committed_at, result_json, undo_of_action_id
+             ) VALUES (?1,?2,'undo',?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![
+                undo_action_id,
+                session_id,
+                image_id,
+                gesture,
+                group_key,
+                committed_at,
+                undo_result,
+                action_id,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(UndoActionResult {
+            action_id: undo_action_id,
+            undone_action_id: action_id.to_string(),
+            image_id,
+            restored_score: if had_previous_score { previous_score } else { None },
+            hidden: previous_hidden,
+            label_id,
+            gesture,
             committed_at,
         })
     }

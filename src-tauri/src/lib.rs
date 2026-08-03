@@ -51,6 +51,7 @@ pub fn run() {
             commands::list_group_images_all,
             commands::toggle_hidden,
             commands::toggle_hidden_action,
+            commands::undo_review_action,
             commands::trash_image,
             commands::recluster_source,
             commands::merge_groups,

@@ -53,7 +53,7 @@ const enumValues: Record<string, ReadonlySet<string>> = {
     'add_source_and_scan', 'list_sources', 'list_groups', 'list_group_images',
     'list_group_images_all', 'toggle_hidden_action', 'trash_image', 'recommend_prompts',
     'recluster_source', 'merge_groups', 'split_images', 'list_labels', 'upsert_label',
-    'delete_label', 'set_image_label', 'apply_swipe_action', 'arena_vote',
+    'delete_label', 'set_image_label', 'apply_swipe_action', 'undo_review_action', 'arena_vote',
     'arena_suggested', 'export_data', 'archive_copy', 'get_group_thumbnails', 'web_request',
   ]),
   error_code: new Set([
