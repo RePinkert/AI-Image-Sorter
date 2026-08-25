@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { arenaVote, assetUrl, errorMessage, listGroupImages, toggleHiddenAction, undoReviewAction } from '../api'
+import { arenaHide, arenaVote, assetUrl, errorMessage, listGroupImages, undoReviewAction } from '../api'
 import type { ImageRow } from '../types'
 import { useStore } from '../store'
 import { bindingDisplay, matchesBinding } from '../keymap'
@@ -40,6 +40,7 @@ export function Arena() {
   const currentGroupKey = useStore((s) => s.currentGroupKey)
   const granularity = useStore((s) => s.granularity)
   const keybindings = useStore((s) => s.keybindings)
+  const reviewSession = useStore((s) => s.reviewSession)
   const updateReviewSession = useStore((s) => s.updateReviewSession)
   const [images, setImages] = useState<ImageRow[]>([])
   const [left, setLeft] = useState<ImageRow | null>(null)
@@ -195,7 +196,7 @@ export function Arena() {
   }
 
   async function hideCard(image: ImageRow) {
-    if (busy) return
+    if (busy || !left || !right || !currentGroupKey) return
     const request = ++actionRequestRef.current
     const startedMs = Date.now()
     actionInFlightRef.current = true
@@ -204,18 +205,29 @@ export function Arena() {
     setRetryAction(null)
     setLeftPopoverOpen(false)
     setRightPopoverOpen(false)
+    // Drop focus: a card keeps an Enter/Space vote handler, and after a
+    // Shift+←/→ hide the next Enter press must NOT vote by accident.
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
+    const survivor = image.id === left.id ? right : left
     try {
-      const result = await toggleHiddenAction(image.id, true, {
+      // Hiding credits the survivor exactly like an arena winner: one
+      // atomic action snapshots both images so undo restores the pair.
+      const result = await arenaHide(currentGroupKey, survivor.id, image.id, {
         sessionId: getTelemetrySessionId(),
         startedAt: startedAtRef.current,
-        contextSignature: currentGroupKey ?? undefined,
+        contextSignature: currentGroupKey,
       })
       if (request !== actionRequestRef.current) return
       const nextImages = images.filter((item) => item.id !== image.id)
-      const nextScores = { ...scores, [image.id]: 0 }
+      const nextScores = {
+        ...scores,
+        [image.id]: result.victim_score,
+        [survivor.id]: result.survivor_score,
+      }
       updateReviewSession({
         arenaLastHideActionId: result.action_id,
         arenaLastHiddenImageId: image.id,
+        arenaLastHidePair: [left.id, right.id],
       })
       setImages(nextImages)
       setScores(nextScores)
@@ -245,6 +257,7 @@ export function Arena() {
     const session = useStore.getState().reviewSession
     const actionId = session.arenaLastHideActionId
     const hiddenImageId = session.arenaLastHiddenImageId
+    const restorePair = session.arenaLastHidePair
     if (!actionId || hiddenImageId == null || busy || currentGroupKey == null) return
     const request = ++actionRequestRef.current
     actionInFlightRef.current = true
@@ -265,9 +278,26 @@ export function Arena() {
       updateReviewSession({
         arenaLastHideActionId: null,
         arenaLastHiddenImageId: null,
+        arenaLastHidePair: null,
       })
       trackAction('hide', { hidden: false, mode: 'arena', image_id: hiddenImageId })
-      selectPair(nextImages, nextScores)
+      if (restorePair) {
+        // Undo must land back on the EXACT pair that was on screen when the
+        // hide happened — not a random next pair — so the user can redo.
+        const restoredLeft = nextImages.find((image) => image.id === restorePair[0])
+        const restoredRight = nextImages.find((image) => image.id === restorePair[1])
+        if (restoredLeft && restoredRight && restoredLeft.id !== restoredRight.id) {
+          setLeft(restoredLeft)
+          setRight(restoredRight)
+          recent.current.add(pairKey(restoredLeft.id, restoredRight.id))
+          startedAtRef.current = new Date().toISOString()
+          updateReviewSession({ arenaPair: [restoredLeft.id, restoredRight.id] })
+        } else {
+          selectPair(nextImages, nextScores)
+        }
+      } else {
+        selectPair(nextImages, nextScores)
+      }
       actionInFlightRef.current = false
       setBusy(false)
       if (reloadAfterActionRef.current) {
@@ -370,6 +400,14 @@ export function Arena() {
           {bindingDisplay(keybindings.arenaHideRight)} 屏蔽右卡 · 松开 Shift 取消
         </div>
       )}
+      {reviewSession.arenaLastHideActionId && (
+        <div className="arena-undo-bar" role="status">
+          <span>已屏蔽一张图片（幸存方已按胜者计分）</span>
+          <button type="button" disabled={busy} onClick={() => void undoLastHide()}>
+            {bindingDisplay(keybindings.arenaUndoHide)} 撤销并回到上一对
+          </button>
+        </div>
+      )}
       <div className="arena-stage">
         <div
           className={`arena-card ${pendingHide ? 'arena-pending' : ''} ${fly === 'left' ? 'fly-left' : ''} ${fly === 'right' ? 'fly-right' : ''}`}
@@ -417,7 +455,7 @@ export function Arena() {
         {bindingDisplay(keybindings.arenaVoteLeft)} / {bindingDisplay(keybindings.arenaVoteRight)} 选胜方 ·{' '}
         {bindingDisplay(keybindings.arenaSkip)} 跳过 · 按住 {bindingDisplay(keybindings.arenaArmHide)} 后按{' '}
         {bindingDisplay(keybindings.arenaHideLeft)} / {bindingDisplay(keybindings.arenaHideRight)} 屏蔽对应卡 ·{' '}
-        {bindingDisplay(keybindings.arenaUndoHide)} 撤销最近屏蔽 · 单击图片放大 · 两侧"更多"可屏蔽并查看 Prompt 差异高亮
+        {bindingDisplay(keybindings.arenaUndoHide)} 撤销最近屏蔽（回到上一对，双方分数一并还原）· 屏蔽后幸存方按胜者计分 · 单击图片放大 · 两侧"更多"可屏蔽并查看 Prompt 差异高亮
       </p>
       {lightbox && <Lightbox src={assetUrl(lightbox)} onClose={() => setLightbox(null)} />}
     </div>

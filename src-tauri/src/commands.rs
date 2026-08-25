@@ -255,8 +255,14 @@ fn scan_source(
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64);
         if existing_map.contains_key(&norm) {
-            // File already scanned; metadata is immutable, keep row,
-            // still count it for the visible total.
+            // Keep the stable image id while refreshing file-level fields that
+            // can change outside the app.
+            let size = std::fs::metadata(f).map(|m| m.len() as i64).unwrap_or(0);
+            let modified_at = file_mtime.unwrap_or(0);
+            if let Some(id) = existing_map.get(&norm) {
+                db.update_file_stats(*id, size, modified_at)
+                    .map_err(|e| e.to_string())?;
+            }
             stats.kept += 1;
             if let Some(m) = file_mtime {
                 if m > stats.newest_mtime {
@@ -309,6 +315,7 @@ fn scan_source(
                 .unwrap_or("")
                 .to_string(),
             size,
+            modified_at: file_mtime.unwrap_or(0),
             width: meta.width as i64,
             height: meta.height as i64,
             prompt_pos: meta.prompt_pos.clone(),
@@ -401,6 +408,12 @@ fn backfill_source(
                 .unwrap_or("")
                 .to_string(),
             size,
+            modified_at: std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
             width: meta.width as i64,
             height: meta.height as i64,
             prompt_pos: meta.prompt_pos.clone(),
@@ -666,6 +679,25 @@ pub fn refresh_workflow_templates(
 #[tauri::command]
 pub fn list_sources(state: State<'_, AppState>) -> Result<Vec<SourceRow>, String> {
     state.db.list_sources().map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelDeviationConfig {
+    pub source_id: i64,
+    pub dimensions: Vec<String>,
+}
+
+#[tauri::command]
+pub fn set_model_deviation_config(
+    config: ModelDeviationConfig,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let allowed = ["base_model", "checkpoint", "lora", "workflow"];
+    if config.dimensions.iter().any(|d| !allowed.contains(&d.as_str())) {
+        return Err("包含不支持的 Model偏差维度".into());
+    }
+    state.db.set_model_deviation_dimensions(config.source_id, &config.dimensions)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -947,12 +979,48 @@ pub struct ManualGroupResult {
 pub struct MergeGroupsArgs {
     pub level: u8,
     pub from_keys: Vec<String>,
+    /// Required: group keys are shared across sources (workflow / model
+    /// chain identities are not source-namespaced), so an unscoped merge
+    /// would silently sweep in images from other sources holding the same
+    /// key. The UI disables merging in the "所有源" view.
+    pub source_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SplitImagesArgs {
     pub level: u8,
     pub image_ids: Vec<i64>,
+}
+
+#[tauri::command]
+pub fn list_move_targets(
+    source_id: i64,
+    current_l2: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::db::GroupInfo>, String> {
+    state.db.list_l2_targets(source_id, &current_l2).map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MoveImagesArgs { pub image_ids: Vec<i64>, pub target_group_key: String }
+
+#[tauri::command]
+pub fn move_images_to_group(args: MoveImagesArgs, state: State<'_, AppState>) -> Result<ManualGroupResult, String> {
+    if args.image_ids.is_empty() { return Ok(ManualGroupResult { group_key: String::new(), moved: 0 }); }
+    let info = state.db.image_move_context(&args.image_ids).map_err(|e| e.to_string())?;
+    if info.iter().any(|(source, _, l2)| *source != info[0].0 || l2 == &args.target_group_key) {
+        return Err("只能在同一来源目录下移动到其他 Prompt偏差组".into());
+    }
+    if !state.db.l2_target_exists(info[0].0, &args.target_group_key).map_err(|e| e.to_string())? {
+        return Err("目标 Prompt偏差组不存在".into());
+    }
+    let moved = state.db.pin_images(2, &args.image_ids, &args.target_group_key, "move").map_err(|e| e.to_string())?;
+    Ok(ManualGroupResult { group_key: args.target_group_key, moved })
+}
+
+#[tauri::command]
+pub fn undo_split(group_key: String, source_id: i64, state: State<'_, AppState>) -> Result<usize, String> {
+    state.db.undo_manual_split(&group_key, source_id).map_err(|e| e.to_string())
 }
 
 /// Manually merge two+ L2 (Prompt偏差) groups into one canonical group.
@@ -967,9 +1035,12 @@ pub fn merge_groups(
     if args.level != 2 {
         return Err("暂仅支持 L2（Prompt偏差）级别的手动合并".to_string());
     }
+    if args.source_id.is_none() {
+        return Err("请先选择具体来源目录，再执行合并（避免误并其他来源的图片）".to_string());
+    }
     let ids = state
         .db
-        .image_ids_for_keys(args.level, &args.from_keys)
+        .image_ids_for_keys(args.level, &args.from_keys, args.source_id)
         .map_err(|e| e.to_string())?;
     if ids.is_empty() {
         return Ok(ManualGroupResult {
@@ -1019,6 +1090,60 @@ pub fn split_images(
         group_key: new_key,
         moved,
     })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnmergeGroupArgs {
+    pub group_key: String,
+    /// Optional: restrict the undo to one source so a group whose key
+    /// accidentally spans sources is only rolled back where asked.
+    pub source_id: Option<i64>,
+}
+
+/// Undo a manual L2 merge from inside the merged group's folder view: every
+/// member is restored to the L2 key it held before the merge and its binding
+/// is removed, so auto re-clustering may place it again. The merged group
+/// itself disappears (its members move back to their original groups).
+#[tauri::command]
+pub fn unmerge_group(
+    args: UnmergeGroupArgs,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    state
+        .db
+        .unmerge_group(&args.group_key, args.source_id)
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArenaHideArgs {
+    pub group_key: String,
+    pub survivor_id: i64,
+    pub victim_id: i64,
+    pub session_id: Option<String>,
+    pub started_at: Option<String>,
+    pub context_signature: Option<String>,
+}
+
+/// Arena hide: hide `victim` (score 0, excluded from scoring) and credit
+/// `survivor` exactly like an arena winner. One review action snapshots both
+/// images so a single undo restores the whole pair.
+#[tauri::command]
+pub fn arena_hide(
+    args: ArenaHideArgs,
+    state: State<'_, AppState>,
+) -> Result<crate::db::ArenaHideResult, String> {
+    state
+        .db
+        .arena_hide_atomic(
+            &args.group_key,
+            args.survivor_id,
+            args.victim_id,
+            args.session_id.as_deref(),
+            args.started_at.as_deref(),
+            args.context_signature.as_deref(),
+        )
+        .map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1495,6 +1620,123 @@ mod e2e_tests {
         assert!(with_model > 0, "diffusion_model must be populated");
         assert!(matched_any, "at least one workflow key must match a template");
 
+        // Prompt-parsing coverage on real data (diagnostic; no assert because
+        // some pipelines legitimately encode no text at all).
+        let conn = db.0.lock().unwrap();
+        let prompt_stats: (i64, i64) = conn
+            .query_row(
+                "SELECT
+                   SUM(CASE WHEN (prompt_pos IS NOT NULL AND prompt_pos!='') OR (prompt_neg IS NOT NULL AND prompt_neg!='') THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN meta_ok=1 AND source_kind='comfy'
+                             AND (prompt_pos IS NULL OR prompt_pos='')
+                             AND (prompt_neg IS NULL OR prompt_neg='') THEN 1 ELSE 0 END)
+                 FROM images",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT filename, checkpoint, substr(prompt_pos,1,60) FROM images
+                 WHERE meta_ok=1 AND source_kind='comfy'
+                   AND (prompt_pos IS NULL OR prompt_pos='')
+                   AND (prompt_neg IS NULL OR prompt_neg='')
+                 ORDER BY filename LIMIT 12",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Vec<_>>();
+        let mut promptless = Vec::new();
+        for (f, ck, pp) in rows.into_iter().flatten() {
+            promptless.push(format!("{f} (ckpt={ck:?}, pos={pp:?})"));
+        }
+        drop(stmt);
+        let civitai: Vec<(String, String, String, i64)> = {
+            let mut s = conn
+                .prepare(
+                    "SELECT filename,
+                            COALESCE(substr(prompt_pos,1,50),''),
+                            COALESCE(samplers,''),
+                            (samplers IS NOT NULL AND samplers!='' AND samplers!='[]') AS has_samplers
+                     FROM images WHERE filename LIKE 'Krea2_2026%' ORDER BY filename",
+                )
+                .unwrap();
+            s.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        drop(conn);
+        eprintln!(
+            "e2e prompt: with_prompt={} comfy_without_prompt={}",
+            prompt_stats.0, prompt_stats.1
+        );
+        for p in promptless {
+            eprintln!("e2e promptless: {p}");
+        }
+        for (f, pos, samplers, has) in &civitai {
+            eprintln!("e2e civitai: {f} pos={pos:?} samplers={} has_samplers={has}", samplers.len());
+        }
+        for (_, pos, _, has) in &civitai {
+            assert!(!pos.is_empty(), "CivitAI image must have a prompt after reparse");
+            assert!(*has == 1, "CivitAI image must have samplers after reparse");        }
+
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Parse the real CivitAI folder images directly with `parse_file` and
+    /// assert prompt + sampler extraction (skips gracefully when absent).
+    #[test]
+    fn real_civitai_images_parse_prompts() {
+        let dir = r"C:\cc\ComfyUI_windows_portable\ComfyUI\output\CivitAI";
+        if !std::path::Path::new(dir).is_dir() {
+            eprintln!("no CivitAI folder, skipping");
+            return;
+        }
+        let mut checked = 0;
+        for entry in walkdir::WalkDir::new(dir)
+            .max_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let p = entry.path();
+            if !p.is_file()
+                || p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.to_lowercase())
+                    .as_deref()
+                    != Some("png")
+            {
+                continue;
+            }
+            let meta = crate::metadata::parse_file(p).unwrap();
+            checked += 1;
+            eprintln!(
+                "civitai real parse: {} prompt_len={} samplers={} ckpt={}",
+                p.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+                meta.prompt_pos.len(),
+                meta.samplers.len(),
+                meta.checkpoint,
+            );
+            assert!(!meta.prompt_pos.is_empty(), "{}: prompt must parse", p.display());
+            assert!(!meta.samplers.is_empty(), "{}: samplers must parse", p.display());
+            assert_eq!(meta.source_kind, crate::metadata::SourceKind::Comfy);
+        }
+        assert!(checked >= 1, "expected at least one CivitAI PNG");
     }
 }

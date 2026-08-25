@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 
 interface PopoverProps {
@@ -65,6 +65,31 @@ export function Popover({ trigger, children, open: controlledOpen, onOpenChange 
         }
     : { display: 'none' }
 
+  // Keep the open panel fully inside the viewport. The anchor (trigger) can
+  // sit near/above the top edge on short windows (e.g. the card's "更多"
+  // button at the top of a clipped card), which would otherwise push the
+  // panel off-screen. Measured post-mount and corrected before paint.
+  const [clamp, setClamp] = useState<{ top?: number; left?: number } | null>(null)
+  useLayoutEffect(() => {
+    if (!open) {
+      setClamp(null)
+      return
+    }
+    const panel = panelRef.current
+    if (!panel) return
+    const pr = panel.getBoundingClientRect()
+    const pad = 8
+    const next: { top?: number; left?: number } = {}
+    if (pr.top < pad) next.top = pad
+    if (pr.bottom > window.innerHeight - pad) next.top = Math.max(pad, window.innerHeight - pad - pr.height)
+    if (pr.left < pad) next.left = pad
+    if (pr.right > window.innerWidth - pad) next.left = Math.max(pad, window.innerWidth - pad - pr.width)
+    setClamp(next)
+  }, [open])
+  const finalStyle: React.CSSProperties = clamp
+    ? { ...style, top: clamp.top ?? style.top, left: clamp.left ?? style.left }
+    : style
+
   return (
     <>
       <div
@@ -82,7 +107,7 @@ export function Popover({ trigger, children, open: controlledOpen, onOpenChange 
           <div
             ref={panelRef}
             className="popover-panel"
-            style={style}
+            style={finalStyle}
             // The panel is portaled to <body>, but React synthetic events
             // bubble through the *component* tree, so a click inside the panel
             // would otherwise reach card-level handlers (e.g. Arena's

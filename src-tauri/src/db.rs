@@ -4,7 +4,7 @@ use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use rusqlite::Transaction;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -219,7 +219,7 @@ impl Db {
 mod migrations {
     use super::*;
 
-    pub(crate) const CURRENT_VERSION: i32 = 13;
+    pub(crate) const CURRENT_VERSION: i32 = 15;
 
     pub fn run(conn: &Connection) -> Result<()> {
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -295,6 +295,11 @@ mod migrations {
                 "ALTER TABLE images ADD COLUMN parser_version TEXT NOT NULL DEFAULT '';",
             )?;
         }
+        if !cols.contains("modified_at") {
+            conn.execute_batch(
+                "ALTER TABLE images ADD COLUMN modified_at INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
         let src_cols = source_columns(conn)?;
         if !src_cols.contains("file_count") {
             conn.execute_batch(
@@ -314,6 +319,9 @@ mod migrations {
             conn.execute_batch(
                 "ALTER TABLE sources ADD COLUMN l2_threshold REAL NOT NULL DEFAULT 0.3;",
             )?;
+        }
+        if !src_cols.contains("model_deviation_dimensions") {
+            conn.execute_batch("ALTER TABLE sources ADD COLUMN model_deviation_dimensions TEXT NOT NULL DEFAULT '[\"base_model\",\"checkpoint\",\"lora\",\"workflow\"]';")?;
         }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS workflow_templates (
@@ -350,6 +358,20 @@ mod migrations {
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_images_recipe_signature ON images(recipe_signature);",
         )?;
+        // v14: manual merge undo. Each binding remembers the group key the
+        // image held BEFORE it was pinned, so "undo merge" can restore every
+        // member to its original L2 group (guarded — fresh DBs already get
+        // the column from CREATE TABLE above).
+        let has_prev_key: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('manual_group_bindings') WHERE name='prev_group_key'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_prev_key == 0 {
+            conn.execute_batch(
+                "ALTER TABLE manual_group_bindings ADD COLUMN prev_group_key TEXT;",
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {};", CURRENT_VERSION))?;
         Ok(())
     }
@@ -385,7 +407,8 @@ mod migrations {
                 scanned_at TEXT,
                 file_count INTEGER NOT NULL DEFAULT 0,
                 newest_mtime INTEGER NOT NULL DEFAULT 0,
-                l2_threshold REAL NOT NULL DEFAULT 0.3
+                l2_threshold REAL NOT NULL DEFAULT 0.3,
+                model_deviation_dimensions TEXT NOT NULL DEFAULT '[]'
             );
             CREATE TABLE IF NOT EXISTS images (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -394,6 +417,7 @@ mod migrations {
                 abs_path TEXT NOT NULL,
                 filename TEXT NOT NULL,
                 size INTEGER,
+                modified_at INTEGER NOT NULL DEFAULT 0,
                 width INTEGER,
                 height INTEGER,
                 prompt_pos TEXT,
@@ -481,6 +505,7 @@ mod migrations {
                 group_key TEXT NOT NULL,
                 kind TEXT NOT NULL DEFAULT 'merge',
                 created_at TEXT,
+                prev_group_key TEXT,
                  PRIMARY KEY(level, image_id),
                  FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE
              );
@@ -743,12 +768,14 @@ pub struct SourceRow {
     /// The background sync uses this instead of a hardcoded default so it
     /// never undoes the user's threshold choice.
     pub l2_threshold: f64,
+    pub model_deviation_dimensions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageRow {
     pub id: i64,
     pub source_id: i64,
+    pub group_key_l1: String,
     pub abs_path: String,
     pub filename: String,
     pub width: i64,
@@ -769,6 +796,8 @@ pub struct ImageRow {
     pub hidden: bool,
     /// File size in bytes (for folder-view sorting).
     pub size: i64,
+    /// File modification time as Unix seconds (for folder-view sorting).
+    pub modified_at: i64,
     /// Primary diffusion model (v8+). Empty for legacy rows until reparse.
     pub diffusion_model: String,
     /// Saved-template name this image's workflow matched (if any).
@@ -870,6 +899,17 @@ pub struct UndoActionResult {
     pub committed_at: String,
 }
 
+/// Result of an arena hide: the victim is hidden with score 0, the survivor
+/// is credited like an arena winner and carries the updated score.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArenaHideResult {
+    pub action_id: String,
+    pub survivor_id: i64,
+    pub survivor_score: f64,
+    pub victim_id: i64,
+    pub victim_score: f64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TelemetryEventResult {
     pub event_id: String,
@@ -894,7 +934,7 @@ impl Db {
     pub fn list_sources(&self) -> Result<Vec<SourceRow>> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, path, kind, alias, scanned_at, l2_threshold FROM sources ORDER BY id",
+            "SELECT id, path, kind, alias, scanned_at, l2_threshold, model_deviation_dimensions FROM sources ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(SourceRow {
@@ -904,6 +944,7 @@ impl Db {
                 alias: r.get(3)?,
                 scanned_at: r.get(4)?,
                 l2_threshold: r.get(5)?,
+                model_deviation_dimensions: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or_default(),
             })
         })?;
         let mut out = Vec::new();
@@ -921,6 +962,15 @@ impl Db {
         conn.execute(
             "UPDATE sources SET l2_threshold=?2 WHERE id=?1",
             rusqlite::params![source_id, threshold],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_model_deviation_dimensions(&self, source_id: i64, dimensions: &[String]) -> Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE sources SET model_deviation_dimensions=?2 WHERE id=?1",
+            rusqlite::params![source_id, serde_json::to_string(dimensions)?],
         )?;
         Ok(())
     }
@@ -943,7 +993,7 @@ impl Db {
         let conn = self.0.lock().unwrap();
         conn.execute(
             "INSERT INTO images (
-                source_id, rel_path, abs_path, filename, size, width, height,
+                source_id, rel_path, abs_path, filename, size, modified_at, width, height,
                 prompt_pos, prompt_neg, checkpoint, loras, vae, samplers, seed, steps, cfg,
                 group_key_l0, group_key_l1, group_key_l2, group_key_l3,
                  sha256, meta_ok, source_kind, scanned_at,
@@ -953,8 +1003,8 @@ impl Db {
                  generation_recipe_json, recipe_signature, parser_version
              ) VALUES (
                  ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
-                 ?17,?18,?19,?20,?21,?22,?23,?24,
-                 ?25,?26,?27,?28,?29,?30,?31,?32,?33
+                 ?17,?18,?19,?20,?21,?22,?23,?24,?25,
+                 ?26,?27,?28,?29,?30,?31,?32,?33,?34
              )",
             rusqlite::params![
                 row.source_id,
@@ -962,6 +1012,7 @@ impl Db {
                 row.abs_path,
                 row.filename,
                 row.size,
+                row.modified_at,
                 row.width,
                 row.height,
                 row.prompt_pos,
@@ -995,6 +1046,15 @@ impl Db {
         Ok(conn.last_insert_rowid())
     }
 
+    pub fn update_file_stats(&self, image_id: i64, size: i64, modified_at: i64) -> Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE images SET size=?1, modified_at=?2 WHERE id=?3",
+            rusqlite::params![size, modified_at, image_id],
+        )?;
+        Ok(())
+    }
+
     /// Full metadata refresh for a row re-parsed from disk (backfill after a
     /// parser fix or a mid-write failed scan). Preserves image id, scores,
     /// labels, and archive log. Returns the new L1 key (for re-clustering).
@@ -1010,11 +1070,11 @@ impl Db {
                 source_id=?2, prompt_pos=?3, prompt_neg=?4, checkpoint=?5,
                 loras=?6, vae=?7, samplers=?8, seed=?9, steps=?10, cfg=?11,
                 group_key_l0=?12, group_key_l1=?13, group_key_l2=?14, group_key_l3=?15,
-                 meta_ok=?16, source_kind=?17, width=?18, height=?19,
-                 diffusion_model=?20, model_chain_json=?21,
-                 workflow_key=?22, workflow_graph_json=?23,
-                 workflow_template_id=?24, workflow_match_confidence=?25,
-                 generation_recipe_json=?26, recipe_signature=?27, parser_version=?28
+                 meta_ok=?16, source_kind=?17, width=?18, height=?19, size=?20, modified_at=?21,
+                 diffusion_model=?22, model_chain_json=?23,
+                 workflow_key=?24, workflow_graph_json=?25,
+                 workflow_template_id=?26, workflow_match_confidence=?27,
+                 generation_recipe_json=?28, recipe_signature=?29, parser_version=?30
              WHERE id=?1",
             rusqlite::params![
                 image_id,
@@ -1036,6 +1096,8 @@ impl Db {
                 row.source_kind,
                 row.width,
                 row.height,
+                row.size,
+                row.modified_at,
                 row.diffusion_model,
                 row.model_chain_json,
                 row.workflow_key,
@@ -1105,12 +1167,73 @@ impl Db {
             }
         }
         // Manual-merge badge only makes sense at the prompt-deviation level.
+        // Fetch all manually-pinned group keys in ONE set-based query instead
+        // of an N+1 loop (was ~17ms per group; the set-based pass is ~1ms).
         if level == 2 {
+            let mut merged: HashSet<String> = HashSet::new();
+            let mut stmt = conn.prepare(&format!(
+                "SELECT DISTINCT i.{col} FROM manual_group_bindings b
+                 JOIN images i ON i.id = b.image_id
+                 WHERE b.level = ?1 AND i.{col} IS NOT NULL AND i.hidden = 0",
+                col = key_col
+            ))?;
+            let rows = stmt.query_map(rusqlite::params![2i64], |r| r.get::<_, String>(0))?;
+            for r in rows {
+                merged.insert(r?);
+            }
             for group in &mut out {
-                group.manually_merged = self.group_has_binding(&conn, 2, &group.group_key)?;
+                group.manually_merged = merged.contains(&group.group_key);
             }
         }
         Ok(out)
+    }
+
+    pub fn list_l2_targets(&self, source_id: i64, current_l2: &str) -> Result<Vec<GroupInfo>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT i.group_key_l2, COUNT(*), MIN(i.prompt_pos), MIN(i.checkpoint),
+                    MIN(i.source_kind), MIN(s.path), MIN(wt.name)
+             FROM images i JOIN sources s ON s.id=i.source_id
+             LEFT JOIN workflow_templates wt ON wt.id=i.workflow_template_id
+             WHERE i.source_id=?1 AND i.group_key_l2 IS NOT NULL
+               AND i.group_key_l2 != ?2 AND i.hidden=0
+             GROUP BY i.group_key_l2 ORDER BY COUNT(*) DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![source_id, current_l2], |r| {
+            Ok(GroupInfo {
+                group_key: r.get(0)?, count: r.get(1)?, prompt_pos: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                checkpoint: r.get::<_, Option<String>>(3)?.unwrap_or_default(), source_kind: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                source_path: r.get::<_, Option<String>>(5)?.unwrap_or_default(), workflow_name: r.get(6)?,
+                model_facets: Vec::new(), manually_merged: false,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row?); }
+        Ok(out)
+    }
+
+    pub fn undo_manual_split(&self, group_key: &str, source_id: i64) -> Result<usize> {
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare(
+            "SELECT b.image_id, b.prev_group_key FROM manual_group_bindings b
+             JOIN images i ON i.id=b.image_id
+             WHERE b.level=2 AND b.group_key=?1 AND b.kind='split' AND i.source_id=?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![group_key, source_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        let mut items = Vec::new();
+        for row in rows { items.push(row?); }
+        drop(stmt);
+        for (id, prev) in &items {
+            if let Some(prev) = prev {
+                tx.execute("UPDATE images SET group_key_l2=?1 WHERE id=?2", rusqlite::params![prev, id])?;
+            }
+            tx.execute("DELETE FROM manual_group_bindings WHERE level=2 AND image_id=?1", rusqlite::params![id])?;
+        }
+        tx.commit()?;
+        Ok(items.len())
     }
 
     fn model_facets_for_group(
@@ -1188,7 +1311,7 @@ impl Db {
         let sql = format!(
             "SELECT i.id, i.source_id, i.abs_path, i.filename, i.width, i.height, i.prompt_pos, i.prompt_neg,
                     i.checkpoint, i.loras, i.vae, i.samplers, i.seed, i.meta_ok, i.source_kind, i.hidden, i.size,
-                    COALESCE(NULLIF(i.diffusion_model, ''), ''), wt.name, b.kind
+                    i.modified_at, i.group_key_l1, COALESCE(NULLIF(i.diffusion_model, ''), ''), wt.name, b.kind
              FROM images i LEFT JOIN workflow_templates wt ON wt.id=i.workflow_template_id
              LEFT JOIN manual_group_bindings b ON b.level=2 AND b.image_id=i.id
              WHERE i.{col}=?1 {hid} ORDER BY i.seed, i.filename",
@@ -1216,9 +1339,11 @@ impl Db {
                 labels: Vec::new(),
                 hidden: r.get::<_, i64>(15)? != 0,
                 size: r.get::<_, Option<i64>>(16)?.unwrap_or(0),
-                diffusion_model: r.get::<_, Option<String>>(17)?.unwrap_or_default(),
-                workflow_name: r.get(18)?,
-                manually_grouped: r.get(19)?,
+                modified_at: r.get::<_, Option<i64>>(17)?.unwrap_or(0),
+                group_key_l1: r.get(18)?,
+                diffusion_model: r.get::<_, Option<String>>(19)?.unwrap_or_default(),
+                workflow_name: r.get(20)?,
+                manually_grouped: r.get(21)?,
             })
         })?;
         let mut out: Vec<ImageRow> = Vec::new();
@@ -1733,6 +1858,108 @@ impl Db {
         })
     }
 
+    /// Arena hide: one card is hidden (score 0, excluded from scoring) and
+    /// the survivor is credited exactly like a normal arena winner — both
+    /// scores move through `apply_arena`, a `compare_pairs` row records
+    /// the win, and one review action snapshots BOTH images' previous state
+    /// so a single undo restores the whole pair.
+    pub fn arena_hide_atomic(
+        &self,
+        group_key: &str,
+        survivor: i64,
+        victim: i64,
+        session_id: Option<&str>,
+        started_at: Option<&str>,
+        context_signature: Option<&str>,
+    ) -> Result<ArenaHideResult> {
+        validate_token("group_key", group_key, 256, true)?;
+        if let Some(session_id) = session_id {
+            validate_token("session_id", session_id, 128, false)?;
+        }
+        if let Some(signature) = context_signature {
+            validate_token("context_signature", signature, 256, false)?;
+        }
+        let started_at = normalize_started_at(started_at)?;
+        let action_id = next_id("act");
+        let committed_at = Utc::now().to_rfc3339();
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        for image_id in [survivor, victim] {
+            let exists: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM images WHERE id=?1",
+                rusqlite::params![image_id],
+                |r| r.get(0),
+            )?;
+            if exists == 0 {
+                return Err(anyhow::anyhow!("image row not found"));
+            }
+        }
+        let survivor_prev = current_score_tx(&tx, survivor)?.unwrap_or(crate::scoring::BASE_SCORE);
+        let victim_prev = current_score_tx(&tx, victim)?.unwrap_or(crate::scoring::BASE_SCORE);
+        let had_survivor_prev_score = current_score_tx(&tx, survivor)?.is_some();
+        let had_victim_prev_score = current_score_tx(&tx, victim)?.is_some();
+        let (survivor_new, _) = crate::scoring::apply_arena(survivor_prev, victim_prev, true);
+        let victim_hidden: bool = tx
+            .query_row(
+                "SELECT hidden FROM images WHERE id=?1",
+                rusqlite::params![victim],
+                |r| r.get::<_, i64>(0),
+            )? != 0;
+        tx.execute(
+            "UPDATE images SET hidden=?1 WHERE id=?2",
+            rusqlite::params![1i64, victim],
+        )?;
+        insert_score_tx(&tx, victim, 0.0, "hide")?;
+        insert_score_tx(&tx, survivor, survivor_new, "arena")?;
+        tx.execute(
+            "INSERT INTO compare_pairs (group_key, left_img, right_img, winner, delta, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                group_key,
+                survivor,
+                victim,
+                survivor,
+                (survivor_new - survivor_prev).abs(),
+                &committed_at,
+            ],
+        )?;
+        let result_json = serde_json::json!({
+            "survivor_id": survivor,
+            "victim_id": victim,
+            "survivor_prev_score": survivor_prev,
+            "had_survivor_prev_score": had_survivor_prev_score,
+            "survivor_new_score": survivor_new,
+            "victim_prev_score": victim_prev,
+            "had_victim_prev_score": had_victim_prev_score,
+            "victim_prev_hidden": victim_hidden,
+        })
+        .to_string();
+        insert_review_action(
+            &tx,
+            &action_id,
+            session_id,
+            "arena_hide",
+            Some(victim),
+            Some(survivor),
+            Some(victim),
+            None,
+            Some(survivor),
+            Some(group_key),
+            started_at.as_deref(),
+            &committed_at,
+            context_signature,
+            &result_json,
+        )?;
+        tx.commit()?;
+        Ok(ArenaHideResult {
+            action_id,
+            survivor_id: survivor,
+            survivor_score: survivor_new,
+            victim_id: victim,
+            victim_score: 0.0,
+        })
+    }
+
     pub fn undo_review_action(
         &self,
         action_id: &str,
@@ -1761,7 +1988,7 @@ impl Db {
             )
             .optional()?
             .ok_or_else(|| anyhow::anyhow!("review action not found"))?;
-        if !matches!(mode.as_str(), "swipe" | "hide") {
+        if !matches!(mode.as_str(), "swipe" | "hide" | "arena_hide") {
             return Err(anyhow::anyhow!("review action is not reversible"));
         }
         let image_id = image_id.ok_or_else(|| anyhow::anyhow!("review action has no image"))?;
@@ -1790,6 +2017,93 @@ impl Db {
                 label_id: existing_result.get("label_id").and_then(|value| value.as_i64()),
                 gesture,
                 committed_at: existing_committed_at,
+            });
+        }
+        // Arena hide affects TWO images (survivor credited as winner,
+        // victim hidden + zeroed). Undo must restore both, so it takes its
+        // own branch before the single-image path below.
+        if mode == "arena_hide" {
+            let snap: serde_json::Value = serde_json::from_str(&result_json)
+                .map_err(|_| anyhow::anyhow!("review action snapshot is invalid"))?;
+            let survivor_id = snap
+                .get("survivor_id")
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| anyhow::anyhow!("arena hide snapshot has no survivor"))?;
+            let victim_id = snap
+                .get("victim_id")
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| anyhow::anyhow!("arena hide snapshot has no victim"))?;
+            let had_survivor = snap
+                .get("had_survivor_prev_score")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let survivor_prev = snap.get("survivor_prev_score").and_then(|value| value.as_f64());
+            let had_victim = snap
+                .get("had_victim_prev_score")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let victim_prev = snap.get("victim_prev_score").and_then(|value| value.as_f64());
+            let victim_prev_hidden = snap
+                .get("victim_prev_hidden")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if had_survivor {
+                let score = survivor_prev
+                    .ok_or_else(|| anyhow::anyhow!("arena hide survivor prev score is missing"))?;
+                insert_score_tx(&tx, survivor_id, score, "undo")?;
+            } else {
+                tx.execute(
+                    "DELETE FROM scores WHERE image_id=?1",
+                    rusqlite::params![survivor_id],
+                )?;
+            }
+            tx.execute(
+                "UPDATE images SET hidden=?1 WHERE id=?2",
+                rusqlite::params![victim_prev_hidden as i64, victim_id],
+            )?;
+            if had_victim {
+                let score = victim_prev
+                    .ok_or_else(|| anyhow::anyhow!("arena hide victim prev score is missing"))?;
+                insert_score_tx(&tx, victim_id, score, "undo")?;
+            } else {
+                tx.execute(
+                    "DELETE FROM scores WHERE image_id=?1",
+                    rusqlite::params![victim_id],
+                )?;
+            }
+            let undo_result = serde_json::json!({
+                "restored_score": victim_prev,
+                "had_previous_score": had_victim,
+                "hidden": victim_prev_hidden,
+                "label_id": null,
+            })
+            .to_string();
+            tx.execute(
+                "INSERT INTO review_actions (
+                     action_id, session_id, mode, image_id, gesture, group_key,
+                     committed_at, result_json, undo_of_action_id
+                 ) VALUES (?1,?2,'undo',?3,?4,?5,?6,?7,?8)",
+                rusqlite::params![
+                    undo_action_id,
+                    session_id,
+                    victim_id,
+                    gesture,
+                    group_key,
+                    committed_at,
+                    undo_result,
+                    action_id,
+                ],
+            )?;
+            tx.commit()?;
+            return Ok(UndoActionResult {
+                action_id: undo_action_id,
+                undone_action_id: action_id.to_string(),
+                image_id: victim_id,
+                restored_score: if had_victim { victim_prev } else { None },
+                hidden: victim_prev_hidden,
+                label_id: None,
+                gesture,
+                committed_at,
             });
         }
         let snapshot: serde_json::Value = serde_json::from_str(&result_json)
@@ -2114,17 +2428,22 @@ impl Db {
         Ok(removed)
     }
 
-    /// Rows whose metadata is missing/broken and should be re-parsed from
-    /// disk (failed mid-write scans, pre-v8 rows, pre-lenient-parser rows).
+    /// Rows whose metadata is missing/broken OR was parsed by an older
+    /// parser version, and should be re-parsed from disk (failed mid-write
+    /// scans, pre-v8 rows, pre-lenient-parser rows, rows produced before
+    /// prompt/sampler extraction improvements).
     pub fn list_images_needing_reparse(&self, source_id: i64) -> Result<Vec<(i64, String)>> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, abs_path FROM images
-             WHERE source_id=?1 AND (meta_ok=0 OR workflow_key IS NULL OR workflow_key='')",
+             WHERE source_id=?1
+               AND (meta_ok=0 OR workflow_key IS NULL OR workflow_key=''
+                    OR parser_version IS NULL OR parser_version!=?2)",
         )?;
-        let rows = stmt.query_map(rusqlite::params![source_id], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        })?;
+        let rows = stmt.query_map(
+            rusqlite::params![source_id, crate::metadata::PARSER_VERSION],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -2172,16 +2491,25 @@ impl Db {
     }
 
     /// All image ids currently holding any of `from_keys` at `level`.
-    pub fn image_ids_for_keys(&self, level: u8, from_keys: &[String]) -> Result<Vec<i64>> {
+    /// Group keys are not source-namespaced (workflow/model-chain identities
+    /// are shared), so when the caller knows the active source it MUST be
+    /// passed — otherwise a merge would silently sweep in images from other
+    /// sources that happen to share the same key.
+    pub fn image_ids_for_keys(
+        &self,
+        level: u8,
+        from_keys: &[String],
+        source_id: Option<i64>,
+    ) -> Result<Vec<i64>> {
         let conn = self.0.lock().unwrap();
         let col = Self::key_col(level);
         let mut out = Vec::new();
         let mut stmt = conn.prepare(&format!(
-            "SELECT id FROM images WHERE {col}=?1 ORDER BY id",
+            "SELECT id FROM images WHERE {col}=?1 AND (?2 IS NULL OR source_id=?2) ORDER BY id",
             col = col
         ))?;
         for k in from_keys {
-            let rows = stmt.query_map(rusqlite::params![k], |r| r.get::<_, i64>(0))?;
+            let rows = stmt.query_map(rusqlite::params![k, source_id], |r| r.get::<_, i64>(0))?;
             for r in rows {
                 out.push(r?);
             }
@@ -2208,21 +2536,57 @@ impl Db {
         Ok(out)
     }
 
+    pub fn image_move_context(&self, ids: &[i64]) -> Result<Vec<(i64, String, String)>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT source_id, group_key_l1, group_key_l2 FROM images WHERE id=?1")?;
+        let mut out = Vec::new();
+        for id in ids {
+            out.push(stmt.query_row(rusqlite::params![id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?);
+        }
+        Ok(out)
+    }
+
+    pub fn l2_target_exists(&self, source_id: i64, target: &str) -> Result<bool> {
+        let conn = self.0.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM images WHERE source_id=?1 AND group_key_l2=?2)",
+            rusqlite::params![source_id, target], |r| r.get(0),
+        )?)
+    }
+
     /// Pin each image to a fixed group key at `level` and rewrite its group
     /// column so display is immediately consistent. Used by manual merge
     /// (every member pinned to the canonical key) and manual split (only
     /// the pulled-out images pinned). Returns the number of images moved.
+    /// Pin each image to a fixed group key at `level` and rewrite its group
+    /// column so display is immediately consistent. Used by manual merge
+    /// (every member pinned to the canonical key) and manual split (only
+    /// the pulled-out images pinned). The previous group key is snapshotted
+    /// into `prev_group_key` so an "undo merge" can restore every member to
+    /// its original group. Returns the number of images moved.
     pub fn pin_images(&self, level: u8, ids: &[i64], group_key: &str, kind: &str) -> Result<usize> {
         let conn = self.0.lock().unwrap();
         let col = Self::key_col(level);
         let mut moved = 0usize;
+        let mut prev_stmt = conn.prepare(&format!("SELECT {col} FROM images WHERE id=?1", col = col))?;
         for id in ids {
+            let prev: Option<String> = prev_stmt
+                .query_row(rusqlite::params![id], |r| r.get(0))
+                .optional()?;
             conn.execute(
-                "INSERT INTO manual_group_bindings (level, image_id, group_key, kind, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO manual_group_bindings (level, image_id, group_key, kind, created_at, prev_group_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(level, image_id) DO UPDATE SET
-                    group_key=excluded.group_key, kind=excluded.kind",
-                rusqlite::params![level as i64, id, group_key, kind, Utc::now().to_rfc3339()],
+                    group_key=excluded.group_key, kind=excluded.kind,
+                    prev_group_key=excluded.prev_group_key",
+                rusqlite::params![
+                    level as i64,
+                    id,
+                    group_key,
+                    kind,
+                    Utc::now().to_rfc3339(),
+                    prev,
+                ],
             )?;
             moved += conn.execute(
                 &format!("UPDATE images SET {col}=?1 WHERE id=?2", col = col),
@@ -2232,21 +2596,50 @@ impl Db {
         Ok(moved)
     }
 
-    /// Whether any image in a group is pinned by a manual binding at `level`.
-    fn group_has_binding(&self, conn: &Connection, level: u8, group_key: &str) -> Result<bool> {
-        let col = Self::key_col(level);
-        let n: i64 = conn.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM manual_group_bindings b
-                 JOIN images i ON i.id=b.image_id
-                 WHERE b.level=?1 AND i.{col}=?2 AND i.hidden=0",
-                col = col
-            ),
-            rusqlite::params![level as i64, group_key],
-            |r| r.get(0),
+    /// Undo a manual L2 merge: every image currently bound to `group_key` with
+    /// kind='merge' is restored to the L2 key it held before the merge
+    /// (snapshot in `prev_group_key`) and its binding is removed, so future
+    /// auto re-clustering is free to place it again. Images whose snapshot
+    /// is missing (legacy merges) are unbound only and rejoin auto-clustering
+    /// on the next recluster pass. Returns the number of restored images.
+    pub fn unmerge_group(&self, group_key: &str, source_id: Option<i64>) -> Result<usize> {
+        validate_token("group_key", group_key, 256, false)?;
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare(
+            "SELECT b.image_id, b.prev_group_key
+             FROM manual_group_bindings b
+             JOIN images i ON i.id = b.image_id
+             WHERE b.level = 2 AND b.group_key = ?1 AND b.kind = 'merge'
+               AND (?2 IS NULL OR i.source_id = ?2)
+             ORDER BY b.image_id",
         )?;
-        Ok(n > 0)
+        let rows = stmt.query_map(rusqlite::params![group_key, source_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        let mut pairs: Vec<(i64, Option<String>)> = Vec::new();
+        for r in rows {
+            pairs.push(r?);
+        }
+        drop(stmt);
+        let mut restored = 0usize;
+        for (image_id, prev) in pairs {
+            if let Some(prev) = prev {
+                tx.execute(
+                    "UPDATE images SET group_key_l2=?1 WHERE id=?2",
+                    rusqlite::params![prev, image_id],
+                )?;
+            }
+            tx.execute(
+                "DELETE FROM manual_group_bindings WHERE level=2 AND image_id=?1",
+                rusqlite::params![image_id],
+            )?;
+            restored += 1;
+        }
+        tx.commit()?;
+        Ok(restored)
     }
+
 }
 
 #[derive(Debug, Clone)]
@@ -2256,6 +2649,7 @@ pub struct ImageInsert {
     pub abs_path: String,
     pub filename: String,
     pub size: i64,
+    pub modified_at: i64,
     pub width: i64,
     pub height: i64,
     pub prompt_pos: String,
@@ -2342,6 +2736,240 @@ mod tests {
         migrations::run(&conn).unwrap();
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(version, migrations::CURRENT_VERSION);
+    }
+
+    #[test]
+    fn arena_hide_credits_survivor_and_undo_restores_pair() {
+        let db = open(std::path::Path::new(":memory:")).unwrap();
+        let src = db.upsert_source("C:\\imgs", "folder", None).unwrap();
+        let make = |n: i64, prompt: &str, key: &str| {
+            db.insert_image(&ImageInsert {
+                source_id: src,
+                rel_path: format!("{n}.png"),
+                abs_path: format!("C:\\imgs\\{n}.png"),
+                filename: format!("{n}.png"),
+                size: 100,
+                modified_at: 0,
+                width: 512,
+                height: 512,
+                prompt_pos: prompt.to_string(),
+                prompt_neg: String::new(),
+                checkpoint: "model".into(),
+                loras: String::new(),
+                vae: String::new(),
+                samplers: String::new(),
+                seed: n,
+                steps: 20,
+                cfg: 7.0,
+                group_key_l0: "l0".into(),
+                group_key_l1: "l1".into(),
+                group_key_l2: key.to_string(),
+                group_key_l3: format!("l3-{n}"),
+                sha256: format!("sha{n}"),
+                meta_ok: true,
+                source_kind: "folder".into(),
+                diffusion_model: String::new(),
+                model_chain_json: String::new(),
+                workflow_key: String::new(),
+                workflow_graph_json: String::new(),
+                workflow_template_id: None,
+                workflow_match_confidence: None,
+                generation_recipe_json: String::new(),
+                recipe_signature: String::new(),
+                parser_version: String::new(),
+            })
+            .unwrap()
+        };
+        let a = make(1, "prompt a", "keyA");
+        let b = make(2, "prompt b", "keyB");
+        let conn = db.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO scores (image_id, internal_score, updated_at, last_mode)
+             VALUES (?1, 60, ?3, 'swipe'), (?2, 40, ?3, 'swipe')",
+            rusqlite::params![a, b, Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let hide = db.arena_hide_atomic("g1", a, b, None, None, None).unwrap();
+        assert_eq!(hide.survivor_id, a);
+        assert_eq!(hide.victim_id, b);
+        assert_eq!(hide.victim_score, 0.0);
+        assert!(hide.survivor_score > 60.0, "survivor must gain score like an arena winner");
+        let conn = db.0.lock().unwrap();
+        let (hidden, score): (i64, f64) = conn
+            .query_row(
+                "SELECT hidden, (SELECT internal_score FROM scores WHERE image_id=images.id)
+                 FROM images WHERE id=?1",
+                rusqlite::params![b],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let survivor_score: f64 = conn
+            .query_row(
+                "SELECT internal_score FROM scores WHERE image_id=?1",
+                rusqlite::params![a],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(hidden, 1);
+        assert_eq!(score, 0.0);
+        assert_eq!(survivor_score, hide.survivor_score);
+
+        let undo = db.undo_review_action(&hide.action_id, None).unwrap();
+        assert_eq!(undo.image_id, b);
+        let conn = db.0.lock().unwrap();
+        let hidden_after: i64 = conn
+            .query_row("SELECT hidden FROM images WHERE id=?1", rusqlite::params![b], |r| r.get(0))
+            .unwrap();
+        let (a_score, b_score): (f64, f64) = conn
+            .query_row(
+                "SELECT (SELECT internal_score FROM scores WHERE image_id=?1),
+                        (SELECT internal_score FROM scores WHERE image_id=?2)",
+                rusqlite::params![a, b],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(hidden_after, 0);
+        assert!((a_score - 60.0).abs() < 1e-9, "survivor score restored, got {a_score}");
+        assert!((b_score - 40.0).abs() < 1e-9, "victim score restored, got {b_score}");
+
+        let undo2 = db.undo_review_action(&hide.action_id, None).unwrap();
+        assert_eq!(undo2.action_id, undo.action_id, "double undo is idempotent");
+    }
+
+    #[test]
+    fn unmerge_restores_images_to_their_original_groups() {
+        let db = open(std::path::Path::new(":memory:")).unwrap();
+        let src = db.upsert_source("C:\\imgs", "folder", None).unwrap();
+        let make = |n: i64, key: &str| {
+            db.insert_image(&ImageInsert {
+                source_id: src,
+                rel_path: format!("{n}.png"),
+                abs_path: format!("C:\\imgs\\{n}.png"),
+                filename: format!("{n}.png"),
+                size: 100,
+                modified_at: 0,
+                width: 512,
+                height: 512,
+                prompt_pos: format!("prompt {n}"),
+                prompt_neg: String::new(),
+                checkpoint: "model".into(),
+                loras: String::new(),
+                vae: String::new(),
+                samplers: String::new(),
+                seed: n,
+                steps: 20,
+                cfg: 7.0,
+                group_key_l0: "l0".into(),
+                group_key_l1: "l1".into(),
+                group_key_l2: key.to_string(),
+                group_key_l3: format!("l3-{n}"),
+                sha256: format!("sha{n}"),
+                meta_ok: true,
+                source_kind: "folder".into(),
+                diffusion_model: String::new(),
+                model_chain_json: String::new(),
+                workflow_key: String::new(),
+                workflow_graph_json: String::new(),
+                workflow_template_id: None,
+                workflow_match_confidence: None,
+                generation_recipe_json: String::new(),
+                recipe_signature: String::new(),
+                parser_version: String::new(),
+            })
+            .unwrap()
+        };
+        let a = make(1, "keyA");
+        let b = make(2, "keyB");
+        let prompts = db.prompts_for_ids(&[a, b]).unwrap();
+        let merged_key = crate::clustering::manual_key(&prompts);
+        let moved = db.pin_images(2, &[a, b], &merged_key, "merge").unwrap();
+        assert_eq!(moved, 2);
+        let conn = db.0.lock().unwrap();
+        let key: String = conn
+            .query_row("SELECT group_key_l2 FROM images WHERE id=?1", rusqlite::params![a], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+        assert_eq!(key, merged_key);
+
+        assert_eq!(db.unmerge_group(&merged_key, Some(src)).unwrap(), 2);
+        let conn = db.0.lock().unwrap();
+        let (ka, kb): (String, String) = conn
+            .query_row(
+                "SELECT (SELECT group_key_l2 FROM images WHERE id=?1),
+                        (SELECT group_key_l2 FROM images WHERE id=?2)",
+                rusqlite::params![a, b],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let bindings: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM manual_group_bindings WHERE group_key=?1",
+                rusqlite::params![merged_key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(ka, "keyA");
+        assert_eq!(kb, "keyB");
+        assert_eq!(bindings, 0);
+
+        assert_eq!(db.unmerge_group(&merged_key, Some(src)).unwrap(), 0);
+    }
+
+    #[test]
+    fn merge_scoped_by_source_does_not_sweep_other_sources() {
+        let db = open(std::path::Path::new(":memory:")).unwrap();
+        let src1 = db.upsert_source("C:\\one", "folder", None).unwrap();
+        let src2 = db.upsert_source("C:\\two", "folder", None).unwrap();
+        let make = |n: i64, key: &str, src: i64| {
+            db.insert_image(&ImageInsert {
+                source_id: src,
+                rel_path: format!("{n}.png"),
+                abs_path: format!("C:\\x\\{n}.png"),
+                filename: format!("{n}.png"),
+                size: 100,
+                modified_at: 0,
+                width: 512,
+                height: 512,
+                prompt_pos: format!("prompt {n}"),
+                prompt_neg: String::new(),
+                checkpoint: "model".into(),
+                loras: String::new(),
+                vae: String::new(),
+                samplers: String::new(),
+                seed: n,
+                steps: 20,
+                cfg: 7.0,
+                group_key_l0: "l0".into(),
+                group_key_l1: "l1".into(),
+                group_key_l2: key.to_string(),
+                group_key_l3: format!("l3-{n}"),
+                sha256: format!("sha{n}"),
+                meta_ok: true,
+                source_kind: "folder".into(),
+                diffusion_model: String::new(),
+                model_chain_json: String::new(),
+                workflow_key: String::new(),
+                workflow_graph_json: String::new(),
+                workflow_template_id: None,
+                workflow_match_confidence: None,
+                generation_recipe_json: String::new(),
+                recipe_signature: String::new(),
+                parser_version: String::new(),
+            })
+            .unwrap()
+        };
+        let a = make(1, "shared", src1);
+        let b = make(2, "shared", src2);
+        let ids = db.image_ids_for_keys(2, &["shared".to_string()], Some(src1)).unwrap();
+        assert_eq!(ids, vec![a], "source-scoped lookup must not return other sources");
+        let all = db.image_ids_for_keys(2, &["shared".to_string()], None).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.contains(&b));
     }
 
 }

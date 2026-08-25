@@ -99,6 +99,53 @@ body,
 .merge-msg {
   color: var(--good);
 }
+/* Merge confirm dialog: overlay + animated thumbnail cards of every group
+   the user is about to merge, so the wrong-merge mistake is caught BEFORE
+   it happens. */
+.merge-confirm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.merge-confirm {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 18px 20px;
+  max-width: min(720px, 94vw);
+  max-height: 84vh;
+  overflow-y: auto;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
+}
+.merge-confirm h3 {
+  margin: 0 0 6px;
+}
+.merge-confirm-groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 12px;
+  margin: 14px 0;
+}
+.merge-confirm-group {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px;
+  background: color-mix(in srgb, var(--panel) 60%, transparent);
+}
+.merge-confirm-group .group-prompt {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 .manual-badge {
   font-size: 12px;
   padding: 6px 10px;
@@ -411,11 +458,18 @@ select {
   justify-content: center;
   overflow: hidden;
   touch-action: none;
+  /* Make the deck a size query container so .card / .card img can size
+     against the deck's *actual* available height (100cqh) instead of the
+     viewport (70vh). The deck height is viewport minus the fixed chrome
+     (topbar + gesture pad), so 70vh used to overflow the deck and clip the
+     card's top corners — hiding the "更多" button and score badge behind
+     the topbar on short windows. */
+  container-type: size;
 }
 .card {
   position: absolute;
   max-width: min(70vw, 560px);
-  max-height: 70vh;
+  max-height: 100cqh;
   width: auto;
   height: auto;
   border-radius: 16px;
@@ -431,7 +485,7 @@ select {
 .card img {
   display: block;
   max-width: min(70vw, 560px);
-  max-height: 70vh;
+  max-height: 100cqh;
   width: auto;
   height: auto;
   object-fit: contain;
@@ -599,6 +653,24 @@ select {
   border-color: var(--warn);
   box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn) 35%, transparent);
 }
+/* Undo bar after an arena hide: makes the rollback visible and clickable
+   instead of relying on the user remembering the Backspace binding. */
+.arena-undo-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 5px 16px;
+  font-size: 13px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border-bottom: 1px solid var(--border);
+}
+.arena-undo-bar button {
+  font-size: 12px;
+  padding: 3px 10px;
+}
 .arena-pending-hint {
   flex: 0 0 auto;
   padding: 5px 16px;
@@ -691,15 +763,24 @@ select {
 }
 
 /* ---------- Lightbox ---------- */
+/* Flex row: the image stage always keeps the whole viewport minus the side
+   rail. Metadata lives in the sidebar — never over the image — so clicking
+   an image to enlarge always yields an unobstructed full view. */
 .lightbox {
   position: fixed;
   inset: 0;
   z-index: 999;
   background: rgba(0, 0, 0, 0.92);
   display: flex;
+  user-select: none;
+}
+.lightbox-stage {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  display: flex;
   align-items: center;
   justify-content: center;
-  user-select: none;
 }
 .lightbox-img-wrap {
   display: flex;
@@ -707,16 +788,20 @@ select {
   justify-content: center;
   will-change: transform;
   touch-action: none;
+  max-width: 100%;
+  max-height: 100%;
+  min-width: 0;
+  min-height: 0;
 }
 .lightbox-img-wrap img {
-  max-width: 92vw;
+  max-width: 100%;
   max-height: 86vh;
   object-fit: contain;
   display: block;
   user-select: none;
 }
 .lightbox-hud {
-  position: fixed;
+  position: absolute;
   bottom: 16px;
   left: 50%;
   transform: translateX(-50%);
@@ -734,12 +819,93 @@ select {
   font-size: 12px;
 }
 .lb-hint {
-  position: fixed;
+  position: absolute;
   bottom: 4px;
   left: 50%;
   transform: translateX(-50%);
   text-align: center;
   width: 100%;
+}
+/* Right sidebar (FolderView zoom view): summons the metadata panel on
+   demand. The panel scrolls internally so long prompts stay usable. */
+.lightbox-side {
+  flex: 0 0 38px;
+  width: 38px;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: rgba(10, 10, 14, 0.6);
+  min-height: 0;
+  transition: flex-basis 0.16s ease, width 0.16s ease;
+}
+.lightbox-side.open {
+  flex-basis: 300px;
+  width: 300px;
+}
+.lightbox-side-toggle {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  text-align: left;
+  padding: 10px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  overflow: hidden;
+}
+.lightbox-side:not(.open) .lightbox-side-toggle {
+  align-items: center;
+  justify-content: center;
+  width: 37px;
+  min-height: 100%;
+  padding: 12px 7px;
+  border-bottom: 0;
+}
+.lightbox-side:not(.open) .lightbox-side-label {
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  white-space: nowrap;
+  letter-spacing: 0;
+}
+.lightbox-side-toggle:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+.lightbox-side-toggle .manual-badge {
+  font-weight: 400;
+}
+.lightbox-side-panel {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px 14px 16px;
+  user-select: none;
+}
+.lightbox-side-panel .meta-popover-content {
+  font-size: 12px;
+}
+.lightbox-side-panel .meta-field pre {
+  max-height: 140px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+@media (max-width: 860px) {
+  .lightbox-side {
+    flex-basis: 34px;
+    width: 34px;
+  }
+  .lightbox-side.open {
+    flex-basis: 240px;
+    width: 240px;
+  }
+  .lightbox-side:not(.open) .lightbox-side-toggle {
+    width: 33px;
+  }
 }
 
 /* ---------- Folder view ---------- */
@@ -780,6 +946,10 @@ select {
   flex: 1 1 auto;
   min-height: 0;
   min-width: 0;
+  /* Positioned ancestor for the JS-masonry items: their absolute top/left
+     coordinates are computed relative to this grid's padding box. Without
+     this, items would anchor to the viewport and cover the toolbar above. */
+  position: relative;
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   grid-auto-rows: minmax(220px, 1fr);
@@ -788,6 +958,12 @@ select {
   padding: 14px 16px;
   overflow: auto;
 }
+/* Masonry is implemented in FolderView.tsx (JS waterfall using the image
+   dimensions stored in the DB) because CSS grid masonry (grid-template-rows:
+   masonry) is not available in Chromium/WebView2 — the CSSWG moved masonry
+   out of the grid spec. The CSS grid below stays as the pre-layout render;
+   once the JS layout is computed, items switch to absolute positioning with
+   their natural aspect ratio (no black bars, no cropping). */
 .folder-item {
   position: relative;
   min-width: 0;
@@ -912,6 +1088,45 @@ select {
   font-size: 11px;
   padding: 1px 8px;
   border-radius: 999px;
+}
+.move-target-card {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  width: 100%;
+  margin: 8px 0;
+  padding: 8px;
+  text-align: left;
+}
+.move-target-thumbs {
+  display: grid;
+  grid-template-columns: repeat(2, 42px);
+  grid-template-rows: repeat(2, 42px);
+  flex: 0 0 84px;
+  gap: 2px;
+  background: #000;
+}
+.move-target-thumbs img {
+  width: 42px;
+  height: 42px;
+  object-fit: cover;
+}
+.move-target-info {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow: hidden;
+}
+.move-target-info strong,
+.move-target-info span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.move-target-info span {
+  color: var(--muted);
+  font-size: 11px;
 }
 .gesture-extra-row {
   display: flex;

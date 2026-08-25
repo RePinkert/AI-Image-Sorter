@@ -6,7 +6,11 @@ export interface SourceRow {
   scanned_at: string | null
   /** Persisted L2 Jaccard threshold this source was last re-clustered at. */
   l2_threshold?: number
+  /** Dimensions currently included in the L1 Model偏差 key. */
+  model_deviation_dimensions?: ModelDeviationDimension[]
 }
+
+export type ModelDeviationDimension = 'base_model' | 'checkpoint' | 'lora' | 'workflow'
 
 export interface LabelRow {
   id: number
@@ -18,6 +22,7 @@ export interface LabelRow {
 export interface ImageRow {
   id: number
   source_id: number
+  group_key_l1: string
   abs_path: string
   filename: string
   width: number
@@ -37,6 +42,8 @@ export interface ImageRow {
   hidden: boolean
   /** File size in bytes (folder-view sorting). */
   size: number
+  /** File modification time as Unix seconds (folder-view sorting). */
+  modified_at: number
   /** Primary diffusion model (v8+). Empty for legacy rows until reparse. */
   diffusion_model?: string
   /** Saved-template name this image's workflow matched (if any). */
@@ -168,4 +175,15 @@ export interface UndoActionResult {
 export interface ManualGroupResult {
   group_key: string
   moved: number
+}
+
+/** Result of an arena hide: victim hidden with score 0, survivor credited
+ *  like an arena winner (its score moves through the same Bradley-Terry
+ *  update as a normal vote). */
+export interface ArenaHideResult {
+  action_id: string
+  survivor_id: number
+  survivor_score: number
+  victim_id: number
+  victim_score: number
 }

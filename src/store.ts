@@ -33,6 +33,9 @@ export interface ReviewSession {
   arenaPair: [number, number] | null
   arenaLastHideActionId: string | null
   arenaLastHiddenImageId: number | null
+  /** The pair that was on screen when the last arena hide happened — undo
+   *  restores exactly this pair so the user lands back where they were. */
+  arenaLastHidePair: [number, number] | null
 }
 
 const EMPTY_REVIEW_SESSION: ReviewSession = {
@@ -45,6 +48,7 @@ const EMPTY_REVIEW_SESSION: ReviewSession = {
   arenaPair: null,
   arenaLastHideActionId: null,
   arenaLastHiddenImageId: null,
+  arenaLastHidePair: null,
 }
 
 export const IDLE_SYNC_PROGRESS: SyncProgressState = {

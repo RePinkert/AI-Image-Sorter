@@ -1,10 +1,10 @@
 [package]
-name = "app"
+name = "AI-Image-Sorter"
 version = "0.1.0"
-description = "AI Image Sorter"
-authors = ["you"]
-license = ""
-repository = ""
+description = "Local-first desktop application for organizing and reviewing AI-generated images"
+authors = ["RePinkert"]
+license = "MIT"
+repository = "https://github.com/RePinkert/AI-Image-Sorter"
 edition = "2021"
 rust-version = "1.77.2"
 

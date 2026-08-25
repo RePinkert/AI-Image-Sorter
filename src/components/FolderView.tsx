@@ -4,9 +4,14 @@ import {
   confirmAction,
   errorMessage,
   listGroupImagesAll,
+  listMoveTargets,
+  moveImagesToGroup,
+  undoSplit,
+  getGroupThumbnails,
   splitImages,
   toggleHiddenAction,
   trashImage as trashImageApi,
+  unmergeGroup,
 } from '../api'
 import type { ImageRow } from '../types'
 import { useStore } from '../store'
@@ -14,15 +19,25 @@ import { Lightbox } from './Lightbox'
 import { PromptRecommendPanel } from './PromptRecommendPanel'
 import { getTelemetrySessionId, trackAction } from '../telemetry'
 
-type SortKey = 'score-desc' | 'score-asc' | 'filename' | 'seed' | 'size-desc' | 'size-asc'
+type SortKey =
+  | 'score-desc'
+  | 'score-asc'
+  | 'filename'
+  | 'seed'
+  | 'size-desc'
+  | 'size-asc'
+  | 'modified-desc'
+  | 'modified-asc'
 
 export function FolderView() {
   const setView = useStore((s) => s.setView)
   const currentGroupKey = useStore((s) => s.currentGroupKey)
+  const currentSourceId = useStore((s) => s.currentSourceId)
   const granularity = useStore((s) => s.granularity)
+  const bumpDataRevision = useStore((s) => s.bumpDataRevision)
   const [images, setImages] = useState<ImageRow[]>([])
   const [busy, setBusy] = useState<number | null>(null)
-  const [lightbox, setLightbox] = useState<string | null>(null)
+  const [lightbox, setLightbox] = useState<ImageRow | null>(null)
   const [confirm, setConfirm] = useState<number | null>(null)
   const [sortKey, setSortKey] = useState<SortKey>('score-desc')
   const [showHiddenOnly, setShowHiddenOnly] = useState(false)
@@ -32,6 +47,12 @@ export function FolderView() {
   const [loadError, setLoadError] = useState('')
   const [actionError, setActionError] = useState('')
   const loadRequestRef = useRef(0)
+  const gridRef = useRef<HTMLDivElement | null>(null)
+  const [masonry, setMasonry] = useState<{ items: { top: number; left: number; w: number; h: number }[]; totalH: number } | null>(null)
+  const [moveTargets, setMoveTargets] = useState<import('../types').GroupInfo[] | null>(null)
+  const [moveThumbs, setMoveThumbs] = useState<Record<string, string[]>>({})
+  const [moveBusy, setMoveBusy] = useState(false)
+
 
   const loadImages = useCallback(async () => {
     if (currentGroupKey == null) return
@@ -80,6 +101,12 @@ export function FolderView() {
       case 'size-asc':
         arr.sort((a, b) => (a.size ?? 0) - (b.size ?? 0))
         break
+      case 'modified-desc':
+        arr.sort((a, b) => (b.modified_at ?? 0) - (a.modified_at ?? 0))
+        break
+      case 'modified-asc':
+        arr.sort((a, b) => (a.modified_at ?? 0) - (b.modified_at ?? 0))
+        break
     }
     return arr
   }, [images, sortKey])
@@ -88,6 +115,44 @@ export function FolderView() {
     () => (showHiddenOnly ? sorted.filter((i) => i.hidden) : sorted),
     [sorted, showHiddenOnly],
   )
+
+  // Waterfall (masonry) layout: every card gets its image's natural aspect
+  // ratio (from the DB width/height, so no waiting for image load), and the
+  // next card lands in the currently shortest column. Sparse groups (e.g. an
+  // L2 group with 1–2 images) and mixed aspect ratios therefore never get
+  // letterboxed black bars or cropped thumbs. Pure-CSS grid remains as the
+  // pre-layout / fallback render.
+  useEffect(() => {
+    const el = gridRef.current
+    if (!el || visible.length === 0) {
+      setMasonry(null)
+      return
+    }
+    const compute = () => {
+      const gap = 10
+      const padX = 16
+      const padY = 14
+      const avail = el.clientWidth - padX * 2
+      if (avail <= 0) return
+      const min = 180
+      const cols = Math.max(1, Math.floor((avail + gap) / (min + gap)))
+      const colW = (avail - (cols - 1) * gap) / cols
+      const hs = new Array<number>(cols).fill(0)
+      const items = visible.map((img) => {
+        const ratio = img.width && img.height ? img.width / img.height : 1
+        const h = colW / ratio
+        const col = hs.indexOf(Math.min(...hs))
+        const pos = { top: hs[col] + padY, left: col * (colW + gap) + padX, w: colW, h }
+        hs[col] += h + gap
+        return pos
+      })
+      setMasonry({ items, totalH: Math.max(0, Math.max(...hs) - gap) + padY * 2 })
+    }
+    compute()
+    const ro = new ResizeObserver(compute)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [visible])
 
   async function toggleHidden(img: ImageRow) {
     if (busy !== null) return
@@ -228,6 +293,68 @@ export function FolderView() {
     }
   }
 
+  async function openMoveDialog() {
+    if (!currentGroupKey || currentSourceId == null || selected.size === 0) return
+    try {
+      const targets = await listMoveTargets(currentSourceId, currentGroupKey)
+      setMoveTargets(targets)
+      const thumbs = await getGroupThumbnails(targets.map((g) => g.group_key), 2)
+      setMoveThumbs(Object.fromEntries(thumbs.map((x) => [x.group_key, x.thumb_paths])))
+    } catch (e) { setActionError(`读取目标分组失败：${errorMessage(e)}`) }
+  }
+
+  async function undoSplitGroup() {
+    if (currentGroupKey == null || currentSourceId == null) return
+    setBusy(-1)
+    try {
+      await undoSplit(currentGroupKey, currentSourceId)
+      bumpDataRevision()
+      setView('groups')
+    } catch (e) { setActionError(`撤销拆组失败：${errorMessage(e)}`) }
+    finally { setBusy(null) }
+  }
+
+  async function moveSelected(target: string) {
+    setMoveBusy(true)
+    try {
+      await moveImagesToGroup(Array.from(selected), target)
+      setImages((arr) => arr.filter((img) => !selected.has(img.id)))
+      setSelected(new Set()); setMoveTargets(null); bumpDataRevision()
+    } catch (e) { setActionError(`移动失败：${errorMessage(e)}`) }
+    finally { setMoveBusy(false) }
+  }
+
+  // This folder view is the rollback point for a manual L2 merge: every
+  // member of a merged group carries a kind='merge' binding, so the group
+  // itself offers the undo. Restores each image to its pre-merge group.
+  async function undoMerge() {
+    if (currentGroupKey == null) return
+    const mergedCount = images.filter((i) => i.manually_grouped === 'merge').length
+    let ok = false
+    try {
+      ok = await confirmAction(
+        `撤销合并「${mergedCount} 张图片所在组」？`,
+        '这些图片将回到合并前的原分组，绑定关系将被移除（自动重聚类可重新分组）。'
+      )
+    } catch (error) {
+      setActionError(`无法打开确认窗口：${errorMessage(error)}`)
+      return
+    }
+    if (!ok) return
+    setBusy(-1)
+    setActionError('')
+    try {
+      const restored = await unmergeGroup(currentGroupKey, currentSourceId)
+      alert(`已撤销合并：${restored} 张图片回到原分组`)
+      bumpDataRevision()
+      setView('groups')
+    } catch (e) {
+      setActionError(`撤销合并失败：${errorMessage(e)}`)
+    } finally {
+      setBusy(null)
+    }
+  }
+
   if (currentGroupKey == null) {
     return (
       <div className="panel">
@@ -249,6 +376,15 @@ export function FolderView() {
       </div>
     )
   }
+
+  // A manual L2 merge pins every member with kind='merge'; when this
+  // folder view sits on such a group it becomes the rollback point.
+  const mergedCount = granularity === 2
+    ? images.filter((i) => i.manually_grouped === 'merge').length
+    : 0
+  const splitCount = granularity === 2
+    ? images.filter((i) => i.manually_grouped === 'split').length
+    : 0
 
   const summary = images.reduce(
     (acc, i) => {
@@ -291,6 +427,8 @@ export function FolderView() {
               <option value="seed">Seed</option>
               <option value="size-desc">大小 ↓</option>
               <option value="size-asc">大小 ↑</option>
+              <option value="modified-desc">修改时间 ↓</option>
+              <option value="modified-asc">修改时间 ↑</option>
             </select>
           </>
         )}
@@ -308,6 +446,22 @@ export function FolderView() {
           />
           只看已屏蔽
         </label>
+        {granularity === 2 && mergedCount > 0 && (
+          <button
+            type="button"
+            className="unmerge-btn"
+            disabled={busy !== null}
+            onClick={() => void undoMerge()}
+            title="该组为手动合并结果：撤销合并，让图片回到合并前的原分组"
+          >
+            撤销合并（{mergedCount} 张）
+          </button>
+        )}
+        {granularity === 2 && splitCount > 0 && (
+          <button type="button" disabled={busy !== null} onClick={() => void undoSplitGroup()} title="撤销当前手动拆出的图片并恢复原 L2 分组">
+            撤销拆组（{splitCount} 张）
+          </button>
+        )}
         {batchMode && (
           <span className="batch-bar">
             已选 {selected.size} 张
@@ -323,6 +477,7 @@ export function FolderView() {
                 拆出为新分组
               </button>
             )}
+            {granularity === 2 && <button type="button" onClick={() => void openMoveDialog()} disabled={selected.size === 0 || busy !== null}>移动至其他组</button>}
             <button
               type="button"
               onClick={batchDelete}
@@ -341,14 +496,20 @@ export function FolderView() {
           <p className="muted">{showHiddenOnly ? '没有已屏蔽的图片。' : '该组无图片。'}</p>
         </div>
       ) : (
-        <div className="folder-grid">
-          {visible.map((img) => {
+        <div
+          className="folder-grid"
+          ref={gridRef}
+          style={masonry ? { height: masonry.totalH } : undefined}
+        >
+          {visible.map((img, index) => {
             const score = img.score ?? 50
             const isSelected = selected.has(img.id)
+            const pos = masonry?.items[index]
             return (
               <div
                 className={`folder-item ${img.hidden ? 'blocked' : ''} ${batchMode ? 'batch' : ''} ${isSelected ? 'selected' : ''}`}
                 key={img.id}
+                style={pos ? { position: 'absolute', top: pos.top, left: pos.left, width: pos.w, height: pos.h, minHeight: 0 } : undefined}
                 onClick={batchMode ? () => toggleSelect(img.id) : undefined}
                 role={batchMode ? 'button' : undefined}
                 tabIndex={batchMode ? 0 : undefined}
@@ -368,7 +529,7 @@ export function FolderView() {
                     onClick={(e) => e.stopPropagation()}
                   />
                 )}
-                <img src={assetUrl(img.abs_path)} alt={img.filename} onClick={batchMode ? undefined : () => setLightbox(img.abs_path)} draggable={false} />
+                <img src={assetUrl(img.abs_path)} alt={img.filename} onClick={batchMode ? undefined : () => setLightbox(img)} draggable={false} />
                 <div className="folder-score" style={img.hidden ? { color: 'var(--muted)' } : undefined}>
                   {score.toFixed(0)}
                 </div>
@@ -402,7 +563,23 @@ export function FolderView() {
       <p className="muted hint" style={{ padding: '8px 16px' }}>
         单击图片放大 · 屏蔽可随时取消 · 删除送入系统回收站可从桌面恢复 · 批量管理支持全选 / 批量删除 / 批量取消屏蔽
       </p>
-      {lightbox && <Lightbox src={assetUrl(lightbox)} onClose={() => setLightbox(null)} />}
+      {lightbox && (
+        <Lightbox src={assetUrl(lightbox.abs_path)} meta={lightbox} onClose={() => setLightbox(null)} />
+      )}
+      {moveTargets && (
+        <div className="merge-confirm-overlay" onClick={() => !moveBusy && setMoveTargets(null)}>
+          <div className="merge-confirm" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+            <h3>移动 {selected.size} 张图片至其他 Prompt偏差组</h3>
+            {moveTargets.length === 0 ? <p className="muted">当前来源目录下没有其他可用分组。</p> : moveTargets.map((g) => (
+              <button key={g.group_key} className="move-target-card" type="button" disabled={moveBusy} onClick={() => void moveSelected(g.group_key)}>
+                <span className="move-target-thumbs">{(moveThumbs[g.group_key] ?? []).slice(0, 4).map((path) => <img key={path} src={assetUrl(path)} alt="" />)}</span>
+                <span className="move-target-info"><strong>{g.prompt_pos.slice(0, 100) || '(无 prompt)'}</strong><span>{g.count} 张 · {g.checkpoint || '未知模型'} · {g.workflow_name || '未命名工作流'}</span></span>
+              </button>
+            ))}
+            <button type="button" onClick={() => setMoveTargets(null)} disabled={moveBusy}>取消</button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

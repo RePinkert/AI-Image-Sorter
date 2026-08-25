@@ -1,7 +1,9 @@
 {
   "name": "ai-image-sorter",
-  "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "Local-first desktop application for organizing and reviewing AI-generated images",
+  "license": "MIT",
+  "repository": "github:RePinkert/AI-Image-Sorter",
   "type": "module",
   "scripts": {
     "dev": "vite",

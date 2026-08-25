@@ -1,14 +1,71 @@
 import { useEffect, useRef, useState } from 'react'
+import { AnimatePresence, motion } from 'framer-motion'
 import { assetUrl, errorMessage, getGroupThumbnails, listGroups, mergeGroups } from '../api'
 import type { Granularity, GroupInfo, GroupThumbDto } from '../types'
 import { useStore } from '../store'
 
 const LEVELS: { value: Granularity; label: string }[] = [
   { value: 0, label: '文件夹' },
-  { value: 1, label: '工作流' },
+  { value: 1, label: 'Model偏差' },
   { value: 2, label: 'Prompt偏差' },
   { value: 3, label: '独立Prompt' },
 ]
+
+const groupThumbCache = new Map<string, string[]>()
+const groupThumbInflight = new Map<string, Promise<string[]>>()
+
+function LazyGroupThumb({ groupKey, level }: { groupKey: string; level: Granularity }) {
+  const hostRef = useRef<HTMLDivElement | null>(null)
+  const [paths, setPaths] = useState<string[]>(() => groupThumbCache.get(`${level}:${groupKey}`) ?? [])
+  const [visible, setVisible] = useState(false)
+
+  useEffect(() => {
+    const el = hostRef.current
+    if (!el) return
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) {
+          setVisible(true)
+          observer.disconnect()
+        }
+      },
+      { rootMargin: '600px 0px' },
+    )
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [])
+
+  useEffect(() => {
+    if (!visible || paths.length > 0) return
+    const cacheKey = `${level}:${groupKey}`
+    let request = groupThumbInflight.get(cacheKey)
+    if (!request) {
+      request = getGroupThumbnails([groupKey], level).then((rows: GroupThumbDto[]) => rows[0]?.thumb_paths ?? [])
+      groupThumbInflight.set(cacheKey, request)
+    }
+    let cancelled = false
+    void request.then((next) => {
+      groupThumbCache.set(cacheKey, next)
+      groupThumbInflight.delete(cacheKey)
+      if (!cancelled) setPaths(next)
+    }).catch(() => {
+      groupThumbInflight.delete(cacheKey)
+    })
+    return () => { cancelled = true }
+  }, [groupKey, level, paths.length, visible])
+
+  return (
+    <div className="group-thumb" ref={hostRef}>
+      {paths.length > 0 ? (
+        <div className={`group-thumb-grid count-${Math.min(paths.length, 4)}`}>
+          {paths.map((path, index) => (
+            <img key={`${path}-${index}`} src={assetUrl(path)} alt="" draggable={false} loading="lazy" decoding="async" />
+          ))}
+        </div>
+      ) : <div className="thumb-placeholder" />}
+    </div>
+  )
+}
 
 export function GroupList() {
   const setView = useStore((s) => s.setView)
@@ -22,17 +79,15 @@ export function GroupList() {
   const setGranularity = useStore((s) => s.setGranularity)
   const sources = useStore((s) => s.sources)
   const dataRevision = useStore((s) => s.dataRevision)
-  const [thumbs, setThumbs] = useState<Record<string, string[]>>({})
-  const [loadingThumbs, setLoadingThumbs] = useState(false)
   const [mergeMode, setMergeMode] = useState(false)
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set())
   const [mergeBusy, setMergeBusy] = useState(false)
   const [mergeMsg, setMergeMsg] = useState<string | null>(null)
+  /** Groups awaiting the confirm dialog before the merge actually runs. */
+  const [confirmGroups, setConfirmGroups] = useState<GroupInfo[] | null>(null)
   const [loadingGroups, setLoadingGroups] = useState(groups.length === 0)
   const [groupError, setGroupError] = useState('')
-  const [thumbError, setThumbError] = useState('')
   const groupRequestRef = useRef(0)
-  const thumbRequestRef = useRef(0)
 
   async function loadGroups(sourceId: number | null, level: Granularity) {
     const request = ++groupRequestRef.current
@@ -50,7 +105,6 @@ export function GroupList() {
       const g = await listGroups(sourceId ?? undefined, level)
       if (request !== groupRequestRef.current) return
       setGroups(g)
-      setThumbs({})
     } catch (error) {
       if (request !== groupRequestRef.current) return
       setGroupError(errorMessage(error))
@@ -73,35 +127,8 @@ export function GroupList() {
 
   useEffect(() => () => {
     groupRequestRef.current += 1
-    thumbRequestRef.current += 1
   }, [])
 
-  useEffect(() => {
-    if (groups.length > 0) {
-      loadThumbs(groups)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [groups])
-
-  async function loadThumbs(gs: GroupInfo[]) {
-    if (gs.length === 0) return
-    const request = ++thumbRequestRef.current
-    setLoadingThumbs(true)
-    setThumbError('')
-    const keys = gs.map((g) => g.group_key)
-    try {
-      const dtos: GroupThumbDto[] = await getGroupThumbnails(keys, granularity)
-      const map: Record<string, string[]> = {}
-      dtos.forEach((d) => {
-        map[d.group_key] = d.thumb_paths
-      })
-      if (request === thumbRequestRef.current) setThumbs(map)
-    } catch (error) {
-      if (request === thumbRequestRef.current) setThumbError(errorMessage(error))
-    } finally {
-      if (request === thumbRequestRef.current) setLoadingThumbs(false)
-    }
-  }
 
   function onLevelChange(level: Granularity) {
     setGranularity(level)
@@ -113,6 +140,7 @@ export function GroupList() {
     setMergeMode(false)
     setSelectedKeys(new Set())
     setMergeMsg(null)
+    setConfirmGroups(null)
   }
 
   function toggleMergeSelect(key: string) {
@@ -132,11 +160,25 @@ export function GroupList() {
   async function doMerge() {
     const keys = Array.from(selectedKeys)
     if (keys.length < 2 || mergeBusy) return
+    // Never merge from the "所有源" view: group keys are shared across
+    // sources, so an unscoped merge would sweep in images the user never
+    // selected. Ask for confirmation with the selected groups' thumbnails.
+    if (currentSourceId == null) {
+      setMergeMsg('请先在顶部选择具体来源目录，再执行合并（避免误并其他来源的图片）')
+      return
+    }
+    setConfirmGroups(groups.filter((g) => selectedKeys.has(g.group_key)))
+  }
+
+  async function doMergeConfirmed() {
+    const keys = Array.from(selectedKeys)
+    if (keys.length < 2 || mergeBusy || currentSourceId == null) return
+    setConfirmGroups(null)
     setMergeBusy(true)
     setMergeMsg(null)
     try {
-      const r = await mergeGroups(2, keys)
-      setMergeMsg(`已合并 ${r.moved} 张到同一分组（自动重聚类不会再拆开）`)
+      const r = await mergeGroups(2, keys, currentSourceId)
+      setMergeMsg(`已合并 ${r.moved} 张到同一分组（自动重聚类不会再拆开，可在文件夹视角撤销合并）`)
       setSelectedKeys(new Set())
       await reloadGroupsAtLevel()
     } catch (e) {
@@ -161,7 +203,7 @@ export function GroupList() {
       return g.source_path || '(文件夹)'
     }
     if (granularity === 1) {
-      return g.workflow_name || '未命名工作流'
+      return g.workflow_name || '未命名 Model偏差'
     }
     return g.prompt_pos.slice(0, 120) || '(无 prompt)'
   }
@@ -195,9 +237,11 @@ export function GroupList() {
           <button
             type="button"
             className={mergeMode ? 'gran-active' : ''}
-            disabled={mergeBusy}
+            disabled={mergeBusy || currentSourceId == null}
             onClick={() => (mergeMode ? exitMergeMode() : setMergeMode(true))}
-            title="勾选两个及以上 Prompt偏差 组，合并为同一组（自动重聚类不会拆开）"
+            title={currentSourceId == null
+              ? '请先选择具体来源目录再合并（避免误并其他来源的图片）'
+              : '勾选两个及以上 Prompt偏差 组，合并为同一组（自动重聚类不会拆开，可在文件夹视角撤销）'}
           >
             {mergeMode ? '合并分组…' : '合并分组'}
           </button>
@@ -225,10 +269,6 @@ export function GroupList() {
         </div>
       )}
       {!loadingGroups && !groupError && groups.length === 0 && <p className="muted">暂无分组，请先导入。</p>}
-      {loadingThumbs && groups.length > 0 && (
-        <p className="muted hint">读取组预览中…</p>
-      )}
-      {thumbError && <p className="muted hint" role="alert">组预览加载失败：{thumbError}</p>}
       {syncing && (
         <p className="sync-warn">扫描进行中，分组数据可能不完整。</p>
       )}
@@ -272,18 +312,8 @@ export function GroupList() {
                 onClick={(e) => e.stopPropagation()}
               />
             )}
-            <div className="group-thumb">
-              {thumbs[g.group_key]?.length ? (
-                <div className={`group-thumb-grid count-${Math.min(thumbs[g.group_key].length, 4)}`}>
-                  {thumbs[g.group_key].map((path, index) => (
-                    <img key={`${path}-${index}`} src={assetUrl(path)} alt="" draggable={false} />
-                  ))}
-                </div>
-              ) : (
-                <div className="thumb-placeholder" />
-              )}
-              <span className="group-count-badge">{g.count}</span>
-            </div>
+            <LazyGroupThumb groupKey={g.group_key} level={granularity} />
+            <span className="group-count-badge">{g.count}</span>
             <div className="group-prompt">{displayLabel(g)}</div>
             {granularity === 2 && g.manually_merged && (
               <span className="merged-badge" title="该组为手动合并结果，自动重聚类不会拆开">
@@ -317,6 +347,51 @@ export function GroupList() {
           </div>
         ))}
       </div>
+      <AnimatePresence>
+        {confirmGroups && confirmGroups.length > 0 && (
+          <motion.div
+            className="merge-confirm-overlay"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setConfirmGroups(null)}
+          >
+            <motion.div
+              className="merge-confirm"
+              role="dialog"
+              aria-modal="true"
+              aria-label="确认合并分组"
+              initial={{ opacity: 0, scale: 0.92, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.94, y: 6 }}
+              transition={{ type: 'spring', stiffness: 320, damping: 28 }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h3>确认合并这 {confirmGroups.length} 个组？</h3>
+              <p className="muted">合并后 {confirmGroups.reduce((n, g) => n + g.count, 0)} 张图片进入同一分组，自动重聚类不会再拆开；合并后可在该组的文件夹视角撤销。</p>
+              <div className="merge-confirm-groups">
+                {confirmGroups.map((g, i) => (
+                  <motion.div
+                    key={g.group_key}
+                    className="merge-confirm-group"
+                    initial={{ opacity: 0, y: 14 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: 0.05 * i, duration: 0.18 }}
+                  >
+                    <LazyGroupThumb groupKey={g.group_key} level={granularity} />
+                    <span className="group-count-badge">{g.count}</span>
+                    <div className="group-prompt">{displayLabel(g)}</div>
+                  </motion.div>
+                ))}
+              </div>
+              <div className="row">
+                <button type="button" className="ghost" disabled={mergeBusy} onClick={() => setConfirmGroups(null)}>取消</button>
+                <button type="button" disabled={mergeBusy} onClick={() => void doMergeConfirmed()}>确认合并</button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   )
 }

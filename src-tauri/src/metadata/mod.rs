@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
 
-pub const PARSER_VERSION: &str = "generation-recipe-v1";
+pub const PARSER_VERSION: &str = "generation-recipe-v4-model-deviation";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ImageMeta {

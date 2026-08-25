@@ -181,7 +181,7 @@ pub fn parse_comfy_workflow(json_str: &str) -> ImageMeta {
         let class = nobj.get("class_type").and_then(|v| v.as_str()).unwrap_or("");
         let is_sampler = matches!(
             class,
-            "KSampler" | "KSamplerAdvanced" | "SamplerCustom"
+            "KSampler" | "KSamplerAdvanced" | "SamplerCustom" | "ClownsharKSampler_Beta"
         );
         if !is_sampler {
             continue;
@@ -319,7 +319,8 @@ pub fn parse_comfy_workflow(json_str: &str) -> ImageMeta {
                     });
                 }
             }
-            "KSampler" | "KSamplerAdvanced" | "SamplerCustom" | "KSamplerSelect" => {
+            "KSampler" | "KSamplerAdvanced" | "SamplerCustom" | "KSamplerSelect"
+            | "ClownsharKSampler_Beta" => {
                 let sampler = inputs
                     .get("sampler_name")
                     .and_then(|v| v.as_str())
@@ -416,10 +417,21 @@ fn resolve_text_value(val: &Value, nodes: &HashMap<String, &Value>, depth: u8) -
     let node_id = arr.first()?.as_str()?;
     let node = nodes.get(node_id)?;
     let nobj = node.as_object()?;
+    let class = nobj.get("class_type").and_then(|v| v.as_str()).unwrap_or("");
     let inputs = nobj.get("inputs").and_then(|v| v.as_object())?;
-    // Try common text field names in text-source nodes.
+
+    // Switch-style nodes (ComfySwitchNode on_false/on_true/switch,
+    // Any Switch (rgthree) inputN/select, ...): forward the selected branch.
+    if class.contains("Switch") {
+        if let Some(s) = resolve_switch_output(inputs, nodes, depth) {
+            return Some(s);
+        }
+    }
+
+    // Try common text field names in text-source nodes. Case-insensitive,
+    // because custom nodes (e.g. AdvPromptEnhancer) use "Prompt"/"Instruction".
     for key in ["text", "value", "string", "prompt", "content", "strings"] {
-        if let Some(v) = inputs.get(key) {
+        if let Some((_, v)) = inputs.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
             // Could be string or array of strings.
             if let Some(s) = v.as_str() {
                 if !s.is_empty() {
@@ -427,20 +439,128 @@ fn resolve_text_value(val: &Value, nodes: &HashMap<String, &Value>, depth: u8) -
                 }
             }
             if let Some(arr2) = v.as_array() {
-                let parts: Vec<String> = arr2
-                    .iter()
-                    .filter_map(|item| {
-                        item.as_str()
-                            .map(|s| s.to_string())
-                            .or_else(|| resolve_text_value(item, nodes, depth + 1))
-                    })
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if !parts.is_empty() {
-                    return Some(parts.join("\n"));
+                // A link reference ["node_id", out_idx] must be followed, not joined.
+                let is_link_ref = arr2
+                    .first()
+                    .and_then(Value::as_str)
+                    .map_or(false, |s| nodes.contains_key(s));
+                if !is_link_ref {
+                    let parts: Vec<String> = arr2
+                        .iter()
+                        .filter_map(|item| {
+                            item.as_str()
+                                .map(|s| s.to_string())
+                                .or_else(|| resolve_text_value(item, nodes, depth + 1))
+                        })
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if !parts.is_empty() {
+                        return Some(parts.join("\n"));
+                    }
                 }
             }
             // Nested link
+            if let Some(s) = resolve_text_value(v, nodes, depth + 1) {
+                return Some(s);
+            }
+        }
+    }
+    // Passthrough nodes with a single input (e.g. PreviewAny.source).
+    if inputs.len() == 1 {
+        if let Some(s) = resolve_text_value(inputs.values().next().unwrap(), nodes, depth + 1) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// The active branch of a switch node: a boolean choice (ComfySwitchNode) or
+/// an input index (rgthree-style `inputN` / `select`).
+enum SwitchChoice {
+    On(bool),
+    Index(usize),
+}
+
+/// Resolve the `switch`/`select` control of a switch node: a literal
+/// boolean/index, or a link to a primitive node holding one.
+fn resolve_switch_choice(
+    val: &Value,
+    nodes: &HashMap<String, &Value>,
+    depth: u8,
+) -> Option<SwitchChoice> {
+    if depth > 8 {
+        return None;
+    }
+    if let Some(b) = val.as_bool() {
+        return Some(SwitchChoice::On(b));
+    }
+    if let Some(n) = val.as_i64() {
+        return Some(SwitchChoice::Index(n.max(0) as usize));
+    }
+    // Link to a primitive (e.g. ["30:24", 0] -> PrimitiveBoolean "value").
+    let arr = val.as_array()?;
+    let node_id = arr.first()?.as_str()?;
+    let node = nodes.get(node_id)?;
+    let inputs = node.get("inputs").and_then(|v| v.as_object())?;
+    for key in ["value", "switch", "select"] {
+        if let Some((_, v)) = inputs.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
+            if let Some(b) = v.as_bool() {
+                return Some(SwitchChoice::On(b));
+            }
+            if let Some(n) = v.as_i64() {
+                return Some(SwitchChoice::Index(n.max(0) as usize));
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the text produced by a switch node's selected branch.
+fn resolve_switch_output(
+    inputs: &serde_json::Map<String, Value>,
+    nodes: &HashMap<String, &Value>,
+    depth: u8,
+) -> Option<String> {
+    let choice = ["switch", "select", "selector", "active"]
+        .iter()
+        .find_map(|k| {
+            inputs
+                .iter()
+                .find(|(k2, _)| k2.eq_ignore_ascii_case(k))
+                .and_then(|(_, v)| resolve_switch_choice(v, nodes, depth))
+        });
+    match choice {
+        Some(SwitchChoice::On(true)) => {
+            resolve_input_text(inputs, &["on_true", "on_false"], nodes, depth)
+        }
+        Some(SwitchChoice::On(false)) => {
+            resolve_input_text(inputs, &["on_false", "on_true"], nodes, depth)
+        }
+        Some(SwitchChoice::Index(n)) => {
+            let key = format!("input{n}");
+            resolve_input_text(inputs, &[key.as_str()], nodes, depth)
+        }
+        None => resolve_input_text(
+            inputs,
+            &[
+                "on_false", "on_true", "input0", "input1", "input2", "input3", "input4", "input5",
+                "input6", "input7", "input8", "input9",
+            ],
+            nodes,
+            depth,
+        ),
+    }
+}
+
+/// Resolve the first of the given input names that yields text.
+fn resolve_input_text(
+    inputs: &serde_json::Map<String, Value>,
+    keys: &[&str],
+    nodes: &HashMap<String, &Value>,
+    depth: u8,
+) -> Option<String> {
+    for key in keys {
+        if let Some((_, v)) = inputs.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
             if let Some(s) = resolve_text_value(v, nodes, depth + 1) {
                 return Some(s);
             }
@@ -530,5 +650,172 @@ mod tests {
         let swapped = API_GRAPH.replace("moodyCutieMixKrea2_v30.safetensors", "krea2_turbo_fp8.safetensors");
         let meta_b = parse_comfy_workflow(&swapped);
         assert_eq!(meta_a.workflow_key, meta_b.workflow_key, "switching models must keep workflow identity");
+    }
+
+    /// Mirror of a subgraph-based workflow flattened into an API prompt by the
+    /// ComfyUI frontend (node ids become "parent:inner", e.g. "30:6"). The
+    /// positive text runs through ComfySwitchNode selected by a PrimitiveBoolean.
+    const V10_FLATTENED_SWITCH: &str = r#"{
+        "30:10": {"class_type": "UNETLoader", "inputs": {"unet_name": "krea2_turbo_fp8_scaled.safetensors", "weight_dtype": "default"}},
+        "30:11": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_4b_fp8_scaled.safetensors", "type": "krea2"}},
+        "30:12": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
+        "30:15": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["30:10", 0], "lora_name": "Krea2/Krea2 NSFW+.safetensors", "strength_model": 0.85}},
+        "30:19": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "a Chinese schoolgirl jumping rope on the sports field"}},
+        "30:24": {"class_type": "PrimitiveBoolean", "inputs": {"value": false}},
+        "30:21": {"class_type": "ComfySwitchNode", "inputs": {"on_false": ["30:19", 0], "on_true": ["30:54", 0], "switch": ["30:24", 0]}},
+        "30:54": {"class_type": "PreviewAny", "inputs": {"source": ["30:55", 0]}},
+        "30:55": {"class_type": "AdvPromptEnhancer", "inputs": {"Instruction": "You are an expert NSFW prompt engineer", "Prompt": "a Chinese schoolgirl jumping rope"}},
+        "30:13": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["30:6", 0]}},
+        "30:6": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["30:11", 0], "text": ["30:21", 0]}},
+        "30:5": {"class_type": "EmptyLatentImage", "inputs": {"width": ["49", 0], "height": ["49", 1]}},
+        "30:23": {"class_type": "PrimitiveBoolean", "inputs": {"value": true}},
+        "30:22": {"class_type": "ComfySwitchNode", "inputs": {"on_false": ["30:10", 0], "on_true": ["30:15", 0], "switch": ["30:23", 0]}},
+        "30:3": {"class_type": "KSampler", "inputs": {"model": ["30:22", 0], "positive": ["30:6", 0], "negative": ["30:13", 0], "latent_image": ["30:5", 0], "seed": 1, "steps": 10, "cfg": 1.0, "sampler_name": "euler", "scheduler": "beta57"}},
+        "30:8": {"class_type": "VAEDecode", "inputs": {"samples": ["30:3", 0], "vae": ["30:12", 0]}},
+        "49": {"class_type": "ResolutionSelector", "inputs": {"resolution": "720x1280 (9:16)"}},
+        "29": {"class_type": "SaveImage", "inputs": {"images": ["30:8", 0]}}
+    }"#;
+
+    fn node_map_from_root(root: &Value) -> HashMap<String, &Value> {
+        root.as_object()
+            .unwrap()
+            .iter()
+            .map(|(id, node)| (id.clone(), node))
+            .collect()
+    }
+
+    #[test]
+    fn flattened_subgraph_switch_false_resolves_user_prompt() {
+        let meta = parse_comfy_workflow(V10_FLATTENED_SWITCH);
+        assert!(meta.raw_ok, "flattened subgraph prompt must parse");
+        assert!(meta.prompt_pos.contains("schoolgirl jumping rope on the sports field"));
+        assert!(meta.prompt_pos.contains("schoolgirl"), "prompt: {}", meta.prompt_pos);
+        assert_eq!(meta.prompt_neg, "", "negative is zeroed via ConditioningZeroOut");
+        assert_eq!(meta.checkpoint, "krea2_turbo_fp8_scaled.safetensors");
+        assert_eq!(meta.diffusion_model, "krea2_turbo_fp8_scaled.safetensors");
+        assert_eq!(meta.loras.len(), 1);
+        assert_eq!(meta.loras[0].name, "Krea2/Krea2 NSFW+.safetensors");
+        assert_eq!(meta.vae, "qwen_image_vae.safetensors");
+        assert_eq!(meta.samplers.len(), 1);
+        assert_eq!(meta.samplers[0].sampler, "euler");
+        assert!(!meta.workflow_key.is_empty());
+    }
+
+    #[test]
+    fn flattened_subgraph_switch_true_uses_on_true_branch() {
+        // Inline literal `true` (frontend inlines primitives) -> must pick on_true.
+        let inline = V10_FLATTENED_SWITCH.replace(r#""switch": ["30:24", 0]"#, r#""switch": true"#);
+        let meta = parse_comfy_workflow(&inline);
+        assert!(meta.prompt_pos.contains("schoolgirl"), "on_true path via PreviewAny -> AdvPromptEnhancer.Prompt");
+        assert!(!meta.prompt_pos.contains("expert NSFW prompt engineer"), "must not pick the system Instruction");
+    }
+
+    #[test]
+    fn model_switch_does_not_produce_text() {
+        let root: Value = serde_json::from_str(V10_FLATTENED_SWITCH).unwrap();
+        let nodes = node_map_from_root(&root);
+        let model_out = serde_json::json!(["30:22", 0]);
+        assert!(
+            resolve_text_value(&model_out, &nodes, 0).is_none(),
+            "MODEL-typed switch must not resolve to text"
+        );
+    }
+
+    #[test]
+    fn rgthree_switch_selects_input_by_index() {
+        let graph = r#"{
+            "1": {"class_type": "Any Switch (rgthree)", "inputs": {"input0": "first option", "input1": "second option", "select": 1}},
+            "2": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["5", 0], "text": ["1", 0]}},
+            "3": {"class_type": "KSampler", "inputs": {"positive": ["2", 0], "model": ["5", 0], "seed": 0}}
+        }"#;
+        let meta = parse_comfy_workflow(graph);
+        assert_eq!(meta.prompt_pos, "second option");
+    }
+
+    #[test]
+    fn case_insensitive_known_keys_pick_prompt_over_instruction() {
+        let root: Value = serde_json::from_str(V10_FLATTENED_SWITCH).unwrap();
+        let nodes = node_map_from_root(&root);
+        let enhancer_out = serde_json::json!(["30:55", 0]);
+        let text = resolve_text_value(&enhancer_out, &nodes, 0).expect("must resolve");
+        assert_eq!(text, "a Chinese schoolgirl jumping rope");
+    }
+
+    #[test]
+    fn single_input_passthrough_node_resolves() {
+        let graph = r#"{
+            "1": {"class_type": "PreviewAny", "inputs": {"source": ["2", 0]}},
+            "2": {"class_type": "CR Text", "inputs": {"text": "hello from cr text"}}
+        }"#;
+        let root: Value = serde_json::from_str(graph).unwrap();
+        let nodes = node_map_from_root(&root);
+        let out = serde_json::json!(["1", 0]);
+        assert_eq!(resolve_text_value(&out, &nodes, 0).as_deref(), Some("hello from cr text"));
+    }
+
+    #[test]
+    fn clownshark_sampler_beta_extracts_sampler_info() {
+        let graph = r#"{
+            "127:116": {"class_type": "ClownsharKSampler_Beta", "inputs": {
+                "sampler_name": "linear/euler", "scheduler": "simple", "steps": 8, "cfg": 1.0,
+                "seed": 1003949590422403, "model": ["21", 0], "positive": ["127:115", 0]
+            }}
+        }"#;
+        let meta = parse_comfy_workflow(graph);
+        assert!(meta.raw_ok);
+        assert_eq!(meta.samplers.len(), 1, "ClownsharKSampler_Beta must be recognized");
+        let s = &meta.samplers[0];
+        assert_eq!(s.sampler, "linear/euler");
+        assert_eq!(s.scheduler, "simple");
+        assert_eq!(s.steps, 8);
+        assert!((s.cfg - 1.0).abs() < 1e-9);
+        assert_eq!(s.seed, 1003949590422403);
+    }
+
+    #[test]
+    fn unresolvable_switch_control_falls_back_to_on_false() {
+        // Mirrors the CivitAI workflow: switch driven by a ComfyOrNode whose
+        // value cannot be determined from the saved prompt -> must resolve
+        // on_false (the user prompt) instead of returning nothing.
+        let graph = r#"{
+            "46": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "a girl by a dark gray Audi at golden hour"}},
+            "56:49": {"class_type": "ImpactIfNone", "inputs": {}},
+            "56:48": {"class_type": "ImpactIfNone", "inputs": {}},
+            "56:50": {"class_type": "ComfyOrNode", "inputs": {"values.value0": ["56:49", 1], "values.value1": ["56:48", 1]}},
+            "56:54": {"class_type": "ComfySwitchNode", "inputs": {"switch": ["56:50", 0], "on_false": ["46", 0], "on_true": ["56:55", 0]}},
+            "56:55": {"class_type": "TextGenerate", "inputs": {"prompt": ["56:52", 0]}},
+            "56:52": {"class_type": "JoinStrings", "inputs": {"string1": ["56:51", 0], "string2": ["46", 0]}},
+            "56:51": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "You are an image prompt engineer"}},
+            "127:115": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["6", 0], "text": ["56:54", 0]}}
+        }"#;
+        let meta = parse_comfy_workflow(graph);
+        assert!(meta.prompt_pos.contains("Audi"), "prompt: {}", meta.prompt_pos);
+        assert!(!meta.prompt_pos.contains("prompt engineer"), "must not pick the system prompt");
+    }
+
+    /// Mirrors the real Krea2 workflow: the positive text runs through a
+    /// RegexExtract whose `string` input is a link reference to a
+    /// ComfySwitchNode driven by an unresolvable ComfyOrNode. The link
+    /// reference must be followed (falling back to on_false), not joined
+    /// element-wise (which would leak the node id "56:54" as text).
+    const KREA2_ENHANCED_CHAIN: &str = r#"{
+        "46": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "ToonDaal, a young girl with icy white hair"}},
+        "56:48": {"class_type": "ImpactIfNone", "inputs": {}},
+        "56:49": {"class_type": "ImpactIfNone", "inputs": {}},
+        "56:50": {"class_type": "ComfyOrNode", "inputs": {"values.value0": ["56:49", 1], "values.value1": ["56:48", 1]}},
+        "56:54": {"class_type": "ComfySwitchNode", "inputs": {"switch": ["56:50", 0], "on_false": ["46", 0], "on_true": ["56:55", 0]}},
+        "56:55": {"class_type": "TextGenerate", "inputs": {"prompt": ["56:52", 0]}},
+        "187": {"class_type": "RegexExtract", "inputs": {"string": ["56:54", 0], "regex_pattern": "(?s)(?:\\*\\*Final Prompt:\\*\\*\\s*)?(.*)", "mode": "First Group", "case_insensitive": true, "multiline": false, "dotall": true, "group_index": 1}},
+        "127:114": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["127:115", 0]}},
+        "127:115": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["6", 0], "text": ["187", 0]}},
+        "127:116": {"class_type": "ClownsharKSampler_Beta", "inputs": {"model": ["21", 0], "positive": ["127:115", 0], "negative": ["127:114", 0], "latent_image": ["11", 0], "seed": 1, "steps": 8, "cfg": 1.0, "sampler_name": "linear/euler", "scheduler": "beta"}}
+    }"#;
+
+    #[test]
+    fn link_reference_input_is_followed_not_joined() {
+        let meta = parse_comfy_workflow(KREA2_ENHANCED_CHAIN);
+        assert!(meta.raw_ok);
+        assert!(meta.prompt_pos.contains("ToonDaal"), "prompt: {}", meta.prompt_pos);
+        assert!(!meta.prompt_pos.contains("56:54"), "must not leak node id: {}", meta.prompt_pos);
     }
 }

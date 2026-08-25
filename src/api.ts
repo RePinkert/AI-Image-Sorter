@@ -3,6 +3,7 @@ import { confirm, open, save } from '@tauri-apps/plugin-dialog'
 import { trackError } from './telemetry'
 import type {
   ActionResult,
+  ArenaHideResult,
   FoundSourceDto,
   Granularity,
   GroupInfo,
@@ -310,9 +311,55 @@ export async function reclusterSource(sourceId: number, threshold: number): Prom
   return apiInvoke('recluster_source', { sourceId, threshold })
 }
 
-export async function mergeGroups(level: number, fromKeys: string[]): Promise<ManualGroupResult> {
+export async function mergeGroups(
+  level: number,
+  fromKeys: string[],
+  sourceId: number | null,
+): Promise<ManualGroupResult> {
   if (isWebDev()) return unavailable('浏览器模式暂不支持手动合并分组，请使用桌面版')
-  return apiInvoke('merge_groups', { args: { level, from_keys: fromKeys } })
+  return apiInvoke('merge_groups', { args: { level, from_keys: fromKeys, source_id: sourceId } })
+}
+
+export async function listMoveTargets(sourceId: number, currentL2: string): Promise<GroupInfo[]> {
+  if (isWebDev()) return unavailable('浏览器模式暂不支持移动分组')
+  return apiInvoke('list_move_targets', { sourceId, currentL2 })
+}
+
+export async function moveImagesToGroup(imageIds: number[], targetGroupKey: string): Promise<ManualGroupResult> {
+  if (isWebDev()) return unavailable('浏览器模式暂不支持移动分组')
+  return apiInvoke('move_images_to_group', { args: { image_ids: imageIds, target_group_key: targetGroupKey } })
+}
+
+export async function undoSplit(groupKey: string, sourceId: number): Promise<number> {
+  if (isWebDev()) return unavailable('浏览器模式暂不支持撤销拆组')
+  return apiInvoke('undo_split', { groupKey, sourceId })
+}
+
+export async function unmergeGroup(
+  groupKey: string,
+  sourceId: number | null,
+): Promise<number> {
+  if (isWebDev()) return unavailable('浏览器模式暂不支持撤销合并，请使用桌面版')
+  return apiInvoke('unmerge_group', { args: { group_key: groupKey, source_id: sourceId } })
+}
+
+export async function arenaHide(
+  groupKey: string,
+  survivorId: number,
+  victimId: number,
+  context: ActionContext = {},
+): Promise<ArenaHideResult> {
+  if (isWebDev()) return unavailable('浏览器模式暂不支持评分写入，请使用桌面版')
+  return apiInvoke('arena_hide', {
+    args: {
+      group_key: groupKey,
+      survivor_id: survivorId,
+      victim_id: victimId,
+      session_id: context.sessionId ?? null,
+      started_at: context.startedAt ?? null,
+      context_signature: context.contextSignature ?? null,
+    },
+  })
 }
 
 export async function splitImages(level: number, imageIds: number[]): Promise<ManualGroupResult> {
