@@ -66,6 +66,16 @@ pub fn parse_a1111_parameters(p: &str) -> ImageMeta {
                 }
             }
         }
+        // Textual inversions ("TI hashes"). Names participate in the
+        // embedding dimension of the Model偏差 fingerprint.
+        if let Some(ti_str) = kv.get("TI hashes") {
+            for part in ti_str.split(',') {
+                let name = part.split(':').next().unwrap_or("").trim().to_string();
+                if !name.is_empty() && !meta.embeddings.contains(&name) {
+                    meta.embeddings.push(name);
+                }
+            }
+        }
         if let Some(size) = kv.get("Size") {
             if let Some((width, height)) = size.split_once('x') {
                 meta.width = width.trim().parse().unwrap_or(0);

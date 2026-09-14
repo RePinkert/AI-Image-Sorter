@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   assetUrl,
   confirmAction,
@@ -17,6 +17,7 @@ import type { ImageRow } from '../types'
 import { useStore } from '../store'
 import { Lightbox } from './Lightbox'
 import { PromptRecommendPanel } from './PromptRecommendPanel'
+import { useViewportWindow } from '../hooks/useViewportWindow'
 import { getTelemetrySessionId, trackAction } from '../telemetry'
 
 type SortKey =
@@ -28,6 +29,10 @@ type SortKey =
   | 'size-asc'
   | 'modified-desc'
   | 'modified-asc'
+
+// Pre-built comparator: Intl.Collator re-resolves ICU collation on every
+// .localeCompare call, which is expensive for thousands of filenames.
+const filenameCollator = new Intl.Collator('zh-Hans', { numeric: true })
 
 export function FolderView() {
   const setView = useStore((s) => s.setView)
@@ -41,6 +46,7 @@ export function FolderView() {
   const [confirm, setConfirm] = useState<number | null>(null)
   const [sortKey, setSortKey] = useState<SortKey>('score-desc')
   const [showHiddenOnly, setShowHiddenOnly] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
   const [batchMode, setBatchMode] = useState(false)
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [loading, setLoading] = useState(true)
@@ -75,6 +81,7 @@ export function FolderView() {
     void loadImages()
     setSelected(new Set())
     setBatchMode(false)
+    setSearchQuery('')
     return () => {
       loadRequestRef.current += 1
     }
@@ -90,7 +97,7 @@ export function FolderView() {
         arr.sort((a, b) => (a.score ?? 50) - (b.score ?? 50))
         break
       case 'filename':
-        arr.sort((a, b) => a.filename.localeCompare(b.filename))
+        arr.sort((a, b) => filenameCollator.compare(a.filename, b.filename))
         break
       case 'seed':
         arr.sort((a, b) => a.seed - b.seed)
@@ -111,10 +118,26 @@ export function FolderView() {
     return arr
   }, [images, sortKey])
 
-  const visible = useMemo(
-    () => (showHiddenOnly ? sorted.filter((i) => i.hidden) : sorted),
-    [sorted, showHiddenOnly],
+  const visible = useMemo(() => {
+    const query = searchQuery.trim().toLocaleLowerCase()
+    return sorted.filter((image) => (!showHiddenOnly || image.hidden)
+      && (!query || image.filename.toLocaleLowerCase().includes(query)))
+  }, [sorted, showHiddenOnly, searchQuery])
+
+  // Viewport windowing: the DB-driven masonry layout above always spans the
+  // whole list (pure arithmetic), but only the items inside the scroll
+  // viewport (+ overscan) get DOM nodes. Cards scrolled out of the window are
+  // fully removed, which keeps re-render cost proportional to the visible
+  // window instead of the whole (L1-sized) group.
+  const masonryPositions = useMemo(
+    () => masonry?.items ?? null,
+    [masonry],
   )
+  const windowed = useViewportWindow(gridRef, masonryPositions)
+  const hasWindow = masonry !== null && masonry.items.length === visible.length
+  const rendered = useMemo(() => (
+    hasWindow ? visible.slice(windowed.start, windowed.end + 1) : visible
+  ), [visible, hasWindow, windowed])
 
   // Waterfall (masonry) layout: every card gets its image's natural aspect
   // ratio (from the DB width/height, so no waiting for image load), and the
@@ -154,7 +177,7 @@ export function FolderView() {
     return () => ro.disconnect()
   }, [visible])
 
-  async function toggleHidden(img: ImageRow) {
+  const toggleHidden = useCallback(async (img: ImageRow) => {
     if (busy !== null) return
     setBusy(img.id)
     setActionError('')
@@ -179,9 +202,9 @@ export function FolderView() {
     } finally {
       setBusy(null)
     }
-  }
+  }, [busy, currentGroupKey])
 
-  async function trash(img: ImageRow) {
+  const trash = useCallback(async (img: ImageRow) => {
     if (busy !== null) return
     setBusy(img.id)
     setActionError('')
@@ -194,16 +217,16 @@ export function FolderView() {
     } finally {
       setBusy(null)
     }
-  }
+  }, [busy])
 
-  function toggleSelect(id: number) {
+  const toggleSelect = useCallback((id: number) => {
     setSelected((prev) => {
       const next = new Set(prev)
       if (next.has(id)) next.delete(id)
       else next.add(id)
       return next
     })
-  }
+  }, [])
 
   function selectAll() {
     setSelected(new Set(visible.map((i) => i.id)))
@@ -438,6 +461,10 @@ export function FolderView() {
       <div className="folder-toolbar">
         共 {images.length} 张 · 可评分 {summary.visible} 张 · 已屏蔽 {summary.hidden} 张 ·
         平均 {avg.toFixed(1)} · 区间 {summary.visible > 0 ? `${summary.min.toFixed(0)}–${summary.max.toFixed(0)}` : '—'}
+        <label className="filename-search">
+          <input type="search" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="搜索当前分组的图片名称" aria-label="搜索当前分组的图片名称" />
+          {searchQuery && <button type="button" onClick={() => setSearchQuery('')} aria-label="清空搜索">清空</button>}
+        </label>
         <label className="hidden-filter" title="只看已屏蔽的图片">
           <input
             type="checkbox"
@@ -493,7 +520,7 @@ export function FolderView() {
       {actionError && <div className="action-error" role="alert"><span>{actionError}</span></div>}
       {visible.length === 0 ? (
         <div className="panel">
-          <p className="muted">{showHiddenOnly ? '没有已屏蔽的图片。' : '该组无图片。'}</p>
+          <p className="muted">{searchQuery.trim() ? `当前分组中没有名称匹配“${searchQuery.trim()}”的图片。` : showHiddenOnly ? '没有已屏蔽的图片。' : '该组无图片。'}</p>
         </div>
       ) : (
         <div
@@ -501,61 +528,24 @@ export function FolderView() {
           ref={gridRef}
           style={masonry ? { height: masonry.totalH } : undefined}
         >
-          {visible.map((img, index) => {
-            const score = img.score ?? 50
-            const isSelected = selected.has(img.id)
+          {rendered.map((img, sliceIndex) => {
+            const index = hasWindow ? windowed.start + sliceIndex : sliceIndex
             const pos = masonry?.items[index]
             return (
-              <div
-                className={`folder-item ${img.hidden ? 'blocked' : ''} ${batchMode ? 'batch' : ''} ${isSelected ? 'selected' : ''}`}
+              <FolderItemCard
                 key={img.id}
-                style={pos ? { position: 'absolute', top: pos.top, left: pos.left, width: pos.w, height: pos.h, minHeight: 0 } : undefined}
-                onClick={batchMode ? () => toggleSelect(img.id) : undefined}
-                role={batchMode ? 'button' : undefined}
-                tabIndex={batchMode ? 0 : undefined}
-                onKeyDown={batchMode ? (event) => {
-                  if (event.key === 'Enter' || event.key === ' ') {
-                    event.preventDefault()
-                    toggleSelect(img.id)
-                  }
-                } : undefined}
-              >
-                {batchMode && (
-                  <input
-                    type="checkbox"
-                    className="batch-check"
-                    checked={isSelected}
-                    onChange={(e) => { e.stopPropagation(); toggleSelect(img.id) }}
-                    onClick={(e) => e.stopPropagation()}
-                  />
-                )}
-                <img src={assetUrl(img.abs_path)} alt={img.filename} onClick={batchMode ? undefined : () => setLightbox(img)} draggable={false} />
-                <div className="folder-score" style={img.hidden ? { color: 'var(--muted)' } : undefined}>
-                  {score.toFixed(0)}
-                </div>
-                {!batchMode && (
-                  <div className="folder-actions">
-                    <button
-                      type="button"
-                      onClick={(e) => { e.stopPropagation(); toggleHidden(img) }}
-                      disabled={busy !== null}
-                      title={img.hidden ? '取消屏蔽（重新参与评分）' : '屏蔽（赋 0 分，可恢复）'}
-                    >
-                      {img.hidden ? '取消屏蔽' : '屏蔽'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={(e) => { e.stopPropagation(); confirm === img.id ? trash(img) : setConfirm(img.id) }}
-                      disabled={busy !== null}
-                      title="送入系统回收站"
-                      style={{ borderColor: 'var(--bad)' }}
-                    >
-                      {confirm === img.id ? '确认删除' : '删除'}
-                    </button>
-                  </div>
-                )}
-                {img.hidden && <div className="folder-blocked-tag">已屏蔽</div>}
-              </div>
+                img={img}
+                pos={pos}
+                batchMode={batchMode}
+                selected={selected.has(img.id)}
+                busy={busy}
+                confirm={confirm}
+                onToggleHidden={toggleHidden}
+                onTrash={trash}
+                onOpen={setLightbox}
+                onToggleSelect={toggleSelect}
+                onConfirmDelete={setConfirm}
+              />
             )
           })}
         </div>
@@ -564,7 +554,11 @@ export function FolderView() {
         单击图片放大 · 屏蔽可随时取消 · 删除送入系统回收站可从桌面恢复 · 批量管理支持全选 / 批量删除 / 批量取消屏蔽
       </p>
       {lightbox && (
-        <Lightbox src={assetUrl(lightbox.abs_path)} meta={lightbox} onClose={() => setLightbox(null)} />
+        <Lightbox src={assetUrl(lightbox.abs_path)} meta={lightbox} onClose={() => setLightbox(null)} onMetaUpdated={(updated) => {
+          setLightbox(updated)
+          setImages((rows) => rows.map((row) => row.id === updated.id ? updated : row))
+          bumpDataRevision()
+        }} />
       )}
       {moveTargets && (
         <div className="merge-confirm-overlay" onClick={() => !moveBusy && setMoveTargets(null)}>
@@ -583,3 +577,97 @@ export function FolderView() {
     </div>
   )
 }
+
+interface FolderItemCardProps {
+  img: ImageRow
+  pos: { top: number; left: number; w: number; h: number } | undefined
+  batchMode: boolean
+  selected: boolean
+  busy: number | null
+  confirm: number | null
+  onToggleHidden: (img: ImageRow) => void
+  onTrash: (img: ImageRow) => void
+  onOpen: (img: ImageRow) => void
+  onToggleSelect: (id: number) => void
+  onConfirmDelete: (id: number | null) => void
+}
+
+// Memoized per card so sorting / filtering / window scrolling only re-render
+// the cards whose position or flags actually changed. All callback props are
+// stable (useCallback / useState setters) and `img` keeps its object identity
+// unless this specific row is updated, so the shallow compare is effective.
+const FolderItemCard = memo(function FolderItemCard({
+  img,
+  pos,
+  batchMode,
+  selected,
+  busy,
+  confirm,
+  onToggleHidden,
+  onTrash,
+  onOpen,
+  onToggleSelect,
+  onConfirmDelete,
+}: FolderItemCardProps) {
+  const score = img.score ?? 50
+  const isConfirmPending = confirm === img.id
+  const hidden = img.hidden
+  return (
+    <div
+      className={`folder-item ${hidden ? 'blocked' : ''} ${batchMode ? 'batch' : ''} ${selected ? 'selected' : ''}`}
+      style={pos ? { position: 'absolute', top: pos.top, left: pos.left, width: pos.w, height: pos.h, minHeight: 0 } : undefined}
+      onClick={batchMode ? () => onToggleSelect(img.id) : undefined}
+      role={batchMode ? 'button' : undefined}
+      tabIndex={batchMode ? 0 : undefined}
+      onKeyDown={batchMode ? (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          onToggleSelect(img.id)
+        }
+      } : undefined}
+    >
+      {batchMode && (
+        <input
+          type="checkbox"
+          className="batch-check"
+          checked={selected}
+          onChange={(e) => { e.stopPropagation(); onToggleSelect(img.id) }}
+          onClick={(e) => e.stopPropagation()}
+        />
+      )}
+      <img
+        src={assetUrl(img.abs_path)}
+        alt={img.filename}
+        loading="lazy"
+        decoding="async"
+        onClick={batchMode ? undefined : () => onOpen(img)}
+        draggable={false}
+      />
+      <div className="folder-score" style={hidden ? { color: 'var(--muted)' } : undefined}>
+        {(Number.isFinite(score) ? score : 50).toFixed(0)}
+      </div>
+      {!batchMode && (
+        <div className="folder-actions">
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); onToggleHidden(img) }}
+            disabled={busy !== null}
+            title={hidden ? '取消屏蔽（重新参与评分）' : '屏蔽（赋 0 分，可恢复）'}
+          >
+            {hidden ? '取消屏蔽' : '屏蔽'}
+          </button>
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); isConfirmPending ? onTrash(img) : onConfirmDelete(img.id) }}
+            disabled={busy !== null}
+            title="送入系统回收站"
+            style={{ borderColor: 'var(--bad)' }}
+          >
+            {isConfirmPending ? '确认删除' : '删除'}
+          </button>
+        </div>
+      )}
+      {hidden && <div className="folder-blocked-tag">已屏蔽</div>}
+    </div>
+  )
+})

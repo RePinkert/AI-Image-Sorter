@@ -1,7 +1,16 @@
 import { useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { assetUrl, errorMessage, getGroupThumbnails, listGroups, mergeGroups } from '../api'
-import type { Granularity, GroupInfo, GroupThumbDto } from '../types'
+import { assetUrl, errorMessage, getGroupThumbnails, listGroups, mergeGroups, reclusterL1 } from '../api'
+import type {
+  Granularity,
+  GroupInfo,
+  GroupThumbDto,
+  ModelDeviationDimension,
+} from '../types'
+import {
+  MODEL_DEVIATION_DIMENSIONS,
+  MODEL_DEVIATION_DIMENSION_LABELS,
+} from '../types'
 import { useStore } from '../store'
 
 const LEVELS: { value: Granularity; label: string }[] = [
@@ -13,6 +22,7 @@ const LEVELS: { value: Granularity; label: string }[] = [
 
 const groupThumbCache = new Map<string, string[]>()
 const groupThumbInflight = new Map<string, Promise<string[]>>()
+
 
 function LazyGroupThumb({ groupKey, level }: { groupKey: string; level: Granularity }) {
   const hostRef = useRef<HTMLDivElement | null>(null)
@@ -88,6 +98,76 @@ export function GroupList() {
   const [loadingGroups, setLoadingGroups] = useState(groups.length === 0)
   const [groupError, setGroupError] = useState('')
   const groupRequestRef = useRef(0)
+  /** The single wheel-selected Model偏差 dimension (defaults to base_model). */
+  const [l1Dimension, setL1Dimension] = useState<ModelDeviationDimension>('base_model')
+  /** Hoists the last computed dimension one rotation past the source's own so
+   *  the badge always shows what the CURRENT groups represent. */
+  const source = currentSourceId == null ? null : sources.find((s) => s.id === currentSourceId)
+  const storedDim = source?.model_deviation_dimensions?.find(
+    (d): d is ModelDeviationDimension =>
+      (MODEL_DEVIATION_DIMENSIONS as string[]).includes(d),
+  )
+  useEffect(() => {
+    if (source) setL1Dimension(storedDim ?? 'base_model')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentSourceId, storedDim])
+  const [reclusterBusy, setReclusterBusy] = useState(false)
+  const reclusterTargetRef = useRef<ModelDeviationDimension | null>(null)
+  // Native non-passive wheel listener: React's synthetic onWheel is passive,
+  // so preventDefault could not stop the page from scrolling alongside. The
+  // ref mirrors the live dimension (handlers below never go stale).
+  const l1WheelWrapRef = useRef<HTMLDivElement | null>(null)
+  const l1DimensionRef = useRef<ModelDeviationDimension>('base_model')
+  const currentSourceIdRef = useRef<number | null>(currentSourceId)
+  const reclusterBusyRef = useRef(false)
+  useEffect(() => {
+    currentSourceIdRef.current = currentSourceId
+  }, [currentSourceId])
+  useEffect(() => {
+    l1DimensionRef.current = l1Dimension
+  }, [l1Dimension])
+  async function runRecluster() {
+    if (currentSourceIdRef.current == null) return
+    const busyTarget = reclusterTargetRef.current
+    reclusterTargetRef.current = null
+    if (busyTarget == null) return
+    reclusterBusyRef.current = true
+    setReclusterBusy(true)
+    try {
+      await reclusterL1(currentSourceIdRef.current, busyTarget)
+      await loadGroups(currentSourceIdRef.current, useStore.getState().granularity)
+    } catch (error) {
+      setGroupError(errorMessage(error))
+    } finally {
+      reclusterBusyRef.current = false
+      setReclusterBusy(false)
+      if (reclusterTargetRef.current != null) void runRecluster()
+    }
+  }
+  useEffect(() => {
+    const el = l1WheelWrapRef.current
+    if (!el) return
+    const handler = (event: WheelEvent) => {
+      event.preventDefault()
+      event.stopPropagation()
+      if (currentSourceIdRef.current == null) return
+      const idx = MODEL_DEVIATION_DIMENSIONS.indexOf(l1DimensionRef.current)
+      const step = event.deltaY > 0 ? 1 : -1
+      const next =
+        MODEL_DEVIATION_DIMENSIONS[
+          (idx + step + MODEL_DEVIATION_DIMENSIONS.length) % MODEL_DEVIATION_DIMENSIONS.length
+        ]
+      if (next === l1DimensionRef.current) return
+      l1DimensionRef.current = next
+      setL1Dimension(next)
+      reclusterTargetRef.current = next
+      if (reclusterBusyRef.current) return
+      void runRecluster()
+    }
+    el.addEventListener('wheel', handler, { passive: false })
+    return () => el.removeEventListener('wheel', handler)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   async function loadGroups(sourceId: number | null, level: Granularity) {
     const request = ++groupRequestRef.current
@@ -203,7 +283,7 @@ export function GroupList() {
       return g.source_path || '(文件夹)'
     }
     if (granularity === 1) {
-      return g.workflow_name || '未命名 Model偏差'
+      return g.model_param || g.workflow_name || '未命名 Model偏差'
     }
     return g.prompt_pos.slice(0, 120) || '(无 prompt)'
   }
@@ -249,16 +329,36 @@ export function GroupList() {
       </div>
 
       <div className="granularity-bar">
-        {LEVELS.map((l) => (
-          <button
-            type="button"
-            key={l.value}
-            className={granularity === l.value ? 'gran-active' : ''}
-            onClick={() => onLevelChange(l.value)}
-          >
-            {l.label}
-          </button>
-        ))}
+        {LEVELS.map((l) =>
+          l.value !== 1 ? (
+            <button
+              type="button"
+              key={l.value}
+              className={granularity === l.value ? 'gran-active' : ''}
+              onClick={() => onLevelChange(l.value)}
+            >
+              {l.label}
+            </button>
+          ) : (
+            <div
+              key={l.value}
+              ref={l1WheelWrapRef}
+              className="l1-wheel-wrap"
+              title={`滚轮切换模型参数维度：当前 ${MODEL_DEVIATION_DIMENSION_LABELS[l1Dimension]}（base_model → Text Encoder → VAE → LoRA → Embedding → ControlNet 循环）`}
+            >
+              <button
+                type="button"
+                className={granularity === 1 ? 'gran-active' : ''}
+                onClick={() => onLevelChange(1)}
+              >
+                {l.label}
+                <span className={`l1-dim-badge ${reclusterBusy ? 'busy' : ''}`}>
+                  {reclusterBusy ? '聚类中…' : MODEL_DEVIATION_DIMENSION_LABELS[l1Dimension]}
+                </span>
+              </button>
+            </div>
+          ),
+        )}
       </div>
 
       {loadingGroups && <p className="muted" role="status">正在加载分组…</p>}
@@ -321,7 +421,9 @@ export function GroupList() {
               </span>
             )}
             <div className="group-meta">
-              {g.checkpoint || '—'} · {g.source_kind}
+              {granularity === 1 && currentSourceId != null
+                ? `${MODEL_DEVIATION_DIMENSION_LABELS[l1Dimension]} · ${g.checkpoint || '—'} · ${g.source_kind}`
+                : `${g.checkpoint || '—'} · ${g.source_kind}`}
               <button
                 type="button"
                 className="folder-link"

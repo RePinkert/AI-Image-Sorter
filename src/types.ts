@@ -10,7 +10,33 @@ export interface SourceRow {
   model_deviation_dimensions?: ModelDeviationDimension[]
 }
 
-export type ModelDeviationDimension = 'base_model' | 'checkpoint' | 'lora' | 'workflow'
+export type ModelDeviationDimension =
+  | 'base_model'
+  | 'text_encoder'
+  | 'vae'
+  | 'lora'
+  | 'embedding'
+  | 'controlnet'
+
+/** Wheel-order for the Model偏差 level: scroll cycles the source's SINGLE
+ *  selected dimension in this exact sequence. */
+export const MODEL_DEVIATION_DIMENSIONS: ModelDeviationDimension[] = [
+  'base_model',
+  'text_encoder',
+  'vae',
+  'lora',
+  'embedding',
+  'controlnet',
+]
+
+export const MODEL_DEVIATION_DIMENSION_LABELS: Record<ModelDeviationDimension, string> = {
+  base_model: 'Base Model',
+  text_encoder: 'Text Encoder',
+  vae: 'VAE',
+  lora: 'LoRA',
+  embedding: 'Embedding',
+  controlnet: 'ControlNet',
+}
 
 export interface LabelRow {
   id: number
@@ -53,6 +79,15 @@ export interface ImageRow {
   manually_grouped?: string | null
 }
 
+export interface UpdateImagePromptsResult {
+  prompt_pos: string
+  prompt_neg: string
+  group_key_l2: string
+  group_key_l3: string
+  modified_at: number
+  size: number
+}
+
 export type Granularity = 0 | 1 | 2 | 3
 
 export interface ModelFacet {
@@ -71,6 +106,10 @@ export interface GroupInfo {
   workflow_name?: string | null
   /** Distinct diffusion models + image counts for the workflow level. */
   model_facets?: ModelFacet[]
+  /** Model-parameter label for the L1 (Model偏差) level under the source's
+   *  selected dimension (e.g. the exact base model file name). Empty at
+   *  other levels / cross-source view. */
+  model_param?: string
   /** True when the group's members are pinned by a manual L2 override. */
   manually_merged?: boolean
 }

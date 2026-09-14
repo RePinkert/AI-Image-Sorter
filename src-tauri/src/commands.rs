@@ -13,6 +13,25 @@ pub struct AppState {
     pub db: Arc<crate::db::Db>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateImagePromptsArgs {
+    pub image_id: i64,
+    pub prompt_pos: String,
+    pub prompt_neg: String,
+    pub expected_size: i64,
+    pub expected_modified_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateImagePromptsResult {
+    pub prompt_pos: String,
+    pub prompt_neg: String,
+    pub group_key_l2: String,
+    pub group_key_l3: String,
+    pub modified_at: i64,
+    pub size: i64,
+}
+
 /// Files modified within this window are assumed to be mid-write and are
 /// deferred to the next sync cycle instead of being parsed into broken rows.
 const STABILITY_WINDOW_SECS: i64 = 10;
@@ -214,7 +233,7 @@ struct ScanStats {
 /// score/label). Files modified in the last `STABILITY_WINDOW_SECS` seconds
 /// are deferred so partially-written files never become permanently broken
 /// rows. Match on NORMALIZED paths so trailing slashes / case / separator
-/// differences can never cause a file to be mis-detected as "new" → which
+/// differences can never cause a file to be mis-detected as "new" — which
 /// would re-allocate image_id and CASCADE-delete its scores.
 ///
 /// `files` is the caller's one-pass walk result (paths already sorted), so
@@ -289,7 +308,8 @@ fn scan_source(
                 ImageMeta::default()
             }
         };
-        let keys = compute_group_keys(&meta, norm_source);
+        let dimension = db.get_source_dimension(source_id).unwrap_or_else(|_| crate::grouper::DEFAULT_DIMENSION.into());
+        let keys = compute_group_keys(&meta, norm_source, &dimension);
         stats.affected.insert(keys.l1.clone());
         let size = std::fs::metadata(f).map(|m| m.len() as i64).unwrap_or(0);
         if let Some(m) = file_mtime {
@@ -323,6 +343,8 @@ fn scan_source(
             checkpoint: meta.checkpoint.clone(),
             loras: serde_json::to_string(&meta.loras).unwrap_or_default(),
             vae: meta.vae.clone(),
+            text_encoder: meta.text_encoder.clone(),
+            controlnet: meta.controlnet.clone(),
             samplers: serde_json::to_string(&meta.samplers).unwrap_or_default(),
             seed,
             steps,
@@ -393,7 +415,8 @@ fn backfill_source(
         if !meta.raw_ok && meta.workflow_key.is_empty() && meta.prompt_pos.is_empty() {
             continue;
         }
-        let keys = compute_group_keys(&meta, norm_source);
+        let dimension = db.get_source_dimension(source_id).unwrap_or_else(|_| crate::grouper::DEFAULT_DIMENSION.into());
+        let keys = compute_group_keys(&meta, norm_source, &dimension);
         let size = std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
         let seed = meta.samplers.first().map(|s| s.seed).unwrap_or(0);
         let steps = meta.samplers.first().map(|s| s.steps).unwrap_or(0);
@@ -421,6 +444,8 @@ fn backfill_source(
             checkpoint: meta.checkpoint.clone(),
             loras: serde_json::to_string(&meta.loras).unwrap_or_default(),
             vae: meta.vae.clone(),
+            text_encoder: meta.text_encoder.clone(),
+            controlnet: meta.controlnet.clone(),
             samplers: serde_json::to_string(&meta.samplers).unwrap_or_default(),
             seed,
             steps,
@@ -692,7 +717,7 @@ pub fn set_model_deviation_config(
     config: ModelDeviationConfig,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let allowed = ["base_model", "checkpoint", "lora", "workflow"];
+    let allowed = crate::grouper::DIMENSIONS;
     if config.dimensions.iter().any(|d| !allowed.contains(&d.as_str())) {
         return Err("包含不支持的 Model偏差维度".into());
     }
@@ -700,7 +725,32 @@ pub fn set_model_deviation_config(
         .map_err(|e| e.to_string())
 }
 
+/// Wheel-driven alias: persist the SINGLE selected dimension, re-derive the
+/// source's L1/L3 fingerprints from stored raw columns (exact-match, no
+/// reparse), and re-cluster L2 on top of the new L1. Returns the resulting
+/// group count at level 1.
 #[tauri::command]
+pub fn recluster_l1(
+    source_id: i64,
+    dimension: String,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    if !crate::grouper::DIMENSIONS.contains(&dimension.as_str()) {
+        return Err(format!("未知的 Model偏差维度：{dimension}"));
+    }
+    state.db.rehash_l1_for_source(source_id, &dimension)
+        .map_err(|e| e.to_string())?;
+    state.db
+        .set_model_deviation_dimensions(source_id, std::slice::from_ref(&dimension))
+        .map_err(|e| e.to_string())?;
+    let threshold = state.db.get_source_threshold(source_id).unwrap_or(crate::clustering::DEFAULT_L2_THRESHOLD);
+    crate::clustering::recluster_l2(&state.db, source_id, threshold)
+        .map_err(|e| e.to_string())?;
+    let groups = state.db.list_groups(Some(source_id), 1).map_err(|e| e.to_string())?;
+    Ok(groups.len())
+}
+
+#[tauri::command(async)]
 pub fn list_groups(
     source_id: Option<i64>,
     level: u8,
@@ -709,7 +759,7 @@ pub fn list_groups(
     state.db.list_groups(source_id, level).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_group_images(
     group_key: String,
     level: u8,
@@ -850,7 +900,7 @@ pub fn arena_suggested(left: i64, right: i64, state: State<'_, AppState>) -> Res
     Ok(scoring::arena_suggested(l, r))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_group_images_all(
     group_key: String,
     level: u8,
@@ -860,6 +910,88 @@ pub fn list_group_images_all(
         .db
         .list_group_images_all(&group_key, level)
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn update_image_prompts(
+    args: UpdateImagePromptsArgs,
+    state: State<'_, AppState>,
+) -> Result<UpdateImagePromptsResult, String> {
+    let (abs, source_id, source_path, old_l1, threshold) = state
+        .db
+        .image_edit_target(args.image_id)
+        .map_err(|e| e.to_string())?;
+    let path = PathBuf::from(&abs);
+    if path.extension().and_then(|e| e.to_str()).map(|e| !e.eq_ignore_ascii_case("png")).unwrap_or(true) {
+        return Err("暂不支持：首版仅支持 PNG 图片".into());
+    }
+    let stat = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    let current_size = stat.len() as i64;
+    let current_mtime = stat.modified().ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64).unwrap_or(0);
+    if current_size != args.expected_size || current_mtime != args.expected_modified_at {
+        return Err("图片已被其他程序修改，请刷新后重试".into());
+    }
+
+    let temp = crate::metadata::png_edit::write_prompts(&path, &args.prompt_pos, &args.prompt_neg)
+        .map_err(|e| e.to_string())?;
+    let parsed = parse_file(&temp).map_err(|e| { let _ = std::fs::remove_file(&temp); e.to_string() })?;
+    if parsed.prompt_pos != args.prompt_pos.trim() || parsed.prompt_neg != args.prompt_neg.trim() {
+        let _ = std::fs::remove_file(&temp);
+        return Err("写回验证失败：图片中的 Prompt 与输入不一致".into());
+    }
+
+    let backup = path.with_extension("png.ai-image-sorter-backup");
+    let _ = std::fs::remove_file(&backup);
+    std::fs::rename(&path, &backup).map_err(|e| { let _ = std::fs::remove_file(&temp); e.to_string() })?;
+    if let Err(error) = std::fs::rename(&temp, &path) {
+        let _ = std::fs::rename(&backup, &path);
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.to_string());
+    }
+
+    let update_result = (|| -> Result<(), String> {
+        let meta = parse_file(&path).map_err(|e| e.to_string())?;
+        if meta.prompt_pos != args.prompt_pos.trim() || meta.prompt_neg != args.prompt_neg.trim() {
+            return Err("最终文件 Prompt 验证失败".into());
+        }
+        let norm_source = normalize_path(&PathBuf::from(&source_path));
+        let dimension = state.db.get_source_dimension(source_id).unwrap_or_else(|_| crate::grouper::DEFAULT_DIMENSION.into());
+        let keys = compute_group_keys(&meta, &norm_source, &dimension);
+        let stat = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        let modified_at = stat.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64).unwrap_or(0);
+        let sampler = meta.samplers.first().cloned().unwrap_or_default();
+        let row = ImageInsert {
+            source_id, rel_path: abs.clone(), abs_path: abs.clone(),
+            filename: path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string(),
+            size: stat.len() as i64, modified_at, width: meta.width as i64, height: meta.height as i64,
+            prompt_pos: meta.prompt_pos.clone(), prompt_neg: meta.prompt_neg.clone(), checkpoint: meta.checkpoint.clone(),
+            loras: serde_json::to_string(&meta.loras).unwrap_or_default(), vae: meta.vae.clone(),
+            text_encoder: meta.text_encoder.clone(), controlnet: meta.controlnet.clone(),
+            samplers: serde_json::to_string(&meta.samplers).unwrap_or_default(), seed: sampler.seed, steps: sampler.steps, cfg: sampler.cfg,
+            group_key_l0: keys.l0, group_key_l1: keys.l1.clone(), group_key_l2: keys.l2, group_key_l3: keys.l3,
+            sha256: String::new(), meta_ok: meta.raw_ok, source_kind: format!("{:?}", meta.source_kind).to_lowercase(),
+            diffusion_model: meta.diffusion_model.clone(), model_chain_json: serde_json::to_string(&meta.model_chain).unwrap_or_else(|_| "[]".into()),
+            workflow_key: meta.workflow_key.clone(), workflow_graph_json: meta.workflow_graph_json.clone(),
+            workflow_template_id: None, workflow_match_confidence: None,
+            generation_recipe_json: meta.generation_recipe_json(), recipe_signature: meta.recipe_signature(),
+            parser_version: crate::metadata::PARSER_VERSION.to_string(),
+        };
+        state.db.update_reparsed_image(args.image_id, &row, source_id).map_err(|e| e.to_string())?;
+        let affected = HashSet::from([old_l1.clone(), keys.l1]);
+        crate::clustering::recluster_l2_keys(&state.db, source_id, &affected, threshold).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if let Err(error) = update_result {
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::rename(&backup, &path);
+        return Err(error);
+    }
+    let _ = std::fs::remove_file(&backup);
+    let (prompt_pos, prompt_neg, group_key_l2, group_key_l3, modified_at, size) = state.db.image_prompt_groups(args.image_id).map_err(|e| e.to_string())?;
+    Ok(UpdateImagePromptsResult { prompt_pos, prompt_neg, group_key_l2, group_key_l3, modified_at, size })
 }
 
 /// Toggle an image's hidden flag. Hidden images are excluded from swipe /
@@ -884,7 +1016,7 @@ pub fn toggle_hidden(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn toggle_hidden_action(
     image_id: i64,
     hidden: bool,
@@ -905,7 +1037,7 @@ pub fn toggle_hidden_action(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn undo_review_action(
     action_id: String,
     session_id: Option<String>,
@@ -992,7 +1124,7 @@ pub struct SplitImagesArgs {
     pub image_ids: Vec<i64>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_move_targets(
     source_id: i64,
     current_l2: String,
@@ -1459,7 +1591,7 @@ pub struct GroupThumbDto {
     pub thumb_paths: Vec<String>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_group_thumbnails(
     group_keys: Vec<String>,
     level: u8,

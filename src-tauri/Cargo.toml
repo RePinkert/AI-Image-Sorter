@@ -25,6 +25,7 @@ tauri-plugin-dialog = "2"
 
 # Metadata / image
 png = "0.17"
+crc32fast = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 kamadak-exif = "0.5"
 walkdir = "2"

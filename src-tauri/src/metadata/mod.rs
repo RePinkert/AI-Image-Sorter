@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
 
-pub const PARSER_VERSION: &str = "generation-recipe-v4-model-deviation";
+pub const PARSER_VERSION: &str = "model-params-v6-single-dimension";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ImageMeta {
@@ -15,6 +15,17 @@ pub struct ImageMeta {
     pub model_chain: Vec<ModelChainItem>,
     pub loras: Vec<LoraInfo>,
     pub vae: String,
+    /// Text encoder / CLIP file name(s) from CLIPLoader-family nodes
+    /// (exact on-disk string, comma-joined when several are stacked).
+    #[serde(default)]
+    pub text_encoder: String,
+    /// ControlNet model file name(s) from ControlNetLoader-family nodes.
+    #[serde(default)]
+    pub controlnet: String,
+    /// Embedding / textual-inversion names referenced by the prompt
+    /// (`embedding:name` tokens; A1111 `TI hashes`).
+    #[serde(default)]
+    pub embeddings: Vec<String>,
     pub samplers: Vec<SamplerInfo>,
     pub raw_ok: bool,
     pub source_kind: SourceKind,
@@ -197,6 +208,7 @@ pub mod a1111_parse;
 pub mod comfy_parse;
 pub mod jpeg;
 pub mod png;
+pub mod png_edit;
 
 use anyhow::Result;
 use std::path::Path;
@@ -233,6 +245,15 @@ pub fn parse_file(path: &Path) -> Result<ImageMeta> {
                 }
                 if meta.vae.is_empty() {
                     meta.vae = txt_meta.vae.clone();
+                }
+                if meta.text_encoder.is_empty() {
+                    meta.text_encoder = txt_meta.text_encoder.clone();
+                }
+                if meta.controlnet.is_empty() {
+                    meta.controlnet = txt_meta.controlnet.clone();
+                }
+                if meta.embeddings.is_empty() {
+                    meta.embeddings = txt_meta.embeddings.clone();
                 }
                 if meta.samplers.is_empty() {
                     meta.samplers = txt_meta.samplers.clone();

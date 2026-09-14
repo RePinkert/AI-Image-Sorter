@@ -127,7 +127,7 @@ export function ImportPanel() {
         {templates.map((template) => (
           <li key={template.path}>
             <span className="path">{template.name}</span>
-            <span className="origin">{template.node_count} 节点 · {template.diffusion_models.join(', ') || '模型未识别'}</span>
+            <span className="origin">{template.node_count} 节点 · {(template.diffusion_models ?? []).join(', ') || '模型未识别'}</span>
             <span className="origin" title={template.path}>{template.topology_signature}</span>
           </li>
         ))}

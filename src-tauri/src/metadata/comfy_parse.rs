@@ -260,6 +260,10 @@ pub fn parse_comfy_workflow(json_str: &str) -> ImageMeta {
     meta.prompt_pos = positive_texts.join("\n");
     meta.prompt_neg = negative_texts.join("\n");
 
+    // Embedding / textual-inversion references appear verbatim inside the
+    // prompt text (`embedding:name`).
+    meta.embeddings = crate::grouper::extract_embedding_refs(&meta.prompt_pos);
+
     // Third pass: loaders.
     for (_, node) in &nodes {
         let Some(nobj) = node.as_object() else { continue };
@@ -267,7 +271,8 @@ pub fn parse_comfy_workflow(json_str: &str) -> ImageMeta {
         let inputs = nobj.get("inputs").and_then(|v| v.as_object());
         let Some(inputs) = inputs else { continue };
         match class {
-            "CheckpointLoaderSimple" | "UNETLoader" | "CheckpointLoader" | "UnetLoaderGGUF" => {
+            "CheckpointLoaderSimple" | "UNETLoader" | "CheckpointLoader" | "UnetLoaderGGUF"
+            | "CheckpointLoaderAdvanced" | "CheckpointLoaderNF4" | "UnetLoaderGGUFAdvanced" => {
                 if let Some(name) = inputs
                     .get("unet_name")
                     .and_then(|v| v.as_str())
@@ -297,6 +302,20 @@ pub fn parse_comfy_workflow(json_str: &str) -> ImageMeta {
                     });
                 }
             }
+            // Custom LoRA loaders: rgthree "Power Lora Loader" / "Lora Loader
+            // Stack", "Lora Loader (LoraManager)", Flux/easy-use packs, etc.
+            // Their input field names differ, so extract slots heuristically.
+            _ if class.to_lowercase().contains("lora") => {
+                for lora in extract_loras_from_inputs(inputs) {
+                    meta.model_chain.push(ModelChainItem {
+                        node_type: class.to_string(),
+                        model: lora.name.clone(),
+                        strength: Some(lora.strength),
+                        enabled: None,
+                    });
+                    meta.loras.push(lora);
+                }
+            }
             "VAELoader" | "SeedVR2LoadVAEModel" => {
                 if let Some(name) = inputs
                     .get("vae_name")
@@ -305,6 +324,58 @@ pub fn parse_comfy_workflow(json_str: &str) -> ImageMeta {
                 {
                     if meta.vae.is_empty() {
                         meta.vae = name.to_string();
+                    }
+                }
+            }
+            // Text encoder / CLIP loaders. Stacked loaders (Dual/Triple/…)
+            // contribute one file name per `clip_name*` slot; they are joined
+            // exactly (sorted) into a single string for fingerprinting.
+            "CLIPLoader" | "DualCLIPLoader" | "TripleCLIPLoader" | "QuadrupleCLIPLoader"
+            | "CLIPLoaderGGUF" | "DualCLIPLoaderGGUF" | "CLIPLoaderAdvanced" => {
+                let mut names: Vec<String> = Vec::new();
+                for (key, value) in inputs {
+                    if key.starts_with("clip_name") {
+                        if let Some(v) = value.as_str() {
+                            if !v.is_empty() {
+                                names.push(v.to_string());
+                            }
+                        }
+                    }
+                }
+                names.sort();
+                names.dedup();
+                if !names.is_empty() {
+                    let joined = names.join(",");
+                    if meta.text_encoder.is_empty() {
+                        meta.text_encoder = joined.clone();
+                    }
+                    meta.model_chain.push(ModelChainItem {
+                        node_type: class.to_string(),
+                        model: joined,
+                        strength: None,
+                        enabled: None,
+                    });
+                }
+            }
+            // ControlNet loaders.
+            "ControlNetLoader" | "ControlNetLoaderAdvanced" | "ControlNetLoaderDiffusers"
+            | "ControlNetLoaderAdvancedDiffusers" => {
+                if let Some(name) = inputs
+                    .get("control_net_name")
+                    .or_else(|| inputs.get("cn_name"))
+                    .or_else(|| inputs.get("name"))
+                    .and_then(|v| v.as_str())
+                {
+                    if !name.is_empty() {
+                        if meta.controlnet.is_empty() {
+                            meta.controlnet = name.to_string();
+                        }
+                        meta.model_chain.push(ModelChainItem {
+                            node_type: class.to_string(),
+                            model: name.to_string(),
+                            strength: None,
+                            enabled: None,
+                        });
                     }
                 }
             }
@@ -352,6 +423,148 @@ pub fn parse_comfy_workflow(json_str: &str) -> ImageMeta {
 
     meta.refresh_generation_recipe();
     meta
+}
+
+/// True for anything that looks like a model-file filename. Custom LoRA
+/// loader nodes (rgthree "Power Lora Loader", "Lora Loader (LoraManager)",
+/// Flux/easy-use packs, ...) use wildly different input field names, so the
+/// generic fallback keys off the value shape instead of the key.
+fn looks_like_model_file(v: &str) -> bool {
+    matches!(
+        v.rsplit('.').next(),
+        Some("safetensors") | Some("sft") | Some("safetensor")
+    )
+}
+
+/// Heuristic LoRA-slot extraction for one loader node's inputs. Covers:
+/// - native fields: `lora_name` + `strength_model` / `strength_clip`;
+/// - dict slots (rgthree Power Lora Loader): inputs named `lora_<N>` whose
+///   value is `{lora, on, strength, strengthTwo}`;
+/// - stacked string slots (rgthree "Lora Loader Stack"): `lora_01` +
+///   paired `strength_01`;
+/// - any other string input that points at a `.safetensors` file (custom
+///   packs rename the field, but practically never the widget value).
+fn extract_loras_from_inputs(
+    inputs: &serde_json::Map<String, Value>,
+) -> Vec<LoraInfo> {
+    use serde_json::Value as V;
+
+    let mut out: Vec<LoraInfo> = Vec::new();
+    let push = |out: &mut Vec<LoraInfo>, name: &str, strength: f64, clip: Option<f64>| {
+        if name.is_empty() { return; }
+        out.push(LoraInfo {
+            name: name.trim().to_string(),
+            strength: if strength.is_finite() { strength } else { 1.0 },
+            clip_strength: clip.filter(|c| c.is_finite()),
+        });
+    };
+
+    // Numeric slots store strengths as strings ("1.20") in some packs.
+    let as_f64 = |v: &Value| -> Option<f64> {
+        v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+    };
+
+    // Named-field lookup that tolerates slot suffixes: for `lora_03` prefer
+    // `strength_03` / `lora_03_strength`, then `strength`, `strength_model`.
+    let number_after = |key: &str| -> Option<String> {
+        let idx = key.find(|c: char| c.is_ascii_digit())?;
+        let n: String = key[idx..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        Some(n)
+    };
+    let strength_for = |key: &str| -> Option<f64> {
+        let mut candidates = Vec::new();
+        if let Some(n) = number_after(key) {
+            candidates.push(format!("lora_{n}_strength"));
+            candidates.push(format!("lora_{n}_model_strength"));
+            candidates.push(format!("strength_{n}"));
+            candidates.push(format!("strength_model_{n}"));
+        }
+        candidates.push("strength".to_string());
+        candidates.push("strength_model".to_string());
+        for cand in &candidates {
+            if let Some(v) = inputs.get(cand.as_str()) {
+                if let Some(n) = as_f64(v) { return Some(n); }
+            }
+        }
+        None
+    };
+    let clip_for = |key: &str| -> Option<f64> {
+        if let Some(n) = number_after(key) {
+            for cand in [format!("lora_{n}_clip_strength"), format!("strength_clip_{n}")] {
+                if let Some(v) = inputs.get(&cand) {
+                    if let Some(c) = as_f64(v) { return Some(c); }
+                }
+            }
+        }
+        for cand in ["strength_clip", "strengthTwo", "strength_two"] {
+            if let Some(v) = inputs.get(cand) {
+                if let Some(c) = as_f64(v) { return Some(c); }
+            }
+        }
+        None
+    };
+
+    for (key, value) in inputs {
+        match value {
+            // LoraManager style: `loras` holds a `__value__` array of slots
+            // ({name, strength, active, clipStrength}).
+            V::Object(wrapped) if key == "loras" || key == "lora_list" => {
+                let Some(entries) = wrapped.get("__value__").and_then(V::as_array) else {
+                    continue;
+                };
+                for entry in entries {
+                    let Some(slot) = entry.as_object() else { continue };
+                    let name = slot.get("name").and_then(V::as_str).unwrap_or("");
+                    if name.is_empty() || name == "None" { continue; }
+                    let active = slot.get("active").and_then(V::as_bool).unwrap_or(true);
+                    if !active { continue; }
+                    let strength = slot.get("strength").and_then(&as_f64).unwrap_or(1.0);
+                    let clip = slot.get("clipStrength").and_then(&as_f64);
+                    push(&mut out, name, strength, clip);
+                }
+            }
+            // Dict slot (rgthree Power Lora Loader style).
+            V::Object(slot) => {
+                let name = slot
+                    .get("lora")
+                    .or_else(|| slot.get("lora_name"))
+                    .or_else(|| slot.get("name"))
+                    .and_then(V::as_str)
+                    .unwrap_or("");
+                if name.is_empty() || name == "None" { continue; }
+                let enabled = slot
+                    .get("on")
+                    .and_then(V::as_bool)
+                    .or_else(|| slot.get("active").and_then(V::as_bool))
+                    .unwrap_or(true);
+                if !enabled { continue; }
+                let strength = slot
+                    .get("strength")
+                    .and_then(&as_f64)
+                    .or_else(|| slot.get("strength_model").and_then(&as_f64))
+                    .unwrap_or(1.0);
+                let clip = slot
+                    .get("strengthTwo")
+                    .and_then(&as_f64)
+                    .or_else(|| slot.get("strength_clip").and_then(&as_f64))
+                    .or_else(|| slot.get("clipStrength").and_then(&as_f64));
+                push(&mut out, name, strength, clip);
+            }
+            // Plain string slot: `lora_name`, `lora_01`, `lora_1_name`, ...
+            V::String(name) => {
+                if name == "None" || name == "NONE" || name.is_empty() { continue; }
+                let is_lora_key = key == "lora_name" || key.starts_with("lora_");
+                if !is_lora_key && !looks_like_model_file(name) {
+                    continue;
+                }
+                let strength = strength_for(key).unwrap_or(1.0);
+                let clip = clip_for(key);
+                push(&mut out, name, strength, clip);
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Parse only the topology of a UI-format workflow JSON. Used as a fallback
@@ -618,6 +831,83 @@ mod tests {
         assert_eq!(meta.prompt_pos, "a beautiful girl");
         assert!(!meta.workflow_key.is_empty());
         assert!(!meta.workflow_graph_json.is_empty());
+    }
+
+    const CUSTOM_LORA_GRAPH: &str = r#"{
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-dev.safetensors"}},
+        "2": {"class_type": "Power Lora Loader (rgthree)", "inputs": {
+            "model": ["1", 0],
+            "lora_1": {"lora": "a_detail.safetensors", "on": true, "strength": 0.7},
+            "lora_2": {"lora": "", "on": true, "strength": 1.0},
+            "lora_3": {"lora": "b_skip.safetensors", "on": false, "strength": 1.0}
+        }},
+        "3": {"class_type": "Lora Loader (LoraManager)", "inputs": {
+            "model": ["2", 0], "lora_name": "c_manager.safetensors", "strength_model": 0.9
+        }},
+        "4": {"class_type": "Lora Loader Stack (rgthree)", "inputs": {
+            "lora_01": "d_stack.safetensors", "strength_01": 0.8,
+            "lora_02": None, "strength_02": 1.0
+        }},
+        "5": {"class_type": "easy loraStack", "inputs": {
+            "toggle": false, "num_loras": 1,
+            "lora_1_name": "e_easy.safetensors", "lora_1_strength": 1.2,
+            "lora_1_model_strength": 1.2, "lora_1_clip_strength": 0.9,
+            "lora_2_name": "None", "lora_2_strength": 1
+        }},
+        "6": {"class_type": "Lora Loader (LoraManager)", "inputs": {
+            "model": ["3", 0], "loras": {"__value__": [
+                {"name": "f_manager", "strength": "1.20", "active": true, "clipStrength": "0.5"},
+                {"name": "g_inactive", "strength": "1.00", "active": false}
+            ]}
+        }},
+        "7": {"class_type": "KSampler", "inputs": {"model": ["3", 0], "seed": 1, "steps": 10, "cfg": 4.0, "sampler_name": "euler"}}
+    }"#;
+
+    #[test]
+    fn custom_lora_loader_nodes_are_recognized() {
+        let graph = CUSTOM_LORA_GRAPH.replace("None", "null");
+        let meta = parse_comfy_workflow(&graph);
+        assert!(meta.raw_ok);
+        let names: Vec<&str> = meta.loras.iter().map(|l| l.name.as_str()).collect();
+        assert!(names.contains(&"a_detail.safetensors"), "dict slot lora must be extracted: {names:?}");
+        assert!(names.contains(&"c_manager.safetensors"), "lora manager loader must be recognized");
+        assert!(names.contains(&"d_stack.safetensors"), "stack loader lora must be recognized");
+        assert!(!names.contains(&"") && !names.contains(&"b_skip.safetensors"), "empty/disabled slots must be skipped: {names:?}");
+        let detail = meta.loras.iter().find(|l| l.name == "a_detail.safetensors").unwrap();
+        assert!((detail.strength - 0.7).abs() < 1e-6);
+        let manager = meta.loras.iter().find(|l| l.name == "c_manager.safetensors").unwrap();
+        assert!((manager.strength - 0.9).abs() < 1e-6);
+        let stacked = meta.loras.iter().find(|l| l.name == "d_stack.safetensors").unwrap();
+        assert!((stacked.strength - 0.8).abs() < 1e-6, "stack slot must pair strength_01 with lora_01");
+        let easy = meta.loras.iter().find(|l| l.name == "e_easy.safetensors").unwrap();
+        assert!((easy.strength - 1.2).abs() < 1e-6, "easy loraStack numbered strength must pair");
+        assert!(!meta.loras.iter().any(|l| l.name == "g_inactive"), "inactive LoraManager slot must be skipped");
+        let f_manager = meta.loras.iter().find(|l| l.name == "f_manager").expect("LoraManager __value__ slot");
+        assert!((f_manager.strength - 1.2).abs() < 1e-6, "string strength must parse");
+        assert_eq!(f_manager.clip_strength, Some(0.5), "clipStrength string must parse");
+        // Group key must shift now that LoRAs are known (LoRAs feed the key).
+        assert!(!meta.workflow_key.is_empty());
+    }
+
+    /// Exactly the inputs a real "Power Lora Loader (rgthree)" node writes
+    /// into a PNG's prompt chunk (capture from the user's ComfyUI outputs).
+    #[test]
+    fn real_power_lora_loader_inputs_extract_all_slots() {
+        let inputs: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+            "PowerLoraLoaderHeaderWidget": {"type": "PowerLoraLoaderHeaderWidget"},
+            "lora_1": {"on": true, "lora": "2BoutOval_K2v3_400.safetensors", "strength": 1},
+            "lora_2": {"on": true, "lora": "PornMaster_Age_Slider_Krea2_V1.safetensors", "strength": -3},
+            "lora_3": {"on": true, "lora": "zoom_krea2_loraholic.safetensors", "strength": -8},
+            "\u{2795} Add Lora": "",
+            "model": ["4", 0],
+            "clip": ["6", 0]
+        })).unwrap();
+        let loras = extract_loras_from_inputs(&inputs);
+        let names: Vec<&str> = loras.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names.len(), 3, "all three enabled slots must be extracted: {names:?}");
+        assert!(names.contains(&"2BoutOval_K2v3_400.safetensors"));
+        assert_eq!(loras.iter().find(|l| l.name == "zoom_krea2_loraholic.safetensors").unwrap().strength, -8.0);
+        assert_eq!(loras.iter().find(|l| l.name == "2BoutOval_K2v3_400.safetensors").unwrap().strength, 1.0);
     }
 
     #[test]

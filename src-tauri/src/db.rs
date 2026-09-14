@@ -138,8 +138,20 @@ pub fn open(path: &std::path::Path) -> Result<Db> {
     conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
     conn.execute_batch("PRAGMA busy_timeout=5000;")?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    let schema_version: i32 =
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
     migrations::run(&conn)?;
-    Ok(Db(Mutex::new(conn)))
+    let db = Db(Mutex::new(conn));
+    // v16 migration leaves L2 as the L1 placeholder (clustering needs the
+    // finished Db handle); finish it here right after a fresh migration.
+    if schema_version < 16 {
+        for source in db.list_sources().unwrap_or_default() {
+            if let Err(e) = crate::clustering::recluster_l2(&db, source.id, source.l2_threshold) {
+                log::warn!("post-migration L2 recluster failed for source {}: {e}", source.id);
+            }
+        }
+    }
+    Ok(db)
 }
 
 impl Db {
@@ -219,7 +231,7 @@ impl Db {
 mod migrations {
     use super::*;
 
-    pub(crate) const CURRENT_VERSION: i32 = 15;
+    pub(crate) const CURRENT_VERSION: i32 = 16;
 
     pub fn run(conn: &Connection) -> Result<()> {
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -322,6 +334,55 @@ mod migrations {
         }
         if !src_cols.contains("model_deviation_dimensions") {
             conn.execute_batch("ALTER TABLE sources ADD COLUMN model_deviation_dimensions TEXT NOT NULL DEFAULT '[\"base_model\",\"checkpoint\",\"lora\",\"workflow\"]';")?;
+        } else if version < 16 {
+            // v16: L1 became a SINGLE wheel-selected dimension. Collapse any
+            // legacy multi-dimension list to its first valid entry.
+            let rows: Vec<(i64, serde_json::Value)> = {
+                let mut stmt =
+                    conn.prepare("SELECT id, model_deviation_dimensions FROM sources")?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            serde_json::from_str::<serde_json::Value>(
+                                &r.get::<_, String>(1)?,
+                            )
+                            .unwrap_or(serde_json::json!([])),
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            };
+            for (id, dims_value) in rows {
+                let single = dims_value
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .find(|d| crate::grouper::DIMENSIONS.contains(&d.as_str()))
+                    })
+                    .flatten()
+                    .unwrap_or_else(|| crate::grouper::DEFAULT_DIMENSION.to_string());
+                conn.execute(
+                    "UPDATE sources SET model_deviation_dimensions=?2 WHERE id=?1",
+                    rusqlite::params![id, serde_json::to_string(&[single])?],
+                )?;
+            }
+        }
+        // v16: text-encoder / controlnet are new fingerprint dimensions.
+        let v16_cols = image_columns(conn)?;
+        for col in ["text_encoder", "controlnet"] {
+            if !v16_cols.contains(col) {
+                conn.execute_batch(&format!("ALTER TABLE images ADD COLUMN {} TEXT;", col))?;
+            }
+        }
+        // v16: L1 keys are re-derived from the raw stored model parameters
+        // under the SINGLE-dimension exact-match fingerprint. Manual pinning
+        // (level-2 bindings) is honored; L2 becomes the L1 placeholder and is
+        // fully re-clustered after the schema settles (startup pass).
+        if version < 16 {
+            rehash(conn, None, None)?;
+            let _ = backfill_text_encoder_controlnet_columns(conn)?;
         }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS workflow_templates (
@@ -374,6 +435,186 @@ mod migrations {
         }
         conn.execute_batch(&format!("PRAGMA user_version = {};", CURRENT_VERSION))?;
         Ok(())
+    }
+
+    /// Re-derive `group_key_l1` / `group_key_l3` for the target rows from the
+    /// RAW stored model parameters using the SINGLE-dimension exact-match
+    /// fingerprint, and set L2 to the L1 placeholder (except rows pinned by a
+    /// manual level-2 binding, which keep their binding key). The caller
+    /// re-runs `clustering::recluster_l2` afterwards to finish auto L2.
+    pub(crate) fn rehash(
+        conn: &Connection,
+        source_id: Option<i64>,
+        dimension_override: Option<&str>,
+    ) -> Result<usize> {
+        use crate::grouper::{extract_embedding_refs, l1_fingerprint, ModelParams};
+
+        // Per-source active dimension (source_id -> dimension).
+        let mut dim_of: std::collections::HashMap<i64, String> = Default::default();
+        {
+            let mut stmt =
+                conn.prepare("SELECT id, model_deviation_dimensions FROM sources")?;
+            let rows = stmt.query_map([], |r| {
+                let dims: Vec<String> =
+                    serde_json::from_str(&r.get::<_, String>(1)?).unwrap_or_default();
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    dims.into_iter()
+                        .find(|d| crate::grouper::DIMENSIONS.contains(&d.as_str()))
+                        .unwrap_or_else(|| crate::grouper::DEFAULT_DIMENSION.to_string()),
+                ))
+            })?;
+            for r in rows {
+                let (id, dim) = r?;
+                dim_of.insert(id, dim);
+            }
+        }
+
+        let mut updates: Vec<(String, String, i64)> = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT id, source_id, COALESCE(diffusion_model,''), COALESCE(checkpoint,''),
+                        COALESCE(text_encoder,''), COALESCE(vae,''),
+                        COALESCE(loras,''), COALESCE(prompt_pos,''), COALESCE(controlnet,'')
+                 FROM images
+                 WHERE (?1 IS NULL OR source_id = ?1)",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![source_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, String>(8)?,
+                ))
+            })?;
+            for r in rows {
+                let (id, src_id, dm, ck, te, vae, loras_json, prompt, cn) = r?;
+                let dimension = dimension_override
+                    .map(|s| s.to_string())
+                    .or_else(|| dim_of.get(&src_id).cloned())
+                    .unwrap_or_else(|| crate::grouper::DEFAULT_DIMENSION.to_string());
+                let mut lora_keys: Vec<String> = serde_json::from_str::<
+                    Vec<crate::metadata::LoraInfo>,
+                >(&loras_json)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|l| l.name.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .collect();
+                lora_keys.sort();
+                lora_keys.dedup();
+                let mut embeddings = extract_embedding_refs(&prompt);
+                embeddings.sort();
+                embeddings.dedup();
+                let params = ModelParams {
+                    base_model: if dm.is_empty() { ck } else { dm },
+                    text_encoder: te,
+                    vae,
+                    lora_keys,
+                    embeddings,
+                    controlnet: cn,
+                };
+                let l1 = l1_fingerprint(&dimension, &params);
+                let mut l3_buf = format!("model-deviation:v2\x01{}\x01{}", dimension, l1);
+                l3_buf.push('\x03');
+                l3_buf.push_str(&crate::grouper::normalize_prompt(&prompt));
+                let l3 = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(l3_buf.as_bytes()));
+                updates.push((l1, l3, id));
+            }
+        }
+
+        // Manual level-2 bindings win over the placeholder.
+        let mut bindings: std::collections::HashMap<i64, String> = Default::default();
+        {
+            let mut stmt =
+                conn.prepare("SELECT image_id, group_key FROM manual_group_bindings WHERE level=?1")?;
+            let rows = stmt.query_map(rusqlite::params![2i64], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for r in rows {
+                let (image_id, key) = r?;
+                bindings.insert(image_id, key);
+            }
+        }
+
+        let mut n = 0usize;
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut img_stmt = tx.prepare(
+                "UPDATE images SET group_key_l1=?2, group_key_l2=?3, group_key_l3=?4 WHERE id=?1",
+            )?;
+            for (l1, l3, id) in &updates {
+                let l2_value = bindings.get(id).cloned().unwrap_or_else(|| l1.clone());
+                img_stmt.execute(rusqlite::params![id, l1, l2_value, l3])?;
+                n += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Best-effort backfill of `text_encoder` / `controlnet` columns from the
+    /// stored model_chain_json (migration v16; fresh parser fills them at
+    /// scan time instead). Returns rows touched.
+    pub(crate) fn backfill_text_encoder_controlnet_columns(conn: &Connection) -> Result<usize> {
+        let sel = {
+            let mut stmt = conn.prepare(
+                "SELECT id, model_chain_json FROM images
+                 WHERE (text_encoder IS NULL OR text_encoder='')
+                    OR (controlnet IS NULL OR controlnet='')",
+            )?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        let tx = conn.unchecked_transaction()?;
+        let mut n = 0usize;
+        for (id, chain_json) in sel {
+            let chain: Vec<crate::metadata::ModelChainItem> =
+                serde_json::from_str(&chain_json).unwrap_or_default();
+            let mut te: Vec<String> = Vec::new();
+            let mut cn: Vec<String> = Vec::new();
+            for item in &chain {
+                match item.node_type.as_str() {
+                    "CLIPLoader" | "DualCLIPLoader" | "TripleCLIPLoader" | "QuadrupleCLIPLoader"
+                    | "CLIPLoaderGGUF" | "DualCLIPLoaderGGUF" | "CLIPLoaderAdvanced" => {
+                        for part in item.model.split(',') {
+                            if !part.is_empty() {
+                                te.push(part.to_string());
+                            }
+                        }
+                    }
+                    "ControlNetLoader"
+                    | "ControlNetLoaderAdvanced"
+                    | "ControlNetLoaderDiffusers"
+                    | "ControlNetLoaderAdvancedDiffusers" => {
+                        if !item.model.is_empty() {
+                            cn.push(item.model.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            te.sort();
+            cn.sort();
+            te.dedup();
+            cn.dedup();
+            tx.execute(
+                "UPDATE images SET text_encoder=?2, controlnet=?3
+                 WHERE id=?1 AND (text_encoder IS NULL OR text_encoder='')
+                    AND (controlnet IS NULL OR controlnet='')",
+                rusqlite::params![id, te.join(","), cn.join(",")],
+            )?;
+            n += 1;
+        }
+        tx.commit()?;
+        Ok(n)
     }
 
     fn image_columns(conn: &Connection) -> Result<std::collections::HashSet<String>> {
@@ -441,6 +682,9 @@ mod migrations {
                 -- FolderView with a gray overlay so the user can un-block it.
                 hidden INTEGER NOT NULL DEFAULT 0,
                 diffusion_model TEXT,
+                -- v16 fingerprint dimensions: text encoder / control net.
+                text_encoder TEXT,
+                controlnet TEXT,
                 model_chain_json TEXT NOT NULL DEFAULT '[]',
                  workflow_key TEXT,
                  workflow_graph_json TEXT,
@@ -833,8 +1077,24 @@ pub struct GroupInfo {
     pub workflow_name: Option<String>,
     /// Distinct diffusion models + image counts for the workflow level.
     pub model_facets: Vec<ModelFacet>,
+    /// Model-parameter label for the L1 (Model\偏差) level, rendered from the
+    /// source's selected dimension (e.g. the exact base model file name).
+    /// Empty at levels 0/2/3 and for the cross-source view.
+    pub model_param: String,
     /// True when the group's members are pinned by a manual L2 override.
     pub manually_merged: bool,
+    // MIN() aggregates backing `model_param` (internal serialization skipped:
+    // with exact-match dimensions every member shares these values).
+    #[serde(skip)]
+    pub(crate) _l1_dm: String,
+    #[serde(skip)]
+    pub(crate) _l1_text_encoder: String,
+    #[serde(skip)]
+    pub(crate) _l1_vae: String,
+    #[serde(skip)]
+    pub(crate) _l1_loras: String,
+    #[serde(skip)]
+    pub(crate) _l1_controlnet: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -997,14 +1257,14 @@ impl Db {
                 prompt_pos, prompt_neg, checkpoint, loras, vae, samplers, seed, steps, cfg,
                 group_key_l0, group_key_l1, group_key_l2, group_key_l3,
                  sha256, meta_ok, source_kind, scanned_at,
-                 diffusion_model, model_chain_json,
+                 diffusion_model, text_encoder, controlnet, model_chain_json,
                  workflow_key, workflow_graph_json,
                  workflow_template_id, workflow_match_confidence,
                  generation_recipe_json, recipe_signature, parser_version
              ) VALUES (
                  ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
                  ?17,?18,?19,?20,?21,?22,?23,?24,?25,
-                 ?26,?27,?28,?29,?30,?31,?32,?33,?34
+                 ?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36
              )",
             rusqlite::params![
                 row.source_id,
@@ -1033,6 +1293,8 @@ impl Db {
                 row.source_kind,
                 Utc::now().to_rfc3339(),
                 row.diffusion_model,
+                row.text_encoder,
+                row.controlnet,
                 row.model_chain_json,
                 row.workflow_key,
                 row.workflow_graph_json,
@@ -1071,10 +1333,10 @@ impl Db {
                 loras=?6, vae=?7, samplers=?8, seed=?9, steps=?10, cfg=?11,
                 group_key_l0=?12, group_key_l1=?13, group_key_l2=?14, group_key_l3=?15,
                  meta_ok=?16, source_kind=?17, width=?18, height=?19, size=?20, modified_at=?21,
-                 diffusion_model=?22, model_chain_json=?23,
-                 workflow_key=?24, workflow_graph_json=?25,
-                 workflow_template_id=?26, workflow_match_confidence=?27,
-                 generation_recipe_json=?28, recipe_signature=?29, parser_version=?30
+                 diffusion_model=?22, text_encoder=?23, controlnet=?24, model_chain_json=?25,
+                 workflow_key=?26, workflow_graph_json=?27,
+                 workflow_template_id=?28, workflow_match_confidence=?29,
+                 generation_recipe_json=?30, recipe_signature=?31, parser_version=?32
              WHERE id=?1",
             rusqlite::params![
                 image_id,
@@ -1099,6 +1361,8 @@ impl Db {
                 row.size,
                 row.modified_at,
                 row.diffusion_model,
+                row.text_encoder,
+                row.controlnet,
                 row.model_chain_json,
                 row.workflow_key,
                 row.workflow_graph_json,
@@ -1123,25 +1387,19 @@ impl Db {
         // Hidden rows are excluded from group counts — the user has decided
         // these images no longer participate in the scoring workflow, so
         // surfacing them in a group thumbnail would be misleading.
-        let sql = match source_id {
-            Some(sid) => format!(
-                "SELECT {col} AS gk, COUNT(*) c, MIN(i.prompt_pos) pp, MIN(i.checkpoint) ck, MIN(i.source_kind) sk, MIN(s.path) sp, MIN(wt.name) wname
-                 FROM images i JOIN sources s ON s.id=i.source_id
-                 LEFT JOIN workflow_templates wt ON wt.id=i.workflow_template_id
-                 WHERE i.source_id={sid} AND {col} IS NOT NULL AND i.hidden=0
-                 GROUP BY {col} ORDER BY c DESC",
-                col = key_col, sid = sid
-            ),
-            None => format!(
-                "SELECT {col} AS gk, COUNT(*) c, MIN(i.prompt_pos) pp, MIN(i.checkpoint) ck, MIN(i.source_kind) sk, MIN(s.path) sp, MIN(wt.name) wname
-                 FROM images i JOIN sources s ON s.id=i.source_id
-                 LEFT JOIN workflow_templates wt ON wt.id=i.workflow_template_id
-                 WHERE {col} IS NOT NULL AND i.hidden=0
-                 GROUP BY {col} ORDER BY c DESC",
-                col = key_col
-            ),
-        };
-        let mut stmt = conn.prepare(&sql)?;
+        let sql_1 = format!(
+            "SELECT {col} AS gk, COUNT(*) c, MIN(i.prompt_pos) pp, MIN(i.checkpoint) ck, MIN(i.source_kind) sk, MIN(s.path) sp, MIN(wt.name) wname, MIN(COALESCE(i.diffusion_model,'')) dm, MIN(COALESCE(i.text_encoder,'')) te, MIN(COALESCE(i.vae,'')) vv, MIN(COALESCE(i.loras,'')) lo, MIN(COALESCE(i.controlnet,'')) cn
+             FROM images i JOIN sources s ON s.id=i.source_id
+             LEFT JOIN workflow_templates wt ON wt.id=i.workflow_template_id
+             WHERE {where_sid} {col} IS NOT NULL AND i.hidden=0
+             GROUP BY {col} ORDER BY c DESC",
+            col = key_col,
+            where_sid = match source_id {
+                Some(sid) => format!("i.source_id={} AND", sid),
+                None => String::new(),
+            }
+        );
+        let mut stmt = conn.prepare(&sql_1)?;
         let map = |r: &rusqlite::Row| {
             Ok(GroupInfo {
                 group_key: r.get(0)?,
@@ -1151,8 +1409,14 @@ impl Db {
                 source_kind: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
                 source_path: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
                 workflow_name: r.get(6)?,
+                model_param: String::new(),
                 model_facets: Vec::new(),
                 manually_merged: false,
+                _l1_dm: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                _l1_text_encoder: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
+                _l1_vae: r.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                _l1_loras: r.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                _l1_controlnet: r.get::<_, Option<String>>(11)?.unwrap_or_default(),
             })
         };
         let mut out = Vec::new();
@@ -1164,6 +1428,22 @@ impl Db {
         if level == 1 {
             for group in &mut out {
                 group.model_facets = self.model_facets_for_group(&conn, &group.group_key)?;
+            }
+            // Render the L1 model-parameter labels from the source's selected
+            // dimension (only meaningful for a single-source view; group keys
+            // are parameter identities shared across sources).
+            if let Some(sid) = source_id {
+                let dimension = Self::get_source_dimension_locked(&conn, sid)?;
+                for group in &mut out {
+                    group.model_param = Self::dimension_label_of(
+                        &dimension,
+                        &group._l1_dm,
+                        &group._l1_text_encoder,
+                        &group._l1_vae,
+                        &group._l1_loras,
+                        &group._l1_controlnet,
+                    );
+                }
             }
         }
         // Manual-merge badge only makes sense at the prompt-deviation level.
@@ -1204,12 +1484,119 @@ impl Db {
                 group_key: r.get(0)?, count: r.get(1)?, prompt_pos: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 checkpoint: r.get::<_, Option<String>>(3)?.unwrap_or_default(), source_kind: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
                 source_path: r.get::<_, Option<String>>(5)?.unwrap_or_default(), workflow_name: r.get(6)?,
+                model_param: String::new(),
                 model_facets: Vec::new(), manually_merged: false,
+                _l1_dm: String::new(), _l1_text_encoder: String::new(),
+                _l1_vae: String::new(), _l1_loras: String::new(), _l1_controlnet: String::new(),
             })
         })?;
         let mut out = Vec::new();
         for row in rows { out.push(row?); }
         Ok(out)
+    }
+
+    /// The single wheel-selected Model偏差 dimension for a source
+    /// (defaults to `base_model`).
+    pub fn get_source_dimension(&self, source_id: i64) -> Result<String> {
+        let conn = self.0.lock().unwrap();
+        Self::get_source_dimension_locked(&conn, source_id)
+    }
+
+    fn get_source_dimension_locked(conn: &Connection, source_id: i64) -> Result<String> {
+        let dims_json: String = conn
+            .query_row(
+                "SELECT model_deviation_dimensions FROM sources WHERE id=?1",
+                rusqlite::params![source_id],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|_| r#"["base_model"]"#.to_string());
+        let dims: Vec<String> = serde_json::from_str(&dims_json).unwrap_or_default();
+        Ok(dims
+            .into_iter()
+            .find(|d| crate::grouper::DIMENSIONS.contains(&d.as_str()))
+            .unwrap_or_else(|| crate::grouper::DEFAULT_DIMENSION.to_string()))
+    }
+
+    /// Human label of an L1 group under `dimension`, built from raw MIN()
+    /// aggregates. Pure formatting of stored values — with exact-match
+    /// dimensions every group member shares these values.
+    fn dimension_label_of(
+        dimension: &str,
+        dm: &str,
+        text_encoder: &str,
+        vae: &str,
+        loras_json: &str,
+        controlnet: &str,
+    ) -> String {
+        let mut lora_names: Vec<String> =
+            serde_json::from_str::<Vec<crate::metadata::LoraInfo>>(loras_json)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|l| l.name.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .collect();
+        lora_names.sort();
+        lora_names.dedup();
+        let label = crate::grouper::ModelParamLabel {
+            base_model: dm.to_string(),
+            text_encoder: text_encoder.to_string(),
+            vae: vae.to_string(),
+            lora_count: lora_names.len(),
+            lora_names,
+            embeddings: Vec::new(),
+            controlnet: controlnet.to_string(),
+        };
+        crate::grouper::dimension_label(dimension, &label)
+    }
+
+    /// Re-derive L1/L3 for all rows of one source under a NEW single
+    /// dimension (persisted by the caller via `set_model_deviation_dimensions`),
+    /// using only stored raw columns. Returns rows updated. Manual level-2
+    /// bindings keep their keys; call `clustering::recluster_l2` afterwards.
+    pub fn rehash_l1_for_source(&self, source_id: i64, dimension: &str) -> Result<usize> {
+        let conn = self.0.lock().unwrap();
+        migrations::rehash(&conn, Some(source_id), Some(dimension))
+    }
+
+    /// Anchor row for an in-place prompt edit: normalized path plus the
+    /// source/routing data the caller needs to re-derive group keys and
+    /// re-cluster at the source's persisted threshold.
+    pub fn image_edit_target(&self, image_id: i64) -> Result<(String, i64, String, String, f64)> {
+        let conn = self.0.lock().unwrap();
+        conn.query_row(
+            "SELECT i.abs_path, i.source_id, s.path, COALESCE(i.group_key_l1,''), s.l2_threshold
+             FROM images i JOIN sources s ON s.id = i.source_id
+             WHERE i.id=?1",
+            rusqlite::params![image_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// Fast re-read after an in-place prompt edit returns the fields the
+    /// frontend refreshes immediately (prompt texts + refreshed group keys).
+    pub fn image_prompt_groups(
+        &self,
+        image_id: i64,
+    ) -> Result<(String, String, String, String, i64, i64)> {
+        let conn = self.0.lock().unwrap();
+        conn.query_row(
+            "SELECT COALESCE(prompt_pos,''), COALESCE(prompt_neg,''), COALESCE(group_key_l2,''),
+                    COALESCE(group_key_l3,''), COALESCE(modified_at,0), COALESCE(size,0)
+             FROM images WHERE id=?1",
+            rusqlite::params![image_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .map_err(|e| e.into())
     }
 
     pub fn undo_manual_split(&self, group_key: &str, source_id: i64) -> Result<usize> {
@@ -2669,6 +3056,8 @@ pub struct ImageInsert {
     pub meta_ok: bool,
     pub source_kind: String,
     pub diffusion_model: String,
+    pub text_encoder: String,
+    pub controlnet: String,
     pub model_chain_json: String,
     pub workflow_key: String,
     pub workflow_graph_json: String,
@@ -2769,6 +3158,8 @@ mod tests {
                 meta_ok: true,
                 source_kind: "folder".into(),
                 diffusion_model: String::new(),
+                text_encoder: String::new(),
+                controlnet: String::new(),
                 model_chain_json: String::new(),
                 workflow_key: String::new(),
                 workflow_graph_json: String::new(),
@@ -2871,6 +3262,8 @@ mod tests {
                 meta_ok: true,
                 source_kind: "folder".into(),
                 diffusion_model: String::new(),
+                text_encoder: String::new(),
+                controlnet: String::new(),
                 model_chain_json: String::new(),
                 workflow_key: String::new(),
                 workflow_graph_json: String::new(),
@@ -2952,6 +3345,8 @@ mod tests {
                 meta_ok: true,
                 source_kind: "folder".into(),
                 diffusion_model: String::new(),
+                text_encoder: String::new(),
+                controlnet: String::new(),
                 model_chain_json: String::new(),
                 workflow_key: String::new(),
                 workflow_graph_json: String::new(),
@@ -2972,4 +3367,31 @@ mod tests {
         assert!(all.contains(&b));
     }
 
+    /// Operator utility: run the v16 (single-dimension L1) migration against
+    /// the REAL production database so the web dev bridge (which only reads)
+    /// can preview the new grouping. Never runs implicitly — set
+    /// `AIS_MIGRATE_REAL_DB=1` to opt in. A timestamped .bak copy is written
+    /// first.
+    #[test]
+    #[ignore = "explicit operator action: AIS_MIGRATE_REAL_DB=1"]
+    fn migrate_production_db_on_demand() {
+        if std::env::var("AIS_MIGRATE_REAL_DB").as_deref() != Ok("1") {
+            eprintln!("set AIS_MIGRATE_REAL_DB=1 to run against the production DB");
+            return;
+        }
+        let Some(appdata) = std::env::var_os("APPDATA") else { return };
+        let real = std::path::PathBuf::from(&appdata)
+            .join("com.aiimagesorter.app")
+            .join("ai-image-sorter.db");
+        if !real.exists() {
+            eprintln!("no production DB at {real:?}");
+            return;
+        }
+        let stamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
+        let bak = real.with_extension(format!("db.bak-onward-{stamp}"));
+        std::fs::copy(&real, &bak).expect("backup copy");
+        let db = open(&real).expect("open+migrate");
+        let _ = db.checkpoint();
+        eprintln!("migrated {} (backup at {})", real.display(), bak.display());
+    }
 }

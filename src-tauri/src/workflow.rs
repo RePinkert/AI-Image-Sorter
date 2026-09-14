@@ -51,14 +51,37 @@ fn parse_template(path: &Path) -> Option<WorkflowTemplateDto> {
             continue;
         }
         let values = node.get("widgets_values").and_then(Value::as_array);
-        let model = match node_type {
-            "UNETLoader" | "UnetLoaderGGUF" | "CheckpointLoaderSimple" | "CheckpointLoader"
-            | "LoraLoader" | "LoraLoaderModelOnly" | "VAELoader" | "SeedVR2LoadVAEModel" =>
-                values.and_then(|v| v.first()),
-            _ => None,
-        }.and_then(Value::as_str).filter(|s| !s.is_empty());
+        // Loader classification is substring-based so custom loader nodes
+        // (rgthree "Power Lora Loader", "Lora Loader (LoraManager)", Flux
+        // packs, ...) are picked up the same way as the native ones. All
+        // ComfyUI loader widgets put the model dropdown in widgets_values.
+        let is_diff = node_type.contains("UNET")
+            || node_type.contains("Unet")
+            || node_type.contains("Checkpoint")
+            || node_type.contains("Diffusion");
+        let is_lora = node_type.to_lowercase().contains("lora");
+        let is_vae = node_type.contains("VAE");
+        // The first widget is the model file for every loader variant; for
+        // custom LoRA organisers the widget list may hold dicts/slots, so
+        // fall back to scanning for the first plain string path.
+        let model = if is_diff || is_lora || is_vae {
+            values
+                .and_then(|v| v.first())
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    values.and_then(|v| {
+                        v.iter()
+                            .filter_map(|w| w.as_str())
+                            .find(|s| !s.is_empty() && s.contains('/'))
+                    })
+                })
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        } else {
+            None
+        };
         if let Some(model) = model {
-            if matches!(node_type, "UNETLoader" | "UnetLoaderGGUF" | "CheckpointLoaderSimple" | "CheckpointLoader") {
+            if is_diff {
                 models.insert(model.to_string());
             }
             chain.push(format!("{}:{}", node_type, model));

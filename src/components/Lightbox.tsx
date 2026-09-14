@@ -23,13 +23,14 @@ interface Props {
    *  inspected — used by FolderView where there is no other way to see an
    *  image's metadata. */
   meta?: ImageRow
+  onMetaUpdated?: (image: ImageRow) => void
 }
 
 const MIN = 0.1
 const MAX = 10
 const FIT = 1
 
-export function Lightbox({ src, onClose, meta }: Props) {
+export function Lightbox({ src, onClose, meta, onMetaUpdated }: Props) {
   const [scale, setScale] = useState(FIT)
   const [pos, setPos] = useState({ x: 0, y: 0 })
   const [metaOpen, setMetaOpen] = useState(false)
@@ -157,7 +158,7 @@ export function Lightbox({ src, onClose, meta }: Props) {
                 exit={{ opacity: 0, x: 18 }}
                 transition={{ duration: 0.16, ease: 'easeOut' }}
               >
-                <ImageMetaPopover img={meta} />
+                <ImageMetaPopover img={meta} onMetaUpdated={onMetaUpdated} />
               </motion.div>
             )}
           </AnimatePresence>

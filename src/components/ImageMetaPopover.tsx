@@ -1,4 +1,5 @@
-import { useMemo, type ReactElement } from 'react'
+import { useEffect, useMemo, useState, type ReactElement } from 'react'
+import { errorMessage, updateImagePrompts } from '../api'
 import type { ImageRow } from '../types'
 import { CopyButton } from './CopyButton'
 
@@ -8,6 +9,7 @@ interface ImageMetaPopoverProps {
   diffColor?: 'left' | 'right'
   /** When provided, renders a "屏蔽" action at the bottom of the popover. */
   onHide?: (img: ImageRow) => void
+  onMetaUpdated?: (img: ImageRow) => void
 }
 
 function tokenize(text: string): string[] {
@@ -49,7 +51,24 @@ function renderPromptWithDiff(
   )
 }
 
-export function ImageMetaPopover({ img, comparePrompt, diffColor, onHide }: ImageMetaPopoverProps) {
+export function ImageMetaPopover({ img, comparePrompt, diffColor, onHide, onMetaUpdated }: ImageMetaPopoverProps) {
+  const isPng = img.filename.toLocaleLowerCase().endsWith('.png')
+  const [editing, setEditing] = useState(false)
+  const [positive, setPositive] = useState(img.prompt_pos)
+  const [negative, setNegative] = useState(img.prompt_neg)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState('')
+  useEffect(() => { setPositive(img.prompt_pos); setNegative(img.prompt_neg) }, [img.id, img.prompt_pos, img.prompt_neg])
+
+  async function savePrompts() {
+    setSaving(true); setSaveError('')
+    try {
+      const result = await updateImagePrompts(img, positive, negative)
+      onMetaUpdated?.({ ...img, prompt_pos: result.prompt_pos, prompt_neg: result.prompt_neg, modified_at: result.modified_at, size: result.size })
+      setEditing(false)
+    } catch (error) { setSaveError(errorMessage(error)) }
+    finally { setSaving(false) }
+  }
   const promptDisplay = useMemo(() => {
     const text = img.prompt_pos || '(无)'
     if (!comparePrompt || !img.prompt_pos) return <>{text}</>
@@ -75,12 +94,20 @@ export function ImageMetaPopover({ img, comparePrompt, diffColor, onHide }: Imag
           )}
           <CopyButton text={img.prompt_pos || ''} className="meta-copy-btn" />
         </strong>
-        <pre>{promptDisplay}</pre>
+        {editing ? <textarea value={positive} onChange={(e) => setPositive(e.target.value)} disabled={saving} rows={8} aria-label="正 prompt" /> : <pre>{promptDisplay}</pre>}
       </div>
       <div className="meta-field">
         <strong>负 prompt</strong>
-        <pre>{img.prompt_neg || '(无)'}</pre>
+        {editing ? <textarea value={negative} onChange={(e) => setNegative(e.target.value)} disabled={saving} rows={6} aria-label="负 prompt" /> : <pre>{img.prompt_neg || '(无)'}</pre>}
       </div>
+      {onMetaUpdated && isPng && (editing ? (
+        <div className="meta-edit-actions">
+          <button type="button" onClick={() => void savePrompts()} disabled={saving || (positive === img.prompt_pos && negative === img.prompt_neg)}>{saving ? '正在写回…' : '保存到 PNG'}</button>
+          <button type="button" onClick={() => { setEditing(false); setPositive(img.prompt_pos); setNegative(img.prompt_neg); setSaveError('') }} disabled={saving}>取消</button>
+        </div>
+      ) : <button type="button" className="meta-edit-btn" onClick={() => setEditing(true)}>编辑 Prompt</button>)}
+      {onMetaUpdated && !isPng && <p className="muted">Prompt 写回首版仅支持 PNG 图片。</p>}
+      {saveError && <div className="action-error" role="alert">{saveError}</div>}
       <div className="meta-field">
         <strong>模型</strong>
         <pre>{img.checkpoint || '(无)'}</pre>

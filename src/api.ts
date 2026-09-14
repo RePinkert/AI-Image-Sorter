@@ -11,11 +11,13 @@ import type {
   ImageRow,
   LabelRow,
   ManualGroupResult,
+  ModelDeviationDimension,
   PromptRecommendation,
   ScanResult,
   SourceRow,
   SyncAllResult,
   UndoActionResult,
+  UpdateImagePromptsResult,
   WorkflowTemplateDto,
 } from './types'
 
@@ -242,6 +244,19 @@ export async function listGroupImagesAll(groupKey: string, level: Granularity = 
   return apiInvoke('list_group_images_all', { groupKey, level })
 }
 
+export async function updateImagePrompts(image: ImageRow, promptPos: string, promptNeg: string): Promise<UpdateImagePromptsResult> {
+  if (isWebDev()) return unavailable('浏览器模式暂不支持写回图片元数据，请使用桌面版')
+  return apiInvoke('update_image_prompts', {
+    args: {
+      image_id: image.id,
+      prompt_pos: promptPos,
+      prompt_neg: promptNeg,
+      expected_size: image.size,
+      expected_modified_at: image.modified_at,
+    },
+  })
+}
+
 export async function applySwipeAction(
   imageId: number,
   gesture: string,
@@ -309,6 +324,14 @@ export async function recommendPrompts(
 export async function reclusterSource(sourceId: number, threshold: number): Promise<void> {
   if (isWebDev()) return unavailable('浏览器模式暂不支持重新聚类，请使用桌面版')
   return apiInvoke('recluster_source', { sourceId, threshold })
+}
+
+/** Wheel-driven L1 (Model偏差) re-clustering: persist the single selected
+ *  dimension, re-derive the source's L1/L3 fingerprints from stored raw
+ *  columns, re-cluster L2, and return the new group count. */
+export async function reclusterL1(sourceId: number, dimension: ModelDeviationDimension): Promise<number> {
+  if (isWebDev()) return unavailable('浏览器模式暂不支持模型偏差重聚类，请使用桌面版')
+  return apiInvoke('recluster_l1', { sourceId, dimension })
 }
 
 export async function mergeGroups(
