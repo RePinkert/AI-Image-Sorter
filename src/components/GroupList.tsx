@@ -1,10 +1,22 @@
 import { useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { assetUrl, errorMessage, getGroupThumbnails, listGroups, mergeGroups, reclusterL1 } from '../api'
+import {
+  assetUrl,
+  confirmAction,
+  errorMessage,
+  getGroupThumbnails,
+  hideGroupImages,
+  listGroupImages,
+  listGroups,
+  mergeGroups,
+  reclusterL1,
+  trashGroupImages,
+} from '../api'
 import type {
   Granularity,
   GroupInfo,
   GroupThumbDto,
+  ImageRow,
   ModelDeviationDimension,
 } from '../types'
 import {
@@ -73,6 +85,73 @@ function LazyGroupThumb({ groupKey, level }: { groupKey: string; level: Granular
           ))}
         </div>
       ) : <div className="thumb-placeholder" />}
+    </div>
+  )
+}
+
+const groupImagesCache = new Map<string, Promise<ImageRow[]>>()
+
+function LazyRowImages({ groupKey, level }: { groupKey: string; level: Granularity }) {
+  const cacheKey = `${level}:${groupKey}`
+  const hostRef = useRef<HTMLDivElement | null>(null)
+  const [images, setImages] = useState<ImageRow[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const [visible, setVisible] = useState(false)
+
+  useEffect(() => {
+    const el = hostRef.current
+    if (!el) return
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) {
+          setVisible(true)
+          observer.disconnect()
+        }
+      },
+      { rootMargin: '300px 0px' },
+    )
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [])
+
+  useEffect(() => {
+    if (!visible || loaded) return
+    let request = groupImagesCache.get(cacheKey)
+    if (!request) {
+      request = listGroupImages(groupKey, level)
+      groupImagesCache.set(cacheKey, request)
+    }
+    let cancelled = false
+    void request
+      .then((rows) => {
+        if (!cancelled) {
+          setImages(rows)
+          setLoaded(true)
+        }
+      })
+      .catch(() => groupImagesCache.delete(cacheKey))
+    return () => {
+      cancelled = true
+    }
+  }, [cacheKey, groupKey, level, loaded, visible])
+
+  if (!loaded) {
+    return <div className="row-image-strip" ref={hostRef}><div className="thumb-placeholder" /></div>
+  }
+  return (
+    <div className="row-image-strip">
+      {images.map((img) => (
+        <img
+          key={img.id}
+          className={img.hidden ? 'row-img hidden-img' : 'row-img'}
+          src={assetUrl(img.abs_path)}
+          alt={img.filename}
+          draggable={false}
+          loading="lazy"
+          decoding="async"
+          title={img.prompt_pos.slice(0, 160)}
+        />
+      ))}
     </div>
   )
 }
@@ -290,6 +369,104 @@ export function GroupList() {
 
   const syncProgress = useStore((s) => s.syncProgress)
   const syncing = syncProgress.active && syncProgress.pending > 0
+  const l2ListView = useStore((s) => s.l2ListView)
+  const setL2ListView = useStore((s) => s.setL2ListView)
+  const listMode = granularity === 2 && l2ListView
+  const [openRowKeys, setOpenRowKeys] = useState<Set<string>>(new Set())
+  const [listFocusKey, setListFocusKey] = useState<string | null>(null)
+  const [rowActionMsg, setRowActionMsg] = useState<string | null>(null)
+  const [rowActionBusy, setRowActionBusy] = useState(false)
+
+  function toggleRowOpen(key: string) {
+    setListFocusKey(key)
+    setOpenRowKeys((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  function switchFocusRow(delta: number) {
+    if (groups.length === 0) return
+    const idx = groups.findIndex((g) => g.group_key === listFocusKey)
+    const nextIdx =
+      idx === -1
+        ? delta > 0
+          ? 0
+          : groups.length - 1
+        : (idx + delta + groups.length) % groups.length
+    setListFocusKey(groups[nextIdx].group_key)
+  }
+
+  // Arrow-key focus switching in the expandable list view; ignored while a
+  // text field has focus so prompt search / edit inputs stay usable.
+  useEffect(() => {
+    if (!listMode) return
+    const handler = (event: KeyboardEvent) => {
+      const target = event.target
+      const tag = target instanceof HTMLElement ? target.tagName : ''
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+      if (event.key === 'ArrowLeft') {
+        event.preventDefault()
+        switchFocusRow(-1)
+      } else if (event.key === 'ArrowRight') {
+        event.preventDefault()
+        switchFocusRow(1)
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [listMode])
+
+  async function hideRowGroup(g: GroupInfo) {
+    setRowActionBusy(true)
+    setRowActionMsg(null)
+    try {
+      const hidden = await hideGroupImages(currentSourceId!, g.group_key, true)
+      setRowActionMsg(`已整组隐藏 ${hidden} 张 — 可在文件夹视角撤销`)
+      setOpenRowKeys((prev) => {
+        const next = new Set(prev)
+        next.delete(g.group_key)
+        return next
+      })
+      await reloadGroupsAtLevel()
+    } catch (e) {
+      setRowActionMsg(`整组隐藏失败：${errorMessage(e)}`)
+    } finally {
+      setRowActionBusy(false)
+    }
+  }
+
+  async function deleteRowGroup(g: GroupInfo) {
+    const currentSource = currentSourceId
+    if (currentSource == null) {
+      setRowActionMsg('请先在顶部选择具体来源目录，再执行整组删除')
+      return
+    }
+    setRowActionBusy(true)
+    setRowActionMsg(null)
+    try {
+      const ok = await confirmAction(
+        `删除这 ${g.count} 张图片？`,
+        `${displayLabel(g)} 的全部成员将被移入系统回收站并从库中移除；删除图片后可在文件回收站恢复文件。`,
+      )
+      if (!ok) return
+      const deleted = await trashGroupImages(currentSource, g.group_key)
+      setRowActionMsg(`已删除 ${deleted} 张（回收站可恢复文件）`)
+      setOpenRowKeys((prev) => {
+        const next = new Set(prev)
+        next.delete(g.group_key)
+        return next
+      })
+      await reloadGroupsAtLevel()
+    } catch (e) {
+      setRowActionMsg(`整组删除失败：${errorMessage(e)}`)
+    } finally {
+      setRowActionBusy(false)
+    }
+  }
 
   return (
     <div className="panel">
@@ -313,6 +490,15 @@ export function GroupList() {
         </select>
         <button type="button" onClick={() => setView('import')}>+ 导入新源</button>
         <button type="button" onClick={() => setView('settings')}>标签设置 / 导出</button>
+        {granularity === 2 && (
+          <button
+            type="button"
+            onClick={() => setL2ListView(!l2ListView)}
+            title="Prompt偏差 层级的呈现方式：卡片网格（旧视图，作为回滚保底）或可展开的分组列表"
+          >
+            {l2ListView ? '切换到卡片视图' : '切换到列表视图'}
+          </button>
+        )}
         {granularity === 2 && (
           <button
             type="button"
@@ -384,71 +570,178 @@ export function GroupList() {
           {mergeMsg && <span className="merge-msg">{mergeMsg}</span>}
         </div>
       )}
-      <div className="group-grid">
-        {groups.map((g) => (
-          <div
-            key={g.group_key}
-            className={`group-card ${mergeMode && granularity === 2 && selectedKeys.has(g.group_key) ? 'merge-selected' : ''}`}
-            onClick={() => (mergeMode && granularity === 2 ? toggleMergeSelect(g.group_key) : openGroup(g))}
-            role="button"
-            tabIndex={0}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter' || event.key === ' ') {
-                event.preventDefault()
-                mergeMode && granularity === 2 ? toggleMergeSelect(g.group_key) : openGroup(g)
-              }
-            }}
-            title={displayLabel(g)}
-          >
-            {mergeMode && granularity === 2 && (
-              <input
-                type="checkbox"
-                className="merge-check"
-                checked={selectedKeys.has(g.group_key)}
-                onChange={(e) => {
-                  e.stopPropagation()
-                  toggleMergeSelect(g.group_key)
-                }}
-                onClick={(e) => e.stopPropagation()}
-              />
-            )}
-            <LazyGroupThumb groupKey={g.group_key} level={granularity} />
-            <span className="group-count-badge">{g.count}</span>
-            <div className="group-prompt">{displayLabel(g)}</div>
-            {granularity === 2 && g.manually_merged && (
-              <span className="merged-badge" title="该组为手动合并结果，自动重聚类不会拆开">
-                已手动合并
-              </span>
-            )}
-            <div className="group-meta">
-              {granularity === 1 && currentSourceId != null
-                ? `${MODEL_DEVIATION_DIMENSION_LABELS[l1Dimension]} · ${g.checkpoint || '—'} · ${g.source_kind}`
-                : `${g.checkpoint || '—'} · ${g.source_kind}`}
-              <button
-                type="button"
-                className="folder-link"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  openFolder(g)
-                }}
-                title="文件夹视角（速览评分 / 屏蔽 / 删除）"
-                style={{ marginLeft: 8 }}
-              >
-                文件夹视角
-              </button>
-            </div>
-            {granularity === 1 && g.model_facets && g.model_facets.length > 0 && (
-              <div className="model-facets">
-                {g.model_facets.map((f) => (
-                  <span key={f.model} className="model-chip" title={f.model}>
-                    {f.model} <b>{f.count}</b>
-                  </span>
-                ))}
+      {!listMode && (
+        <div className="group-grid">
+          {groups.map((g) => (
+            <div
+              key={g.group_key}
+              className={`group-card ${mergeMode && granularity === 2 && selectedKeys.has(g.group_key) ? 'merge-selected' : ''}`}
+              onClick={() => (mergeMode && granularity === 2 ? toggleMergeSelect(g.group_key) : openGroup(g))}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault()
+                  mergeMode && granularity === 2 ? toggleMergeSelect(g.group_key) : openGroup(g)
+                }
+              }}
+              title={displayLabel(g)}
+            >
+              {mergeMode && granularity === 2 && (
+                <input
+                  type="checkbox"
+                  className="merge-check"
+                  checked={selectedKeys.has(g.group_key)}
+                  onChange={(e) => {
+                    e.stopPropagation()
+                    toggleMergeSelect(g.group_key)
+                  }}
+                  onClick={(e) => e.stopPropagation()}
+                />
+              )}
+              <LazyGroupThumb groupKey={g.group_key} level={granularity} />
+              <span className="group-count-badge">{g.count}</span>
+              <div className="group-prompt">{displayLabel(g)}</div>
+              {granularity === 2 && g.manually_merged && (
+                <span className="merged-badge" title="该组为手动合并结果，自动重聚类不会拆开">
+                  已手动合并
+                </span>
+              )}
+              <div className="group-meta">
+                {granularity === 1 && currentSourceId != null
+                  ? `${MODEL_DEVIATION_DIMENSION_LABELS[l1Dimension]} · ${g.checkpoint || '—'} · ${g.source_kind}`
+                  : `${g.checkpoint || '—'} · ${g.source_kind}`}
+                <button
+                  type="button"
+                  className="folder-link"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    openFolder(g)
+                  }}
+                  title="文件夹视角（速览评分 / 屏蔽 / 删除）"
+                  style={{ marginLeft: 8 }}
+                >
+                  文件夹视角
+                </button>
               </div>
-            )}
-          </div>
-        ))}
-      </div>
+              {granularity === 1 && g.model_facets && g.model_facets.length > 0 && (
+                <div className="model-facets">
+                  {g.model_facets.map((f) => (
+                    <span key={f.model} className="model-chip" title={f.model}>
+                      {f.model} <b>{f.count}</b>
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {listMode && (
+        <div className="group-list-rows" role="list">
+          {rowActionMsg && <p className="sync-warn" role="status">{rowActionMsg}</p>}
+          {groups.map((g) => {
+            const open = openRowKeys.has(g.group_key)
+            const focused = listFocusKey === g.group_key
+            return (
+              <div
+                key={g.group_key}
+                role="listitem"
+                className={`group-row ${focused ? 'row-focused' : ''} ${open ? 'row-open' : ''} ${mergeMode && selectedKeys.has(g.group_key) ? 'merge-selected' : ''}`}
+              >
+                <div className="group-row-head">
+                  {mergeMode ? (
+                    <input
+                      type="checkbox"
+                      className="merge-check"
+                      checked={selectedKeys.has(g.group_key)}
+                      onChange={(e) => {
+                        e.stopPropagation()
+                        toggleMergeSelect(g.group_key)
+                      }}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  ) : (
+                    <button
+                      type="button"
+                      className={`row-expander ${open ? 'open' : ''}`}
+                      title={open ? '折叠' : '展开显示该组图片'}
+                      onClick={() => toggleRowOpen(g.group_key)}
+                    >
+                      ▸
+                    </button>
+                  )}
+                  <div
+                    className="group-row-title"
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => toggleRowOpen(g.group_key)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault()
+                        toggleRowOpen(g.group_key)
+                      }
+                    }}
+                  >
+                    <span className="group-chevron">{open ? '▾' : '▸'}</span>
+                    <span className="group-count-badge">{g.count}</span>
+                    <span className="group-prompt">{displayLabel(g)}</span>
+                    {g.manually_merged && <span className="merged-badge" title="该组为手动合并结果，自动重聚类不会拆开">已手动合并</span>}
+                  </div>
+                  <div className="group-row-actions">
+                    <button
+                      type="button"
+                      className="row-action"
+                      disabled={rowActionBusy}
+                      title="切换到上一组（焦点移动，便于整组合并 / 移出）"
+                      onClick={() => switchFocusRow(-1)}
+                    >
+                      ◀
+                    </button>
+                    <button
+                      type="button"
+                      className="row-action"
+                      disabled={rowActionBusy}
+                      title="切换到下一组（焦点移动，便于整组合并 / 移出）"
+                      onClick={() => switchFocusRow(1)}
+                    >
+                      ▶
+                    </button>
+                    <button
+                      type="button"
+                      className="row-action"
+                      disabled={rowActionBusy || currentSourceId == null}
+                      title="整组隐藏（可在文件夹视角撤销）"
+                      onClick={() => void hideRowGroup(g)}
+                    >
+                      ⊗
+                    </button>
+                    <button
+                      type="button"
+                      className="row-action row-action-danger"
+                      disabled={rowActionBusy || currentSourceId == null}
+                      title="整组删除：全体成员移入系统回收站（Shift+Delete 语义）"
+                      onClick={() => void deleteRowGroup(g)}
+                    >
+                      🗑
+                    </button>
+                  </div>
+                </div>
+                {open && !mergeMode && (
+                  <div className="group-row-body">
+                    <LazyRowImages groupKey={g.group_key} level={granularity} />
+                    <div className="row-open-hint">
+                      {currentSourceId == null
+                        ? '请先在顶部选择具体来源目录，再使用组按钮操作'
+                        : '← → 键快速切换焦点组；⊗ 整组隐藏、🗑 整组删除（回收站）'}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
       <AnimatePresence>
         {confirmGroups && confirmGroups.length > 0 && (
           <motion.div

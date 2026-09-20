@@ -309,6 +309,18 @@ export async function trashImage(imageId: number): Promise<void> {
   return apiInvoke('trash_image', { imageId })
 }
 
+/** Batch show/hide every member of an L2 group. Returns changed count. */
+export async function hideGroupImages(sourceId: number, groupKey: string, hidden: boolean): Promise<number> {
+  if (isWebDev()) return unavailable('浏览器模式暂不支持批量屏蔽，请使用桌面版')
+  return apiInvoke('hide_group_images', { sourceId, groupKey, hidden })
+}
+
+/** Shift+Delete on a whole L2 group: recycle-bin + DB row per member. */
+export async function trashGroupImages(sourceId: number, groupKey: string): Promise<number> {
+  if (isWebDev()) return unavailable('浏览器模式暂不支持批量删除，请使用桌面版')
+  return apiInvoke('trash_group_images', { sourceId, groupKey })
+}
+
 export async function recommendPrompts(
   groupKey: string,
   granularity: number,

@@ -88,6 +88,8 @@ pub fn run() {
             commands::toggle_hidden_action,
             commands::undo_review_action,
             commands::trash_image,
+            commands::hide_group_images,
+            commands::trash_group_images,
             commands::recluster_source,
             commands::merge_groups,
             commands::split_images,

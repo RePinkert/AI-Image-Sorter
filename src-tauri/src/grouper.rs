@@ -16,6 +16,33 @@ pub const DIMENSIONS: [&str; 6] = [
 
 pub const DEFAULT_DIMENSION: &str = "base_model";
 
+/// View-level group key prefix for the per-LoRA SINGLE membership listing.
+/// Unlike the other dimensions this listing is DERIVED read-only from the
+/// `images.loras` JSON (one key per LoRA file name) rather than stored in
+/// `group_key_l1`, so a stacked image appears in every LoRA folder it
+/// belongs to. Never persisted; `group_key_l1` keeps the set-based
+/// fingerprint untouched.
+pub const LORA_SINGLE_PREFIX: &str = "lora-single:";
+/// Sentinel bucket for images without any LoRA in the single listing.
+pub const LORA_SINGLE_UNKNOWN: &str = "(unknown)";
+
+pub fn lora_single_key(lora_name: &str) -> String {
+    format!("{}{}", LORA_SINGLE_PREFIX, lora_name)
+}
+
+/// Parse a per-LoRA view key back into the LoRA file name (or `None` for the
+/// unknown bucket).
+pub fn lora_single_name(key: &str) -> Option<&str> {
+    key.strip_prefix(LORA_SINGLE_PREFIX)
+        .filter(|n| !n.is_empty() && *n != LORA_SINGLE_UNKNOWN)
+}
+
+/// True when the key addresses the per-LoRA membership listing (either a
+/// real LoRA folder or the unknown bucket).
+pub fn is_lora_single_key(key: &str) -> bool {
+    key.starts_with(LORA_SINGLE_PREFIX)
+}
+
 pub struct GroupKeys {
     pub l0: String,
     pub l1: String,

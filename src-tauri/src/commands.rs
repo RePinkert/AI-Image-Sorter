@@ -738,6 +738,17 @@ pub fn recluster_l1(
     if !crate::grouper::DIMENSIONS.contains(&dimension.as_str()) {
         return Err(format!("未知的 Model偏差维度：{dimension}"));
     }
+    if dimension == "lora" {
+        // The lora dimension is a DERIVED per-single-LoRA membership view
+        // (json_each over the `loras` JSON). It neither rewrites
+        // group_key_l1 nor reclusters L2, so switching back to any other
+        // dimension is possible without data loss.
+        state.db
+            .set_model_deviation_dimensions(source_id, std::slice::from_ref(&dimension))
+            .map_err(|e| e.to_string())?;
+        let groups = state.db.list_groups(Some(source_id), 1).map_err(|e| e.to_string())?;
+        return Ok(groups.len());
+    }
     state.db.rehash_l1_for_source(source_id, &dimension)
         .map_err(|e| e.to_string())?;
     state.db
@@ -768,6 +779,64 @@ pub fn list_group_images(
     state
         .db
         .list_group_images(&group_key, level)
+        .map_err(|e| e.to_string())
+}
+
+/// Hide / un-hide every member image of an L2 (Prompt偏差) group in one
+/// action. Used by the expandable list view's ⊗ button.
+#[tauri::command(async)]
+pub fn hide_group_images(
+    source_id: i64,
+    group_key: String,
+    hidden: bool,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    state
+        .db
+        .set_group_hidden(2, &group_key, source_id, hidden)
+        .map_err(|e| e.to_string())
+}
+
+/// Shift+Delete semantics for a whole L2 group: send every member image to
+/// the OS recycle bin (recoverable from the desktop Recycle Bin) and remove
+/// its DB row. Returns how many images were deleted.
+#[tauri::command(async)]
+pub fn trash_group_images(
+    source_id: i64,
+    group_key: String,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let ids = state
+        .db
+        .image_ids_for_keys(2, &[group_key.clone()], Some(source_id))
+        .map_err(|e| e.to_string())?;
+    let mut deleted = 0usize;
+    for id in ids {
+        // trash_image is wrapped in a Tauri command; replicate its body here
+        // so one failure doesn't abort the remaining members.
+        match trash_one_image(&state.db, id) {
+            Ok(()) => deleted += 1,
+            Err(_) => continue,
+        }
+    }
+    Ok(deleted)
+}
+
+fn trash_one_image(db: &crate::db::Db, image_id: i64) -> Result<(), String> {
+    let abs = db
+        .image_abs_path(image_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "image row not found".to_string())?;
+    let native = if std::path::MAIN_SEPARATOR == '\\' {
+        abs.replace('/', "\\")
+    } else {
+        abs
+    };
+    let p = PathBuf::from(&native);
+    if p.exists() {
+        trash::delete(&p).map_err(|e| e.to_string())?;
+    }
+    db.delete_image_by_id(image_id)
         .map_err(|e| e.to_string())
 }
 

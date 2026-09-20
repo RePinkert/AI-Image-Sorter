@@ -90,6 +90,11 @@ interface AppState {
   syncProgress: SyncProgressState
   reviewSession: ReviewSession
   dataRevision: number
+  /** L2 (Prompt偏差) list-window presentation: cards (legacy) or expandable
+   *  rows. Cards stay the default so the rows experiment can be switched
+   *  off instantly if it regresses. */
+  l2ListView: boolean
+  setL2ListView: (on: boolean) => void
   setView: (v: View) => void
   setSources: (s: SourceRow[]) => void
   setCurrentSourceId: (id: number | null) => void
@@ -127,6 +132,8 @@ export const useStore = create<AppState>()(
       syncProgress: IDLE_SYNC_PROGRESS,
       reviewSession: EMPTY_REVIEW_SESSION,
       dataRevision: 0,
+      l2ListView: false,
+      setL2ListView: (on) => set({ l2ListView: on }),
       setView: (v) => set((s) => ({
         view: v,
         reviewSession: v === 'swipe' || v === 'arena'
@@ -185,6 +192,7 @@ export const useStore = create<AppState>()(
         l2Threshold: s.l2Threshold,
         keybindings: s.keybindings,
         reviewSession: s.reviewSession,
+        l2ListView: s.l2ListView,
       }),
     },
   ),

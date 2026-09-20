@@ -1378,6 +1378,16 @@ impl Db {
 
     pub fn list_groups(&self, source_id: Option<i64>, level: u8) -> Result<Vec<GroupInfo>> {
         let conn = self.0.lock().unwrap();
+        // The per-LoRA single-membership listing replaces the stored-key path
+        // when the wheel-selected dimension is `lora` under a concrete source
+        // (an unknown dimension for the "所有源" view keeps the stored
+        // fingerprint listing).
+        if level == 1 && source_id.is_some() {
+            let dimension = Self::get_source_dimension_locked(&conn, source_id.unwrap())?;
+            if dimension == "lora" {
+                return Self::list_lora_member_groups(&conn, source_id.unwrap());
+            }
+        }
         let key_col = match level {
             0 => "group_key_l0",
             1 => "group_key_l1",
@@ -1427,7 +1437,7 @@ impl Db {
         // Model facets only make sense at the workflow level.
         if level == 1 {
             for group in &mut out {
-                group.model_facets = self.model_facets_for_group(&conn, &group.group_key)?;
+                group.model_facets = Self::model_facets_for_group_inner(&conn, &group.group_key)?;
             }
             // Render the L1 model-parameter labels from the source's selected
             // dimension (only meaningful for a single-source view; group keys
@@ -1623,11 +1633,127 @@ impl Db {
         Ok(items.len())
     }
 
-    fn model_facets_for_group(
-        &self,
+    /// A json_each-based EXISTS condition matching images that carry the
+    /// LoRA named `?1`. Handles the empty/invalid `loras` JSON gracefully so
+    /// no row can error out mid-scan.
+    fn lora_member_by_name_cond() -> &'static str {
+        "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(COALESCE(i.loras,'')) THEN COALESCE(i.loras,'[]') ELSE '[]' END) je WHERE json_extract(je.value, '$.name') = ?1)"
+    }
+
+    /// Per-LoRA membership listing (L1 lora dimension): one group per LoRA
+    /// file name; an image with multiple LoRAs surfaces in EVERY folder it
+    /// belongs to. Carved read-only from the `loras` JSON — `group_key_l1`
+    /// stays untouched, so the stored set-based fingerprint and L2 clustering
+    /// are unaffected.
+    fn list_lora_member_groups(conn: &Connection, source_id: i64) -> Result<Vec<GroupInfo>> {
+        let unknown_key = crate::grouper::lora_single_key(crate::grouper::LORA_SINGLE_UNKNOWN);
+        let sql = format!(
+            "SELECT CASE
+                 WHEN je.value IS NOT NULL AND COALESCE(json_extract(je.value, '$.name'), '') <> ''
+                     THEN '{prefix}' || json_extract(je.value, '$.name')
+                 ELSE '{unknown}' END AS gk,
+             COUNT(*) c,
+             MIN(i.prompt_pos) pp,
+             MIN(i.checkpoint) ck,
+             MIN(i.source_kind) sk,
+             MIN(s.path) sp,
+             MIN(wt.name) wname
+             FROM images i JOIN sources s ON s.id=i.source_id
+             LEFT JOIN workflow_templates wt ON wt.id=i.workflow_template_id
+             LEFT JOIN json_each(CASE WHEN json_valid(COALESCE(i.loras,''))
+                 THEN COALESCE(i.loras,'[]') ELSE '[]' END) je
+             WHERE i.source_id=?1 AND i.hidden=0
+             GROUP BY gk ORDER BY c DESC, gk",
+            prefix = crate::grouper::LORA_SINGLE_PREFIX,
+            unknown = unknown_key
+        );
+        let mut out = Vec::new();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params![source_id], |r| {
+            Ok(GroupInfo {
+                group_key: r.get(0)?,
+                count: r.get(1)?,
+                prompt_pos: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                checkpoint: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                source_kind: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                source_path: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                workflow_name: r.get(6)?,
+                model_param: String::new(),
+                model_facets: Vec::new(),
+                manually_merged: false,
+                _l1_dm: String::new(),
+                _l1_text_encoder: String::new(),
+                _l1_vae: String::new(),
+                _l1_loras: String::new(),
+                _l1_controlnet: String::new(),
+            })
+        })?;
+        for r in rows {
+            let mut g = r?;
+            // The label IS the file name itself, straight from the key.
+            g.model_param = crate::grouper::lora_single_name(&g.group_key)
+                .map(str::to_string)
+                .unwrap_or_else(|| crate::grouper::LORA_SINGLE_UNKNOWN.to_string());
+            g.model_facets = Self::model_facets_for_group_inner(conn, &g.group_key)?;
+            out.push(g);
+        }
+        Ok(out)
+    }
+
+    /// Thumbnail paths for a per-LoRA membership folder (`name` = None → the
+    /// unknown bucket: images without any LoRA).
+    fn list_lora_member_thumbnails(&self, name: Option<&str>) -> Result<Vec<String>> {
+        let cond = match name {
+            Some(_) => Self::lora_member_by_name_cond().to_string(),
+            None => "NOT EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(COALESCE(i.loras,'')) THEN COALESCE(i.loras,'[]') ELSE '[]' END) je WHERE COALESCE(json_extract(je.value, '$.name'), '') <> '') AND ?1 IS NOT NULL".to_string(),
+        };
+        let conn = self.0.lock().unwrap();
+        let sql = format!(
+            "SELECT i.abs_path FROM images i WHERE i.hidden=0 AND {cond}
+             ORDER BY i.seed, i.filename LIMIT 4"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params![name.unwrap_or_default()],
+            |r| r.get::<_, String>(0),
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    fn model_facets_for_group_inner(
         conn: &Connection,
         group_key: &str,
     ) -> Result<Vec<ModelFacet>> {
+        if crate::grouper::is_lora_single_key(group_key) {
+            let mut stmt = conn.prepare(
+                "SELECT COALESCE(NULLIF(diffusion_model, ''), '(未知)') AS model, COUNT(*) c
+                 FROM images i
+                 WHERE i.hidden=0 AND EXISTS (
+                   SELECT 1 FROM json_each(CASE WHEN json_valid(COALESCE(i.loras,''))
+                       THEN COALESCE(i.loras,'[]') ELSE '[]' END) je
+                   WHERE json_extract(je.value, '$.name') = ?1
+                 )
+                 GROUP BY model ORDER BY c DESC",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![crate::grouper::lora_single_name(group_key).unwrap_or_default()],
+                |r| {
+                    Ok(ModelFacet {
+                        model: r.get(0)?,
+                        count: r.get(1)?,
+                    })
+                },
+            )?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            return Ok(out);
+        }
         let mut stmt = conn.prepare(
             "SELECT COALESCE(NULLIF(diffusion_model, ''), '(未知)') AS model, COUNT(*) c
              FROM images WHERE group_key_l1=?1 AND hidden=0
@@ -1655,6 +1781,9 @@ impl Db {
     /// the original files directly as the group preview, so no generated
     /// cache or image decoding is needed for the group list.
     pub fn list_group_thumbnail_paths(&self, group_key: &str, level: u8) -> Result<Vec<String>> {
+        if level == 1 && crate::grouper::is_lora_single_key(group_key) {
+            return self.list_lora_member_thumbnails(crate::grouper::lora_single_name(group_key));
+        }
         let conn = self.0.lock().unwrap();
         let key_col = match level {
             0 => "group_key_l0",
@@ -1694,18 +1823,35 @@ impl Db {
             2 => "group_key_l2",
             _ => "group_key_l3",
         };
-        let hidden_clause = if include_hidden { "" } else { "AND hidden=0" };
+        let hidden_clause = if include_hidden { "" } else { "AND i.hidden=0" };
+        // Per-LoRA membership key: match members via the `loras` JSON. The
+        // unknown bucket binds a dummy `?1 IS NOT NULL` so a single param
+        // vector works for both branches.
+        let (where_expr, param) = if level == 1 && crate::grouper::is_lora_single_key(group_key) {
+            match crate::grouper::lora_single_name(group_key) {
+                Some(name) => (
+                    Self::lora_member_by_name_cond().to_string(),
+                    name.to_string(),
+                ),
+                None => (
+                    "NOT EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(COALESCE(i.loras,'')) THEN COALESCE(i.loras,'[]') ELSE '[]' END) je WHERE COALESCE(json_extract(je.value, '$.name'), '') <> '') AND ?1 IS NOT NULL".to_string(),
+                    group_key.to_string(),
+                ),
+            }
+        } else {
+            (format!("i.{key_col}=?1"), group_key.to_string())
+        };
         let sql = format!(
             "SELECT i.id, i.source_id, i.abs_path, i.filename, i.width, i.height, i.prompt_pos, i.prompt_neg,
                     i.checkpoint, i.loras, i.vae, i.samplers, i.seed, i.meta_ok, i.source_kind, i.hidden, i.size,
                     i.modified_at, i.group_key_l1, COALESCE(NULLIF(i.diffusion_model, ''), ''), wt.name, b.kind
              FROM images i LEFT JOIN workflow_templates wt ON wt.id=i.workflow_template_id
              LEFT JOIN manual_group_bindings b ON b.level=2 AND b.image_id=i.id
-             WHERE i.{col}=?1 {hid} ORDER BY i.seed, i.filename",
-            col = key_col, hid = hidden_clause
+             WHERE {where_expr} {hid} ORDER BY i.seed, i.filename",
+            hid = hidden_clause
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params![group_key], |r| {
+        let rows = stmt.query_map(rusqlite::params![param], |r| {
             Ok(ImageRow {
                 id: r.get(0)?,
                 source_id: r.get(1)?,
@@ -1749,6 +1895,25 @@ impl Db {
             img.labels = self.labels_for(&conn, img.id)?;
         }
         Ok(out)
+    }
+
+    /// Batch show/hide for every member of an L2 group in one source.
+    /// Returns how many images changed. Hidden rows are excluded from group
+    /// counts, so hiding a whole group makes it disappear from the list view
+    /// without deleting anything (undoable from the folder view).
+    pub fn set_group_hidden(&self, level: u8, group_key: &str, source_id: i64, hidden: bool) -> Result<usize> {
+        let key_col = match level {
+            0 => "group_key_l0",
+            1 => "group_key_l1",
+            2 => "group_key_l2",
+            _ => "group_key_l3",
+        };
+        let conn = self.0.lock().unwrap();
+        let sql = format!(
+            "UPDATE images SET hidden=?2 WHERE {key_col}=?1 AND source_id=?3 AND hidden<>?2"
+        );
+        let changed = conn.execute(&sql, rusqlite::params![group_key, hidden as i64, source_id])?;
+        Ok(changed)
     }
 
     /// Look up the abs_path for an image (used by trash_image to find the
@@ -3365,6 +3530,125 @@ mod tests {
         let all = db.image_ids_for_keys(2, &["shared".to_string()], None).unwrap();
         assert_eq!(all.len(), 2);
         assert!(all.contains(&b));
+    }
+
+    #[test]
+    fn lora_single_member_view_groups_by_individual_lora() {
+        let db = open(std::path::Path::new(":memory:")).unwrap();
+        let src = db.upsert_source("C:\\imgs", "folder", None).unwrap();
+        let lora_json = |names: &[&str]| {
+            serde_json::to_string(
+                &names
+                    .iter()
+                    .map(|n| crate::metadata::LoraInfo {
+                        name: n.to_string(),
+                        strength: 1.0,
+                        clip_strength: None,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let make = |n: i64, loras: String| {
+            db.insert_image(&ImageInsert {
+                source_id: src,
+                rel_path: format!("{n}.png"),
+                abs_path: format!("C:\\imgs\\{n}.png"),
+                filename: format!("{n}.png"),
+                size: 100,
+                modified_at: 0,
+                width: 512,
+                height: 512,
+                prompt_pos: format!("prompt {n}"),
+                prompt_neg: String::new(),
+                checkpoint: "model".into(),
+                loras,
+                vae: String::new(),
+                samplers: String::new(),
+                seed: n,
+                steps: 20,
+                cfg: 7.0,
+                group_key_l0: "l0".into(),
+                group_key_l1: "setfingerprint".into(),
+                group_key_l2: "l2".into(),
+                group_key_l3: format!("l3-{n}"),
+                sha256: format!("sha{n}"),
+                meta_ok: true,
+                source_kind: "folder".into(),
+                diffusion_model: String::new(),
+                text_encoder: String::new(),
+                controlnet: String::new(),
+                model_chain_json: String::new(),
+                workflow_key: String::new(),
+                workflow_graph_json: String::new(),
+                workflow_template_id: None,
+                workflow_match_confidence: None,
+                generation_recipe_json: String::new(),
+                recipe_signature: String::new(),
+                parser_version: String::new(),
+            })
+            .unwrap()
+        };
+        // img1 = lora a only; img2 = stacked a + b; img3 = none.
+        let i1 = make(1, lora_json(&["a.safetensors"]));
+        let i2 = make(2, lora_json(&["b.safetensors", "a.safetensors"]));
+        let i3 = make(3, String::new());
+
+        db.set_model_deviation_dimensions(src, &["lora".to_string()]).unwrap();
+        let groups = db.list_groups(Some(src), 1).unwrap();
+        let by_key: std::collections::HashMap<String, i64> =
+            groups.iter().map(|g| (g.group_key.clone(), g.count)).collect();
+        assert_eq!(
+            by_key.get(&crate::grouper::lora_single_key("a.safetensors")),
+            Some(&2),
+            "stacked image joins the lora-a group too"
+        );
+        assert_eq!(
+            by_key.get(&crate::grouper::lora_single_key("b.safetensors")),
+            Some(&1)
+        );
+        assert_eq!(
+            by_key.get(&crate::grouper::lora_single_key(crate::grouper::LORA_SINGLE_UNKNOWN)),
+            Some(&1),
+            "images without loras land in the unknown bucket"
+        );
+        // The stored L1 must stay untouched by the derived view.
+        let conn = db.0.lock().unwrap();
+        let stored: String =
+            conn.query_row("SELECT group_key_l1 FROM images WHERE id=?1", rusqlite::params![i1], |r| r.get(0))
+                .unwrap();
+        drop(conn);
+        assert_eq!(stored, "setfingerprint");
+
+        let a_members = db
+            .list_group_images(&crate::grouper::lora_single_key("a.safetensors"), 1)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>();
+        assert_eq!(a_members, vec![i1, i2]);
+        let unknown_members = db
+            .list_group_images(&crate::grouper::lora_single_key(crate::grouper::LORA_SINGLE_UNKNOWN), 1)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>();
+        assert_eq!(unknown_members, vec![i3]);
+
+        // Hidden rows must leave the derived view's counts as well.
+        db.toggle_hidden_atomic(i2, true, None, None, None).unwrap();
+        let hidden_members = db
+            .list_group_images(&crate::grouper::lora_single_key("a.safetensors"), 1)
+            .unwrap();
+        assert_eq!(hidden_members.len(), 1, "hidden rows filtered from swipe view");
+        let hidden_counts = db.list_groups(Some(src), 1).unwrap();
+        let a_count: i64 = hidden_counts
+            .iter()
+            .find(|g| g.group_key == crate::grouper::lora_single_key("a.safetensors"))
+            .map(|g| g.count)
+            .unwrap_or(0);
+        assert_eq!(a_count, 1, "hidden rows excluded from member counts");
+        let _ = i2;
     }
 
     /// Operator utility: run the v16 (single-dimension L1) migration against
