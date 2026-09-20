@@ -7,21 +7,9 @@ import { getTelemetrySessionId, trackAction } from '../telemetry'
 import { Lightbox } from './Lightbox'
 import { Popover } from './Popover'
 import { ImageMetaPopover } from './ImageMetaPopover'
+import { pairKey, pickArenaPair } from '../lib/arenaPair'
 
-const ARENA_THRESHOLD = 5
-const RECENT_LIMIT = 20
-
-function pairKey(a: number, b: number) {
-  return a < b ? `${a}:${b}` : `${b}:${a}`
-}
-
-function pairAll(images: ImageRow[]): [ImageRow, ImageRow][] {
-  const result: [ImageRow, ImageRow][] = []
-  for (let i = 0; i < images.length; i += 1) {
-    for (let j = i + 1; j < images.length; j += 1) result.push([images[i], images[j]])
-  }
-  return result
-}
+const RECENT_BASE_LIMIT = 20
 
 function isEditableTarget(target: EventTarget | null) {
   return target instanceof HTMLElement && (
@@ -57,6 +45,8 @@ export function Arena() {
   const [rightPopoverOpen, setRightPopoverOpen] = useState(false)
   const [pendingHide, setPendingHide] = useState(false)
   const recent = useRef<Set<string>>(new Set())
+  const lastShownRound = useRef<Record<number, number>>({})
+  const roundCounter = useRef(0)
   const loadRequestRef = useRef(0)
   const actionRequestRef = useRef(0)
   const actionInFlightRef = useRef(false)
@@ -65,30 +55,45 @@ export function Arena() {
   const startedAtRef = useRef(new Date().toISOString())
   const bothOpen = leftPopoverOpen && rightPopoverOpen
 
+  const markShown = useCallback((l: ImageRow, r: ImageRow) => {
+    roundCounter.current += 1
+    lastShownRound.current[l.id] = roundCounter.current
+    lastShownRound.current[r.id] = roundCounter.current
+    recent.current.add(pairKey(l.id, r.id))
+    // Strict LRU: drop the OLDEST insertion so capacity N pairs of pairs
+    // covers recent history, instead of blanket-killing half the memory.
+    const capacity = Math.max(RECENT_BASE_LIMIT, 2 * Math.max(1, recent.current.size))
+    const keys = Array.from(recent.current)
+    let overflow = keys.length - capacity
+    while (overflow > 0) {
+      const oldest = keys.shift()
+      if (oldest === undefined) break
+      recent.current.delete(oldest)
+      overflow -= 1
+    }
+  }, [])
+
   const selectPair = useCallback((nextImages: ImageRow[], nextScores: Record<number, number>) => {
-    const closePairs = pairAll(nextImages).filter(([a, b]) =>
-      Math.abs((nextScores[a.id] ?? 50) - (nextScores[b.id] ?? 50)) < ARENA_THRESHOLD,
-    )
-    const pool = closePairs.length > 0 ? closePairs : pairAll(nextImages)
-    const fresh = pool.filter(([a, b]) => !recent.current.has(pairKey(a.id, b.id)))
-    const choices = fresh.length > 0 ? fresh : pool
-    if (choices.length === 0) {
+    const pick = pickArenaPair({
+      images: nextImages,
+      scores: nextScores,
+      recentPairs: recent.current,
+      lastShownRound: lastShownRound.current,
+      round: roundCounter.current,
+    })
+    if (!pick) {
       setLeft(null)
       setRight(null)
       updateReviewSession({ arenaPair: null })
       return
     }
-    const [nextLeft, nextRight] = choices[Math.floor(Math.random() * choices.length)]
-    recent.current.add(pairKey(nextLeft.id, nextRight.id))
-    if (recent.current.size > RECENT_LIMIT) {
-      const entries = Array.from(recent.current)
-      recent.current = new Set(entries.slice(Math.floor(entries.length / 2)))
-    }
+    const [nextLeft, nextRight] = pick
+    markShown(nextLeft, nextRight)
     setLeft(nextLeft)
     setRight(nextRight)
     startedAtRef.current = new Date().toISOString()
     updateReviewSession({ arenaPair: [nextLeft.id, nextRight.id] })
-  }, [updateReviewSession])
+  }, [updateReviewSession, markShown])
 
   const load = useCallback(async () => {
     if (currentGroupKey == null) return
@@ -121,7 +126,7 @@ export function Arena() {
       if (restoredLeft && restoredRight && restoredLeft.id !== restoredRight.id) {
         setLeft(restoredLeft)
         setRight(restoredRight)
-        recent.current.add(pairKey(restoredLeft.id, restoredRight.id))
+        markShown(restoredLeft, restoredRight)
         startedAtRef.current = new Date().toISOString()
       } else {
         selectPair(loaded, nextScores)
@@ -132,7 +137,7 @@ export function Arena() {
       setLoadError(errorMessage(error))
       setStatus('error')
     }
-  }, [currentGroupKey, granularity, selectPair, updateReviewSession])
+  }, [currentGroupKey, granularity, markShown, selectPair, updateReviewSession])
 
   useEffect(() => {
     void load()
@@ -289,7 +294,7 @@ export function Arena() {
         if (restoredLeft && restoredRight && restoredLeft.id !== restoredRight.id) {
           setLeft(restoredLeft)
           setRight(restoredRight)
-          recent.current.add(pairKey(restoredLeft.id, restoredRight.id))
+          markShown(restoredLeft, restoredRight)
           startedAtRef.current = new Date().toISOString()
           updateReviewSession({ arenaPair: [restoredLeft.id, restoredRight.id] })
         } else {

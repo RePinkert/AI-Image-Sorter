@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{Emitter, Manager, State};
+use tauri::{Emitter, State};
 
 pub struct AppState {
     pub db: Arc<crate::db::Db>,
@@ -1573,14 +1573,8 @@ pub fn export_diagnostics(state: State<'_, AppState>) -> Result<serde_json::Valu
 
 #[tauri::command]
 pub fn db_path(app: tauri::AppHandle) -> String {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "app_data".to_string());
-    let _ = std::fs::create_dir_all(&dir);
-    PathBuf::from(&dir)
-        .join("ai-image-sorter.db")
+    let dir = crate::paths::data_root(&app);
+    dir.join("ai-image-sorter.db")
         .to_string_lossy()
         .to_string()
 }

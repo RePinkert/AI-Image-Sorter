@@ -1,5 +1,7 @@
 # AI Image Sorter
 
+English | [简体中文](README-zh.md)
+
 AI Image Sorter is a local-first desktop application for organizing and reviewing AI-generated images. It is built for image libraries produced by ComfyUI and compatible generators, with generation metadata kept alongside the images in a local SQLite database.
 
 ## Features
@@ -12,7 +14,7 @@ AI Image Sorter is a local-first desktop application for organizing and reviewin
 - Hide, label, archive, move, merge, split, and undo image actions
 - Incrementally rescan registered folders in the background
 - Export image data as CSV/JSON and export redacted diagnostics
-- Store application data locally; telemetry is disabled unless enabled in Settings
+- Store application data locally; coarse app events stay in the local database only — no data ever leaves the machine
 
 ## Status
 
@@ -24,6 +26,21 @@ Download the Windows installer from the [Releases](https://github.com/RePinkert/
 
 The application does not upload or modify source images during indexing. Image files remain in their original folders unless an explicit archive, move, or recycle-bin action is requested.
 
+### Portable use
+
+The build in `Release` is a standalone `.exe` — you can run it directly, no installation required. Everything (database and logs) can be kept in the same place as the software:
+
+1. Place `AI-Image-Sorter.exe` anywhere on the machine (such as a local disk partition or a USB flash drive).
+2. Create an empty file `ai-image-sorter.portable` with the same name next to the `.exe` file.
+3. Launch the `.exe`; portable mode routes all app data through the `data\` directory next to the `.exe`:
+   - `data\ai-image-sorter.db` — SQLite database
+   - `data\logs\` — run logs
+   - WebView2 profile — kept at the OS default location while running, **wiped automatically on exit**
+
+Each normal exit erases the WebView2 profile (cache, cookies, browser state) from the host's AppData, while the database and logs stay on the drive beside the application — exactly the portable design: data travels with the software, and the host keeps no traces of it. To uninstall, just delete the `.exe` and `data\`; no directory belonging to this software remains in system AppData. (If a crash preempts the cleanup, only the WebView2 cache survives on the host; the next normal exit removes it.)
+
+Delete the `ai-image-sorter.portable` file to revert to the default application mode: data is written to the system application data directory (`%APPDATA%\com.aiimagesorter.app`).
+
 ## Usage
 
 1. Launch the application.
@@ -31,7 +48,7 @@ The application does not upload or modify source images during indexing. Image f
 3. Let the initial scan finish. Registered folders are checked incrementally while the application is open.
 4. Select a grouping level, then review images using swipe or arena mode.
 
-The local database is stored in the platform-specific Tauri application data directory. It contains indexes, scores, labels, recipes, and optional local telemetry, but not copied image files.
+The local database is stored in the platform-specific Tauri application data directory. It contains indexes, scores, labels, recipes, and local telemetry events, but not copied image files.
 
 ## Development
 
@@ -57,7 +74,7 @@ Some integration tests use a developer-local ComfyUI image directory and are not
 
 ## Privacy
 
-The application is local-first. Optional telemetry records coarse application events for debugging and product improvement. It does not intentionally record prompts, image pixels, source paths, or other image contents. Telemetry can be disabled in Settings, and redacted diagnostics can be exported from the same panel.
+The application is local-first. Coarse application events are recorded for debugging and product improvement, and they stay in the local database — the app has no networking at all. Events do not intentionally include prompts, image pixels, source paths, or other image contents. Recording can be disabled in Settings, and redacted diagnostics can be exported from the same panel.
 
 ## Contributing
 
