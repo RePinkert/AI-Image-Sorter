@@ -8,9 +8,13 @@ import {
   hideGroupImages,
   listGroupImages,
   listGroups,
+  listMoveTargets,
   mergeGroups,
+  moveImagesToGroup,
   reclusterL1,
-  trashGroupImages,
+  splitImages,
+  toggleHiddenAction,
+  trashImage,
 } from '../api'
 import type {
   Granularity,
@@ -91,7 +95,21 @@ function LazyGroupThumb({ groupKey, level }: { groupKey: string; level: Granular
 
 const groupImagesCache = new Map<string, Promise<ImageRow[]>>()
 
-function LazyRowImages({ groupKey, level }: { groupKey: string; level: Granularity }) {
+function LazyRowImages({
+  groupKey,
+  level,
+  selected,
+  onToggleSelect,
+  reloadToken,
+}: {
+  groupKey: string
+  level: Granularity
+  /** Selected image ids (scoped to this row). */
+  selected: Set<number>
+  onToggleSelect: (id: number) => void
+  /** Bumped by the parent after a row mutation so cached rows refetch. */
+  reloadToken: number
+}) {
   const cacheKey = `${level}:${groupKey}`
   const hostRef = useRef<HTMLDivElement | null>(null)
   const [images, setImages] = useState<ImageRow[]>([])
@@ -135,22 +153,41 @@ function LazyRowImages({ groupKey, level }: { groupKey: string; level: Granulari
     }
   }, [cacheKey, groupKey, level, loaded, visible])
 
+  // A fresh reloadToken invalidates the (now stale) cached promise.
+  useEffect(() => {
+    if (reloadToken === 0) return
+    groupImagesCache.delete(cacheKey)
+    setLoaded(false)
+    setImages([])
+    setVisible(false)
+    // Re-arm the observer immediately if the strip is already on screen.
+    const el = hostRef.current
+    if (el) setVisible(true)
+  }, [reloadToken, cacheKey])
+
   if (!loaded) {
     return <div className="row-image-strip" ref={hostRef}><div className="thumb-placeholder" /></div>
   }
   return (
     <div className="row-image-strip">
       {images.map((img) => (
-        <img
+        <button
           key={img.id}
-          className={img.hidden ? 'row-img hidden-img' : 'row-img'}
-          src={assetUrl(img.abs_path)}
-          alt={img.filename}
-          draggable={false}
-          loading="lazy"
-          decoding="async"
-          title={img.prompt_pos.slice(0, 160)}
-        />
+          type="button"
+          className={`row-img-wrap ${selected.has(img.id) ? 'row-img-selected' : ''}`}
+          title={`${img.filename}${img.hidden ? '（已屏蔽）' : ''} — 点击选择`}
+          onClick={() => onToggleSelect(img.id)}
+        >
+          <img
+            className={img.hidden ? 'row-img hidden-img' : 'row-img'}
+            src={assetUrl(img.abs_path)}
+            alt={img.filename}
+            draggable={false}
+            loading="lazy"
+            decoding="async"
+          />
+          {selected.has(img.id) && <span className="row-img-check">✓</span>}
+        </button>
       ))}
     </div>
   )
@@ -376,6 +413,43 @@ export function GroupList() {
   const [listFocusKey, setListFocusKey] = useState<string | null>(null)
   const [rowActionMsg, setRowActionMsg] = useState<string | null>(null)
   const [rowActionBusy, setRowActionBusy] = useState(false)
+  /** Per-row selected image ids — when non-empty, the row's ⇆/⊗/🗑 buttons
+   *  act on the SELECTION instead of the whole group. */
+  const [rowSelections, setRowSelections] = useState<Record<string, number[]>>({})
+  /** Bumped after each row mutation so the inline strip refetches. */
+  const [rowImagesToken, setRowImagesToken] = useState<Record<string, number>>({})
+  /** Pending migration request (whole-group or selected images). */
+  const [moveRequest, setMoveRequest] = useState<{
+    rowKey: string
+    label: string
+    imageIds: number[]
+  } | null>(null)
+  const [moveTargets, setMoveTargets] = useState<GroupInfo[] | null>(null)
+  const [moveBusy, setMoveBusy] = useState(false)
+
+  function selectionOf(key: string): number[] {
+    return rowSelections[key] ?? []
+  }
+
+  function toggleRowImageSelect(rowKey: string, id: number) {
+    setRowSelections((prev) => {
+      const cur = prev[rowKey] ?? []
+      const next = cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]
+      return { ...prev, [rowKey]: next }
+    })
+  }
+
+  function clearRowSelection(rowKey: string) {
+    setRowSelections((prev) => {
+      const next = { ...prev }
+      delete next[rowKey]
+      return next
+    })
+  }
+
+  function bumpRowImages(rowKey: string) {
+    setRowImagesToken((prev) => ({ ...prev, [rowKey]: (prev[rowKey] ?? 0) + 1 }))
+  }
 
   function toggleRowOpen(key: string) {
     setListFocusKey(key)
@@ -387,85 +461,142 @@ export function GroupList() {
     })
   }
 
-  function switchFocusRow(delta: number) {
-    if (groups.length === 0) return
-    const idx = groups.findIndex((g) => g.group_key === listFocusKey)
-    const nextIdx =
-      idx === -1
-        ? delta > 0
-          ? 0
-          : groups.length - 1
-        : (idx + delta + groups.length) % groups.length
-    setListFocusKey(groups[nextIdx].group_key)
+  /** Member ids for the current, matching the SAME source scoping the group
+   *  list used. list_group_images is global (keys are shared across
+   *  sources); filter by source for safety. */
+  async function memberIdsOf(rowKey: string): Promise<number[]> {
+    const rows = await listGroupImages(rowKey, granularity)
+    return rows
+      .filter((r) => currentSourceId == null || r.source_id === currentSourceId)
+      .map((r) => r.id)
   }
 
-  // Arrow-key focus switching in the expandable list view; ignored while a
-  // text field has focus so prompt search / edit inputs stay usable.
-  useEffect(() => {
-    if (!listMode) return
-    const handler = (event: KeyboardEvent) => {
-      const target = event.target
-      const tag = target instanceof HTMLElement ? target.tagName : ''
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
-      if (event.key === 'ArrowLeft') {
-        event.preventDefault()
-        switchFocusRow(-1)
-      } else if (event.key === 'ArrowRight') {
-        event.preventDefault()
-        switchFocusRow(1)
-      }
-    }
-    window.addEventListener('keydown', handler)
-    return () => window.removeEventListener('keydown', handler)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [listMode])
-
-  async function hideRowGroup(g: GroupInfo) {
-    setRowActionBusy(true)
-    setRowActionMsg(null)
-    try {
-      const hidden = await hideGroupImages(currentSourceId!, g.group_key, true)
-      setRowActionMsg(`已整组隐藏 ${hidden} 张 — 可在文件夹视角撤销`)
-      setOpenRowKeys((prev) => {
-        const next = new Set(prev)
-        next.delete(g.group_key)
-        return next
-      })
-      await reloadGroupsAtLevel()
-    } catch (e) {
-      setRowActionMsg(`整组隐藏失败：${errorMessage(e)}`)
-    } finally {
-      setRowActionBusy(false)
-    }
-  }
-
-  async function deleteRowGroup(g: GroupInfo) {
-    const currentSource = currentSourceId
-    if (currentSource == null) {
-      setRowActionMsg('请先在顶部选择具体来源目录，再执行整组删除')
+  async function openMoveDialog(rowKey: string) {
+    if (currentSourceId == null) {
+      setRowActionMsg('请先在顶部选择具体来源目录，再执行迁移')
       return
     }
     setRowActionBusy(true)
     setRowActionMsg(null)
     try {
-      const ok = await confirmAction(
-        `删除这 ${g.count} 张图片？`,
-        `${displayLabel(g)} 的全部成员将被移入系统回收站并从库中移除；删除图片后可在文件回收站恢复文件。`,
-      )
-      if (!ok) return
-      const deleted = await trashGroupImages(currentSource, g.group_key)
-      setRowActionMsg(`已删除 ${deleted} 张（回收站可恢复文件）`)
-      setOpenRowKeys((prev) => {
-        const next = new Set(prev)
-        next.delete(g.group_key)
-        return next
+      const group = groups.find((g) => g.group_key === rowKey)
+      const ids = selectionOf(rowKey).length > 0
+        ? selectionOf(rowKey)
+        : await memberIdsOf(rowKey)
+      if (ids.length === 0) {
+        setRowActionMsg('该组没有可迁移的成员')
+        return
+      }
+      const targets = await listMoveTargets(currentSourceId, rowKey)
+      setMoveRequest({
+        rowKey,
+        label: group ? displayLabel(group) : rowKey,
+        imageIds: ids,
       })
-      await reloadGroupsAtLevel()
+      setMoveTargets(targets)
     } catch (e) {
-      setRowActionMsg(`整组删除失败：${errorMessage(e)}`)
+      setRowActionMsg(`加载迁移目标失败：${errorMessage(e)}`)
     } finally {
       setRowActionBusy(false)
     }
+  }
+
+  function closeMoveDialog() {
+    setMoveRequest(null)
+    setMoveTargets(null)
+  }
+
+  async function moveConfirmed(targetKey: string | null) {
+    if (!moveRequest || moveBusy) return
+    setMoveBusy(true)
+    try {
+      const r = targetKey == null
+        ? // "新建分组": split out into its own independent group (manual
+          // pin, so re-clustering keeps it apart).
+          await splitImages(2, moveRequest.imageIds)
+        : await moveImagesToGroup(moveRequest.imageIds, targetKey)
+      const targetLabel = targetKey == null ? '新分组' : '目标组'
+      setRowActionMsg(`已迁移 ${r.moved} 张 → ${targetLabel}`)
+      clearRowSelection(moveRequest.rowKey)
+      bumpRowImages(moveRequest.rowKey)
+      closeMoveDialog()
+      await reloadGroupsAtLevel()
+    } catch (e) {
+      setRowActionMsg(`迁移失败：${errorMessage(e)}`)
+    } finally {
+      setMoveBusy(false)
+    }
+  }
+
+  async function hideRowScope(g: GroupInfo) {
+    const ids = selectionOf(g.group_key)
+    if (currentSourceId == null) {
+      setRowActionMsg('请先在顶部选择具体来源目录，再执行屏蔽')
+      return
+    }
+    setRowActionBusy(true)
+    setRowActionMsg(null)
+    try {
+      if (ids.length > 0) {
+        for (const id of ids) {
+          await toggleHiddenAction(id, true)
+        }
+        setRowActionMsg(`已隐藏所选 ${ids.length} 张 — 可在文件夹视角撤销`)
+        clearRowSelection(g.group_key)
+        bumpRowImages(g.group_key)
+      } else {
+        const hiddenCount = await hideGroupImages(currentSourceId, g.group_key, true)
+        setRowActionMsg(`已整组隐藏 ${hiddenCount} 张 — 可在文件夹视角撤销`)
+      }
+      await reloadGroupsAtLevel()
+    } catch (e) {
+      setRowActionMsg(`屏蔽失败：${errorMessage(e)}`)
+    } finally {
+      setRowActionBusy(false)
+    }
+  }
+
+  async function deleteRowScope(g: GroupInfo) {
+    const ids = selectionOf(g.group_key)
+    const currentSource = currentSourceId
+    if (currentSource == null) {
+      setRowActionMsg('请先在顶部选择具体来源目录，再执行删除')
+      return
+    }
+    setRowActionBusy(true)
+    setRowActionMsg(null)
+    try {
+      const targetLabel = ids.length > 0
+        ? `所选 ${ids.length} 张`
+        : `${dangerGuardLabel(g)} 全部 ${g.count} 张`
+      const ok = await confirmAction(
+        `删除 ${targetLabel}图片？`,
+        '所选图片将被移入系统回收站并从库中移除；文件可从桌面回收站恢复。',
+      )
+      if (!ok) return
+      const doomed = ids.length > 0 ? ids : await memberIdsOf(g.group_key)
+      let deleted = 0
+      for (const id of doomed) {
+        try {
+          await trashImage(id)
+          deleted += 1
+        } catch {
+          // One failure doesn't abort the rest of the batch.
+        }
+      }
+      setRowActionMsg(`已删除 ${deleted} 张（回收站可恢复文件）`)
+      clearRowSelection(g.group_key)
+      bumpRowImages(g.group_key)
+      await reloadGroupsAtLevel()
+    } catch (e) {
+      setRowActionMsg(`删除失败：${errorMessage(e)}`)
+    } finally {
+      setRowActionBusy(false)
+    }
+  }
+
+  function dangerGuardLabel(g: GroupInfo): string {
+    return `「${displayLabel(g)}」`
   }
 
   return (
@@ -643,6 +774,8 @@ export function GroupList() {
           {groups.map((g) => {
             const open = openRowKeys.has(g.group_key)
             const focused = listFocusKey === g.group_key
+            const selN = selectionOf(g.group_key).length
+            const rowSel = openRowKeys.has(g.group_key) ? selectionOf(g.group_key) : []
             return (
               <div
                 key={g.group_key}
@@ -689,30 +822,35 @@ export function GroupList() {
                     {g.manually_merged && <span className="merged-badge" title="该组为手动合并结果，自动重聚类不会拆开">已手动合并</span>}
                   </div>
                   <div className="group-row-actions">
+                    <span className={`row-selection-badge ${selN > 0 ? 'has-sel' : ''}`}>
+                      {selN > 0 ? `已选 ${selN} 张 · 按钮作用于所选` : '未选图片 · 按钮作用于整组'}
+                      {selN > 0 && (
+                        <button
+                          type="button"
+                          className="row-action row-clear"
+                          disabled={rowActionBusy}
+                          title="清除图片选择（回到整组操作）"
+                          onClick={() => clearRowSelection(g.group_key)}
+                        >
+                          ✕
+                        </button>
+                      )}
+                    </span>
                     <button
                       type="button"
                       className="row-action"
                       disabled={rowActionBusy}
-                      title="切换到上一组（焦点移动，便于整组合并 / 移出）"
-                      onClick={() => switchFocusRow(-1)}
+                      title={selN > 0 ? `迁移所选 ${selN} 张到其他组或新建分组` : '整组迁移到其他组或新建分组'}
+                      onClick={() => void openMoveDialog(g.group_key)}
                     >
-                      ◀
-                    </button>
-                    <button
-                      type="button"
-                      className="row-action"
-                      disabled={rowActionBusy}
-                      title="切换到下一组（焦点移动，便于整组合并 / 移出）"
-                      onClick={() => switchFocusRow(1)}
-                    >
-                      ▶
+                      ⇆
                     </button>
                     <button
                       type="button"
                       className="row-action"
                       disabled={rowActionBusy || currentSourceId == null}
-                      title="整组隐藏（可在文件夹视角撤销）"
-                      onClick={() => void hideRowGroup(g)}
+                      title={selN > 0 ? `屏蔽所选 ${selN} 张（可在文件夹视角撤销）` : '整组隐藏（可在文件夹视角撤销）'}
+                      onClick={() => void hideRowScope(g)}
                     >
                       ⊗
                     </button>
@@ -720,8 +858,8 @@ export function GroupList() {
                       type="button"
                       className="row-action row-action-danger"
                       disabled={rowActionBusy || currentSourceId == null}
-                      title="整组删除：全体成员移入系统回收站（Shift+Delete 语义）"
-                      onClick={() => void deleteRowGroup(g)}
+                      title={selN > 0 ? `删除所选 ${selN} 张：移入系统回收站（Shift+Delete 语义）` : '整组删除：全体成员移入系统回收站（Shift+Delete 语义）'}
+                      onClick={() => void deleteRowScope(g)}
                     >
                       🗑
                     </button>
@@ -729,11 +867,17 @@ export function GroupList() {
                 </div>
                 {open && !mergeMode && (
                   <div className="group-row-body">
-                    <LazyRowImages groupKey={g.group_key} level={granularity} />
+                    <LazyRowImages
+                      groupKey={g.group_key}
+                      level={granularity}
+                      selected={new Set(rowSel)}
+                      onToggleSelect={(id) => toggleRowImageSelect(g.group_key, id)}
+                      reloadToken={rowImagesToken[g.group_key] ?? 0}
+                    />
                     <div className="row-open-hint">
                       {currentSourceId == null
                         ? '请先在顶部选择具体来源目录，再使用组按钮操作'
-                        : '← → 键快速切换焦点组；⊗ 整组隐藏、🗑 整组删除（回收站）'}
+                        : '点击图片多选；选中后 ⇆ ⊗ 🗑 作用于所选图片，否则作用于整组'}
                     </div>
                   </div>
                 )}
@@ -742,6 +886,63 @@ export function GroupList() {
           })}
         </div>
       )}
+      <AnimatePresence>
+        {moveRequest && (
+          <motion.div
+            className="merge-confirm-overlay"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={closeMoveDialog}
+          >
+            <motion.div
+              className="merge-confirm"
+              role="dialog"
+              aria-modal="true"
+              aria-label="迁移图片"
+              initial={{ opacity: 0, scale: 0.92, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.94, y: 6 }}
+              transition={{ type: 'spring', stiffness: 320, damping: 28 }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h3>迁移 {moveRequest.imageIds.length} 张图片</h3>
+              <p className="muted">来源：{moveRequest.label || '(无标签组)'}。迁移后自动重聚类不会拆开；目标可以是现有组，或新建一个分组。</p>
+              <div className="move-target-picker">
+                <button
+                  type="button"
+                  className="move-target new-group"
+                  disabled={moveBusy}
+                  onClick={() => void moveConfirmed(null)}
+                  title="为所选图片新建一个独立分组（移出成新组）"
+                >
+                  ➕ 新建分组
+                </button>
+                {(moveTargets ?? []).map((t) => (
+                  <button
+                    type="button"
+                    key={t.group_key}
+                    className="move-target"
+                    disabled={moveBusy}
+                    title={t.prompt_pos.slice(0, 200)}
+                    onClick={() => void moveConfirmed(t.group_key)}
+                  >
+                    <LazyGroupThumb groupKey={t.group_key} level={granularity} />
+                    <span className="group-count-badge">{t.count}</span>
+                    <span className="group-prompt">{t.prompt_pos.slice(0, 120) || '(无 prompt)'}</span>
+                  </button>
+                ))}
+                {moveTargets != null && moveTargets.length === 0 && (
+                  <p className="muted">同来源下暂无其他组 — 可选择新建分组。</p>
+                )}
+              </div>
+              <div className="row">
+                <button type="button" className="ghost" disabled={moveBusy} onClick={closeMoveDialog}>取消</button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
       <AnimatePresence>
         {confirmGroups && confirmGroups.length > 0 && (
           <motion.div
