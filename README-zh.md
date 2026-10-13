@@ -22,13 +22,11 @@ AI Image Sorter 是一款本地优先（local-first）的桌面应用，用于�
 
 ## 安装
 
-从 [Releases](https://github.com/RePinkert/AI-Image-Sorter/releases) 页面下载 Windows 安装包。NSIS 安装器与 MSI 包均由 Tauri release 构建生成。
+从 [Releases](https://github.com/RePinkert/AI-Image-Sorter/releases) 页面下载便携版 `AI-Image-Sorter.exe`。发布包仅提供这一个免安装的独立 exe，不提供 NSIS/MSI 安装器。
 
 应用在建立索引时不会上传或修改源图像。归档是把图片复制到目标文件夹，组间移动只改变分组归属，不触碰磁盘文件；只有送入回收站才会把文件移出原目录。
 
 ### 便携使用
-
-> **注意**：`ai-image-sorter.portable` 标记机制不在 v0.2.0 发布包中（该包会忽略标记文件）。v0.2.0 的独立 `.exe` 免安装即可运行，数据固定写入 `%APPDATA%\com.aiimagesorter.app`。下文步骤 2–3 适用于包含便携数据路径的更新构建。
 
 Release 构建产物是独立的 `.exe`，无需安装即可直接运行。所有数据（数据库、日志等）都可以跟随软件本体存放：
 
