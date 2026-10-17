@@ -685,7 +685,15 @@ export function GroupList() {
           <button type="button" onClick={() => void loadGroups(currentSourceId, granularity)}>重试</button>
         </div>
       )}
-      {!loadingGroups && !groupError && groups.length === 0 && <p className="muted">暂无分组，请先导入。</p>}
+      {!loadingGroups && !groupError && groups.length === 0 && (
+        <div className="empty-groups">
+          <p className="empty-groups-title">暂无分组</p>
+          <p className="muted">选择来源目录并扫描后，图片会按 prompt 自动聚类成组。</p>
+          <button type="button" className="btn-secondary" onClick={() => setView('import')}>
+            去导入来源目录
+          </button>
+        </div>
+      )}
       {syncing && (
         <p className="sync-warn">扫描进行中，分组数据可能不完整。</p>
       )}
@@ -739,9 +747,12 @@ export function GroupList() {
                 </span>
               )}
               <div className="group-meta">
-                {granularity === 1 && currentSourceId != null
-                  ? `${MODEL_DEVIATION_DIMENSION_LABELS[l1Dimension]} · ${g.checkpoint || '—'} · ${g.source_kind}`
-                  : `${g.checkpoint || '—'} · ${g.source_kind}`}
+                {/* source_kind 全库恒为 'comfy'，单独展示是冗余（规则05），删去。 */}
+                <span className="group-meta-text">
+                  {granularity === 1 && currentSourceId != null
+                    ? `${MODEL_DEVIATION_DIMENSION_LABELS[l1Dimension]} · ${g.checkpoint || '—'}`
+                    : (g.checkpoint || '—')}
+                </span>
                 <button
                   type="button"
                   className="folder-link"
@@ -861,7 +872,16 @@ export function GroupList() {
                       title={selN > 0 ? `删除所选 ${selN} 张：移入系统回收站（Shift+Delete 语义）` : '整组删除：全体成员移入系统回收站（Shift+Delete 语义）'}
                       onClick={() => void deleteRowScope(g)}
                     >
-                      🗑
+                      <svg viewBox="0 0 12 12" width="10" height="10" aria-hidden="true" focusable="false" className="icon-glyph">
+                        <path
+                          d="M1.5 3h9 M4.5 3V1.8h3V3 M2.8 3.2l.5 7.3h5.4l.5-7.3 M5 5v4 M7 5v4"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.1"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        />
+                      </svg>
                     </button>
                   </div>
                 </div>
@@ -877,7 +897,7 @@ export function GroupList() {
                     <div className="row-open-hint">
                       {currentSourceId == null
                         ? '请先在顶部选择具体来源目录，再使用组按钮操作'
-                        : '点击图片多选；选中后 ⇆ ⊗ 🗑 作用于所选图片，否则作用于整组'}
+                        : '点击图片多选；选中后 ⇆ ⊗ 删除按钮作用于所选图片，否则作用于整组'}
                     </div>
                   </div>
                 )}
