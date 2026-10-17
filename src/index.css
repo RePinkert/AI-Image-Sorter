@@ -64,6 +64,15 @@
   --good-100: #1f2e22; --good-500: #81c784; /* 对 n-3 = 6.67 ✓ */
   --bad-100: #33222a; --bad-500: #e88a8a; /* 对 n-3 = 5.39 ✓ */
   --warn-100: #33291a; --warn-500: #ffb74d; /* 对 n-3 = 7.76 ✓ */
+  /* 深色实底：配反白文字才达 AA。实测 #fff on --bad-500 仅 2.49、on --accent 仅 3.07，
+     二者都不可用作实底 —— 这两个色标是浅色。 */
+  --bad-700: #9e3535; /* 白字 6.97:1 ✓ */
+  --accent-700: #4a6ae0; /* 白字 4.74:1 ✓ */
+
+  /* 绝对墨色。图片 letterbox 衬底必须是纯黑（任何灰调都会在黑边上显出痕迹）；
+     彩色实底上的文字必须是纯白。这两个是「材质」而非「主题色」，故不入中性色阶。 */
+  --n-pure: #000000;
+  --ink-inverse: #ffffff;
 
   /* 圆角（规则01：13 种收敛为 3 档 + 药丸） */
   --r-card: 10px;
@@ -223,7 +232,6 @@ body,
 }
 .merge-confirm {
   background: var(--panel);
-  border: 1px solid var(--border);
   border-radius: var(--r-card);
   padding: 18px 20px;
   max-width: min(720px, 94vw);
@@ -241,7 +249,6 @@ body,
   margin: 14px 0;
 }
 .merge-confirm-group {
-  border: 1px solid var(--border);
   border-radius: var(--r-card);
   padding: 8px;
   background: color-mix(in srgb, var(--panel) 60%, transparent);
@@ -343,7 +350,7 @@ h2 {
   /* 对比度修正：#fff on --accent(#6c8cff) 仅 3.07:1，远未达 AA。
      --accent-700 配白字为 4.74:1 ✓，且比霓虹蓝更克制。 */
   background: var(--accent-700);
-  color: #fff;
+  color: var(--ink-inverse);
 }
 .granularity-bar button.gran-active:hover:not(:disabled) {
   background: color-mix(in srgb, var(--accent-700) 86%, white);
@@ -386,7 +393,7 @@ button:hover:not(:disabled) {
   background: var(--n-4);
 }
 button:hover:not(:disabled) {
-  background: #383846;
+  background: var(--n-4);
 }
 button:disabled {
   opacity: 0.5;
@@ -428,6 +435,10 @@ select {
 .source-list .origin {
   color: var(--muted);
   font-size: 11px;
+  /* 承载「N 节点 · 模型A, 模型B, 模型C」——多个不可断词根。flex 行内不设
+     min-width:0 会被最长文件名撑破。 */
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .msg {
@@ -509,7 +520,7 @@ select {
   aspect-ratio: 1;
   border-radius: var(--r-control);
   overflow: hidden;
-  background: #000;
+  background: var(--n-pure);
 }
 .group-thumb img {
   width: 100%;
@@ -524,7 +535,7 @@ select {
   width: 100%;
   height: 100%;
   gap: 2px;
-  background: #000;
+  background: var(--n-pure);
 }
 .group-thumb-grid img {
   min-width: 0;
@@ -543,7 +554,7 @@ select {
 .thumb-placeholder {
   width: 100%;
   height: 100%;
-  background: #2a2a34;
+  background: var(--n-2);
 }
 .group-count-badge {
   position: absolute;
@@ -660,7 +671,7 @@ select {
   border-radius: var(--r-card);
   overflow: hidden;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
-  background: #000;
+  background: var(--n-pure);
   user-select: none;
 }
 .card-under {
@@ -1162,8 +1173,7 @@ select {
   height: 100%;
   border-radius: var(--r-card);
   overflow: hidden;
-  background: #000;
-  border: 1px solid var(--border);
+  background: var(--n-pure);
   cursor: zoom-in;
   transition: border-color 0.15s;
 }
@@ -1295,7 +1305,7 @@ select {
   grid-template-rows: repeat(2, 42px);
   flex: 0 0 84px;
   gap: 2px;
-  background: #000;
+  background: var(--n-pure);
 }
 .move-target-thumbs img {
   width: 42px;
@@ -1355,8 +1365,8 @@ select {
   bottom: 6px;
   left: 50%;
   transform: translateX(-50%);
-  background: var(--bad);
-  color: #fff;
+  background: var(--bad-700);
+  color: var(--ink-inverse);
   font-size: 11px;
   font-weight: 700;
   padding: 2px 10px;
@@ -1380,7 +1390,6 @@ select {
 }
 .popover-panel {
   background: var(--panel);
-  border: 1px solid var(--border);
   border-radius: var(--r-card);
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.55);
   max-width: 520px;
@@ -1397,7 +1406,7 @@ select {
 /* More button (styled by .popover-trigger positioning on cards) */
 .more-btn {
   background: rgba(0, 0, 0, 0.65);
-  color: #ccc;
+  color: var(--n-8);
   border: 1px solid rgba(255, 255, 255, 0.15);
   border-radius: var(--r-control);
   padding: 4px 10px;
@@ -1408,7 +1417,7 @@ select {
 }
 .more-btn:hover {
   background: rgba(0, 0, 0, 0.85);
-  color: #fff;
+  color: var(--ink-inverse);
 }
 
 /* Metadata inside popover */
@@ -1436,7 +1445,7 @@ select {
   color: var(--muted);
 }
 .meta-row strong {
-  color: #ccc;
+  color: var(--n-8);
 }
 
 .diff-badge {
@@ -1448,11 +1457,11 @@ select {
 }
 .diff-badge[data-side='left'] {
   background: rgba(229, 115, 115, 0.3);
-  color: #ff8a8a;
+  color: var(--bad-500);
 }
 .diff-badge[data-side='right'] {
   background: rgba(129, 199, 132, 0.3);
-  color: #8affa8;
+  color: var(--good-500);
 }
 
 /* Prompt diff section */
@@ -1491,22 +1500,22 @@ select {
 }
 .diff-token.diff-left {
   background: rgba(229, 115, 115, 0.35);
-  color: #ff8a8a;
+  color: var(--bad-500);
 }
 .diff-token.diff-right {
   background: rgba(129, 199, 132, 0.35);
-  color: #8affa8;
+  color: var(--good-500);
 }
 
 /* Prompt recommendation panel */
 .prompt-recommend-panel {
   background: var(--panel);
-  border: 1px solid var(--border);
   border-radius: var(--r-card);
   padding: 12px 14px;
   margin-top: 8px;
   max-height: 360px;
   overflow-y: auto;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 10px 28px -14px rgb(0 0 0 / 0.7);
 }
 .recommend-header {
   display: flex;
@@ -1520,7 +1529,6 @@ select {
   gap: 10px;
 }
 .recommend-item {
-  border: 1px solid var(--border);
   border-radius: var(--r-control);
   padding: 8px 10px;
   background: var(--bg);
@@ -1533,15 +1541,24 @@ select {
   font-size: 12px;
   margin-bottom: 4px;
 }
+.rec-model {
+  /* 此前完全没有 CSS 定义。它承载模型文件名（不可断词根）且位于 flex-wrap 行内，
+     min-width:auto 会让它撑成整行最宽项 —— 与 .group-meta 同一类问题。
+     同时按规则03 用字重+主色确立它作为该行身份标识的地位。 */
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 700;
+  color: var(--n-9);
+}
 .rec-max {
-  color: var(--good);
+  color: var(--good-500);
   font-weight: 700;
 }
 .rec-avg {
   color: var(--muted);
 }
 .rec-count {
-  color: var(--accent);
+  color: var(--accent-300);
 }
 .recommend-text {
   margin: 0;
@@ -1551,7 +1568,7 @@ select {
   line-height: 1.55;
   max-height: 80px;
   overflow: auto;
-  color: #ccc;
+  color: var(--n-8);
   background: rgba(0, 0, 0, 0.25);
   padding: 4px 8px;
   border-radius: var(--r-control);
@@ -1584,7 +1601,7 @@ select {
   gap: 6px;
 }
 .recommend-recipe dt {
-  color: #ccc;
+  color: var(--n-8);
   font-weight: 700;
 }
 .recommend-recipe dd {
@@ -1604,7 +1621,7 @@ select {
   border-radius: var(--r-control);
   padding: 0 2px;
   font-weight: 700;
-  color: #8affa8;
+  color: var(--good-500);
 }
 
 /* Copy buttons */
@@ -1668,8 +1685,8 @@ select {
   margin-top: 16px;
   padding: 16px;
   background: var(--panel);
-  border: 1px solid var(--border);
   border-radius: var(--r-card);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 10px 28px -14px rgb(0 0 0 / 0.7);
 }
 .keymap-head {
   display: flex;
@@ -1688,7 +1705,6 @@ select {
   margin: 14px 0 20px;
   padding: 12px;
   background: var(--bg);
-  border: 1px solid var(--border);
   border-radius: var(--r-card);
   overflow-x: auto;
 }
@@ -1708,7 +1724,6 @@ select {
   height: 46px;
   padding: 4px 5px;
   background: var(--panel-2);
-  border: 1px solid var(--border);
   border-radius: var(--r-control);
   display: flex;
   flex-direction: column;
@@ -1785,7 +1800,6 @@ select {
 }
 .km-binding code {
   background: var(--bg);
-  border: 1px solid var(--border);
   padding: 1px 6px;
   border-radius: var(--r-control);
   font-size: 12px;
@@ -1861,7 +1875,6 @@ select {
   font-size: 13px;
   line-height: 1;
   border-radius: var(--r-control);
-  border: 1px solid var(--border);
   background: var(--panel);
   color: var(--text);
   cursor: pointer;
@@ -1893,7 +1906,6 @@ select {
   height: 86px;
   object-fit: cover;
   border-radius: var(--r-control);
-  border: 1px solid var(--border);
   cursor: default;
 }
 .row-img.hidden-img {
@@ -1929,8 +1941,8 @@ select {
   width: 16px;
   height: 16px;
   border-radius: 50%;
-  background: var(--accent);
-  color: #fff;
+  background: var(--accent-700);
+  color: var(--ink-inverse);
   font-size: 11px;
   line-height: 16px;
   text-align: center;
@@ -1968,7 +1980,6 @@ select {
   min-width: 280px;
   max-width: 380px;
   background: var(--panel-2);
-  border: 1px solid var(--border);
   border-radius: var(--r-card);
   color: var(--text);
   cursor: pointer;
