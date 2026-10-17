@@ -1,18 +1,34 @@
-﻿@font-face {
-  font-family: 'Victor Mono';
-  src: url('./assets/fonts/victor-mono-latin-400.woff2') format('woff2');
+﻿/* ------------------------------------------------------------------
+   Sarasa Mono SC（等距更纱黑体 SC），SIL OFL-1.1。
+
+   为什么换掉 Victor Mono：
+   Victor Mono 拉丁前进宽度 0.6em，而任何 CJK 字体的汉字都是 1.0em ——
+   比值 1.667，中英混排永远对不齐列（实测确认）。
+   Sarasa Mono SC 的拉丁为 0.5em、汉字 1.0em，比值**精确 2.0**，
+   且两者由 Iosevka + 思源黑体同源配套设计，混排字重与 x-height 天然协调。
+
+   子集化说明：原始 TTF 每字重 25.6MB（51,250 字形，含 11,172 个韩文）。
+   已用 fontTools 剔除韩文 / Nerd Font / emoji 区段并去除 hinting，
+   保留 CJK 统一表意文字全集（保证任意中文 prompt 不缺字），
+   76.5MB TTF -> 9.4MB WOFF2。详见 THIRD_PARTY_NOTICES.md。
+   ------------------------------------------------------------------ */
+@font-face {
+  font-family: 'Sarasa Mono SC';
+  src: url('./assets/fonts/sarasa-mono-sc-400.woff2') format('woff2');
   font-weight: 400;
   font-display: swap;
 }
 @font-face {
-  font-family: 'Victor Mono';
-  src: url('./assets/fonts/victor-mono-latin-600.woff2') format('woff2');
+  /* 上游文件的内部族名是 'Sarasa Mono SC SemiBold'，但 @font-face 用 url()
+     引入时由 CSS 侧的 font-family 决定匹配，内部名仅影响 local() 查找。 */
+  font-family: 'Sarasa Mono SC';
+  src: url('./assets/fonts/sarasa-mono-sc-600.woff2') format('woff2');
   font-weight: 600;
   font-display: swap;
 }
 @font-face {
-  font-family: 'Victor Mono';
-  src: url('./assets/fonts/victor-mono-latin-700.woff2') format('woff2');
+  font-family: 'Sarasa Mono SC';
+  src: url('./assets/fonts/sarasa-mono-sc-700.woff2') format('woff2');
   font-weight: 700;
   font-display: swap;
 }
@@ -56,8 +72,12 @@
 
   /* 字体（规则01：全等宽。汉字在系统 CJK 字体中本就是 1em 全宽，
      因此中文侧零成本获得等宽度；Victor Mono 负责拉丁与数字。 */
-  --font-ui: 'Victor Mono', 'Microsoft YaHei UI', 'PingFang SC', 'Noto Sans SC', sans-serif;
-  --font-mono: 'Victor Mono', 'Consolas', 'Cascadia Mono', monospace;
+  /* 字体栈（规则01：全等宽）。
+     Sarasa Mono SC 同时覆盖拉丁与汉字 —— 放在第一位意味着两种文字都由它渲染，
+     2:1 字宽比才成立。系统 CJK 字体只作为「字体未加载完成时」的兜底，
+     此时退化行为是汉字仍为全宽（不会破版），仅失去对齐网格。 */
+  --font-ui: 'Sarasa Mono SC', 'Microsoft YaHei UI', 'PingFang SC', 'Noto Sans SC', monospace;
+  --font-mono: 'Sarasa Mono SC', 'Consolas', 'Cascadia Mono', monospace;
 
   /* 兼容别名：把旧名映射进色阶，便于渐进迁移 */
   --bg: var(--n-1);
@@ -76,6 +96,30 @@
   box-sizing: border-box;
 }
 
+/* ------------------------------------------------------------------
+   字体栈的最后一公里。
+
+   UA 样式表给 pre/code 自带 `font-family: monospace`，给 button/input/
+   select/textarea 自带 `font: -webkit-small-control`（Chromium 解析为 Arial）。
+   这些是**直接作用于元素自身**的声明，优先级高于从 body 继承的值 ——
+   所以 body 上的字体栈根本传不到这些标签。实测：56 个 button 全部渲染为
+   Arial，12 个 pre 全部渲染为系统等宽体。
+
+   因此必须逐个显式覆盖，任何新增的表单控件/代码块才会自动继承字体栈。
+   ------------------------------------------------------------------ */
+pre,
+code,
+kbd,
+samp {
+  font-family: var(--font-ui);
+}
+button,
+input,
+select,
+textarea {
+  font-family: var(--font-ui);
+}
+
 html,
 body,
 #root {
@@ -85,8 +129,8 @@ body,
   color: var(--text);
   font-family: var(--font-ui);
   font-size: 14px;
-  /* Victor Mono 默认启用编程连字 (-> => !=)。在数据密集界面里
-     连字会破坏字符对齐并干扰阅读，全局关闭。 */
+  /* Sarasa Mono SC 的拉丁部分源自 Iosevka，默认启用编程连字 (-> => !=)。
+     在数据密集界面里连字会破坏字符对齐并干扰阅读，全局关闭。 */
   font-variant-ligatures: none;
   -webkit-font-smoothing: antialiased;
 }
@@ -378,7 +422,8 @@ select {
 }
 .source-list .path {
   flex: 1;
-  font-family: monospace;
+  /* 原为裸 monospace，会退回系统等宽体（Consolas 0.55em）从而破坏 2:1 对齐。 */
+  font-family: var(--font-mono);
 }
 .source-list .origin {
   color: var(--muted);
