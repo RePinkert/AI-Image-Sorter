@@ -884,6 +884,17 @@ select {
   flex-direction: column;
   overflow-y: auto;
 }
+/* 键位帮助条：去贴边空白，给换行可读的行高与节奏 */
+.arena-view > p.hint {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 8px 16px 10px;
+  line-height: 1.5;
+}
+.arena-hint-text b {
+  font-weight: 600;
+  color: var(--n-8);
+}
 .arena-stage {
   flex: 1;
   display: flex;

@@ -456,11 +456,12 @@ export function Arena() {
           <div className="arena-label">{pendingHide ? '→ 屏蔽此卡' : '点击/→ 胜出'}</div>
         </div>
       </div>
-      <p className="muted hint">
-        {bindingDisplay(keybindings.arenaVoteLeft)} / {bindingDisplay(keybindings.arenaVoteRight)} 选胜方 ·{' '}
-        {bindingDisplay(keybindings.arenaSkip)} 跳过 · 按住 {bindingDisplay(keybindings.arenaArmHide)} 后按{' '}
-        {bindingDisplay(keybindings.arenaHideLeft)} / {bindingDisplay(keybindings.arenaHideRight)} 屏蔽对应卡 ·{' '}
-        {bindingDisplay(keybindings.arenaUndoHide)} 撤销最近屏蔽（回到上一对，双方分数一并还原）· 屏蔽后幸存方按胜者计分 · 单击图片放大 · 两侧"更多"可屏蔽并查看 Prompt 差异高亮
+      <p className="muted hint arena-hint-text">
+        <b>{bindingDisplay(keybindings.arenaVoteLeft)} / {bindingDisplay(keybindings.arenaVoteRight)}</b> 选胜方 ·{' '}
+        <b>{bindingDisplay(keybindings.arenaSkip)}</b> 跳过 · 按住 <b>{bindingDisplay(keybindings.arenaArmHide)}</b> 后按{' '}
+        <b>{bindingDisplay(keybindings.arenaHideLeft)} / {bindingDisplay(keybindings.arenaHideRight)}</b> 屏蔽对应卡 ·{' '}
+        <b>{bindingDisplay(keybindings.arenaUndoHide)}</b> 撤销屏蔽（分数一并还原）· 屏蔽后幸存方按胜者计分 ·{' '}
+        单击图片放大 · 两侧"更多"可屏蔽并查看 Prompt 差异
       </p>
       {lightbox && <Lightbox src={assetUrl(lightbox)} onClose={() => setLightbox(null)} />}
     </div>
