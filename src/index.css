@@ -1,14 +1,75 @@
-﻿:root {
-  --bg: #1a1a1f;
-  --panel: #24242c;
-  --panel-2: #2e2e38;
-  --text: #e6e6ea;
-  --muted: #8a8a96;
-  --accent: #6c8cff;
-  --good: #81c784;
-  --bad: #e57373;
-  --warn: #ffb74d;
-  --border: #3a3a46;
+﻿@font-face {
+  font-family: 'Victor Mono';
+  src: url('./assets/fonts/victor-mono-latin-400.woff2') format('woff2');
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Victor Mono';
+  src: url('./assets/fonts/victor-mono-latin-600.woff2') format('woff2');
+  font-weight: 600;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Victor Mono';
+  src: url('./assets/fonts/victor-mono-latin-700.woff2') format('woff2');
+  font-weight: 700;
+  font-display: swap;
+}
+
+:root {
+  /* ---------------------------------------------------------------
+     中性色阶（规则13：8~10 档）。
+     契约：--n-7 及以上才可作正文色。--n-6 对面板仅 3.08:1，
+     只能用于大字号或纯装饰，绝不可用于小字号正文。
+     --------------------------------------------------------------- */
+  --n-0: #121216; /* 最深：缩略图占位、压暗层 */
+  --n-1: #1a1a1f; /* 页面底 */
+  --n-2: #24242c; /* 卡片 / 面板 */
+  --n-3: #2e2e38; /* 次级面板 */
+  --n-4: #3a3a46; /* 分隔线 */
+  --n-5: #4a4a58; /* 悬停底 */
+  --n-6: #6e6e7e; /* 仅大字/装饰 —— 对 n-2 仅 3.08:1 */
+  --n-7: #9a9aa8; /* 次要文字 —— 对 n-3 达 4.83:1 ✓ */
+  --n-8: #c8c8d2;
+  --n-9: #e6e6ea; /* 主文字 */
+
+  /* ---------------------------------------------------------------
+     强调色阶。规则13 的关键收益：有了多档才可能有 hover / active /
+     浅底 tint，而不是所有交互都退化��「改 border-color」。
+     --------------------------------------------------------------- */
+  --accent-50: #1b2140; /* 选中态浅底 */
+  --accent-100: #232d55;
+  --accent-300: #8ba3ff; /* 深色面上的强调文字/描边 —— 对 n-3 达 5.61:1 ✓ */
+  --accent-500: #6c8cff; /* 仅装饰/大字 —— 对 n-3 仅 4.37:1 */
+  --accent-700: #4a6ae0; /* 实心按钮底 + 白字 = 4.74:1 ✓ */
+
+  /* 语义色阶。文字用 500 档直接显示，徽章一律「浅底深字」（规则14）。 */
+  --good-100: #1f2e22; --good-500: #81c784; /* 对 n-3 = 6.67 ✓ */
+  --bad-100: #33222a; --bad-500: #e88a8a; /* 对 n-3 = 5.39 ✓ */
+  --warn-100: #33291a; --warn-500: #ffb74d; /* 对 n-3 = 7.76 ✓ */
+
+  /* 圆角（规则01：13 种收敛为 3 档 + 药丸） */
+  --r-card: 10px;
+  --r-control: 6px;
+  --r-pill: 999px;
+
+  /* 字体（规则01：全等宽。汉字在系统 CJK 字体中本就是 1em 全宽，
+     因此中文侧零成本获得等宽度；Victor Mono 负责拉丁与数字。 */
+  --font-ui: 'Victor Mono', 'Microsoft YaHei UI', 'PingFang SC', 'Noto Sans SC', sans-serif;
+  --font-mono: 'Victor Mono', 'Consolas', 'Cascadia Mono', monospace;
+
+  /* 兼容别名：把旧名映射进色阶，便于渐进迁移 */
+  --bg: var(--n-1);
+  --panel: var(--n-2);
+  --panel-2: var(--n-3);
+  --text: var(--n-9);
+  --muted: var(--n-7);
+  --border: var(--n-4);
+  --accent: var(--accent-500);
+  --good: var(--good-500);
+  --bad: var(--bad-500);
+  --warn: var(--warn-500);
 }
 
 * {
@@ -22,8 +83,12 @@ body,
   height: 100%;
   background: var(--bg);
   color: var(--text);
-  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-family: var(--font-ui);
   font-size: 14px;
+  /* Victor Mono 默认启用编程连字 (-> => !=)。在数据密集界面里
+     连字会破坏字符对齐并干扰阅读，全局关闭。 */
+  font-variant-ligatures: none;
+  -webkit-font-smoothing: antialiased;
 }
 
 .app {
@@ -66,7 +131,7 @@ body,
   align-self: flex-start;
   font-size: 11px;
   padding: 2px 8px;
-  border-radius: 999px;
+  border-radius: var(--r-pill);
   background: color-mix(in srgb, var(--accent) 18%, transparent);
   color: var(--accent);
   border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
@@ -92,7 +157,7 @@ body,
   padding: 10px 14px;
   margin: 12px 0;
   border: 1px solid var(--accent);
-  border-radius: 10px;
+  border-radius: var(--r-card);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   font-size: 13px;
 }
@@ -115,7 +180,7 @@ body,
 .merge-confirm {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-radius: var(--r-card);
   padding: 18px 20px;
   max-width: min(720px, 94vw);
   max-height: 84vh;
@@ -133,7 +198,7 @@ body,
 }
 .merge-confirm-group {
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--r-card);
   padding: 8px;
   background: color-mix(in srgb, var(--panel) 60%, transparent);
 }
@@ -149,7 +214,7 @@ body,
 .manual-badge {
   font-size: 12px;
   padding: 6px 10px;
-  border-radius: 8px;
+  border-radius: var(--r-control);
   margin-bottom: 8px;
   background: color-mix(in srgb, var(--accent) 14%, transparent);
   border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
@@ -170,7 +235,7 @@ body,
 .model-chip {
   font-size: 11px;
   padding: 2px 8px;
-  border-radius: 999px;
+  border-radius: var(--r-pill);
   background: var(--panel-alt, rgba(128, 128, 128, 0.15));
   color: var(--muted);
   white-space: nowrap;
@@ -220,10 +285,24 @@ h2 {
   padding: 6px 14px;
   font-size: 13px;
 }
+/* 规则04：与其费劲加亮选中项，不如按静音键弱化竞争者。
+   未选中项退为透明底 + 次要字色，选中项自然成为焦点。 */
+.granularity-bar button:not(.gran-active) {
+  background: transparent;
+  color: var(--n-7);
+}
+.granularity-bar button:not(.gran-active):hover:not(:disabled) {
+  background: var(--n-2);
+  color: var(--n-9);
+}
 .granularity-bar button.gran-active {
-  background: var(--accent);
+  /* 对比度修正：#fff on --accent(#6c8cff) 仅 3.07:1，远未达 AA。
+     --accent-700 配白字为 4.74:1 ✓，且比霓虹蓝更克制。 */
+  background: var(--accent-700);
   color: #fff;
-  border-color: var(--accent);
+}
+.granularity-bar button.gran-active:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-700) 86%, white);
 }
 /* L1 wheel-wrap: hover wheel cycles the Model偏差 dimension without
  * scrolling the page; the badge shows the selected dimension live. */
@@ -234,24 +313,33 @@ h2 {
 .l1-dim-badge {
   margin-left: 7px;
   padding: 1px 7px;
-  border-radius: 8px;
+  border-radius: var(--r-control);
   font-size: 11px;
-  background: rgba(96, 165, 250, 0.18);
-  border: 1px solid rgba(96, 165, 250, 0.35);
-  color: inherit;
+  /* 规则14「浅底深字」：accent-100 浅底 + accent-300 深字 = 6.56:1，
+     比原先 rgba 叠加更柔和，且对比度达标。 */
+  background: var(--accent-100);
+  border: 1px solid color-mix(in srgb, var(--accent-300) 28%, transparent);
+  color: var(--accent-300);
 }
 .l1-dim-badge.busy {
-  color: var(--warn, #e6a23c);
+  background: var(--warn-100);
+  border-color: color-mix(in srgb, var(--warn-500) 28%, transparent);
+  color: var(--warn-500);
 }
 
 button {
-  background: var(--panel-2);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  /* 规则19：--border 在面板上仅 1.37:1，每个按钮都在画一根看不见的线。
+     改用表面明度差表达边界，交互反馈交给 background 变化。 */
+  background: var(--n-2);
+  color: var(--n-9);
+  border: 0;
+  border-radius: var(--r-control);
   padding: 8px 14px;
   cursor: pointer;
-  transition: background 0.15s;
+  transition: background-color 0.15s, color 0.15s;
+}
+button:hover:not(:disabled) {
+  background: var(--n-4);
 }
 button:hover:not(:disabled) {
   background: #383846;
@@ -266,7 +354,7 @@ select {
   background: var(--panel-2);
   color: var(--text);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--r-control);
   padding: 8px 10px;
 }
 
@@ -301,7 +389,7 @@ select {
   margin-top: 16px;
   padding: 10px;
   background: var(--panel-2);
-  border-radius: 8px;
+  border-radius: var(--r-control);
 }
 
 .state-panel {
@@ -333,7 +421,7 @@ select {
   margin: 12vh auto 0;
   padding: 24px;
   border: 1px solid var(--bad);
-  border-radius: 8px;
+  border-radius: var(--r-control);
   background: var(--panel);
 }
 .fatal-error h1 {
@@ -349,24 +437,32 @@ select {
 }
 .group-card {
   position: relative;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 12px;
+  /* 规则19：--border 在面板上仅 1.37:1 —— 渲染了却几乎看不见，纯视觉噪音。
+     改用「更亮的表面 + 柔和阴影」建立轮廓，把边框预算省下来。 */
+  background: var(--n-3);
+  border-radius: var(--r-card);
   padding: 10px;
   cursor: pointer;
-  transition: border-color 0.15s;
+  transition: box-shadow 0.15s, background-color 0.15s;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.4);
   display: flex;
   flex-direction: column;
   gap: 8px;
+  /* 网格项默认 min-width:auto 会解析为「基于内容的最小尺寸」，等于把整个不可断行的
+     模型文件名写进 min-content，撑破 200px 轨道并溢出 .panel。必须显式归零。 */
+  min-width: 0;
 }
 .group-card:hover {
-  border-color: var(--accent);
+  /* 规则16：用强调色描边建立焦点。用 box-shadow 环而非 border，
+     常态就不必为每张卡片渲染一根发丝线。 */
+  background: var(--n-5);
+  box-shadow: 0 0 0 1px var(--accent-300), 0 6px 16px -8px rgb(0 0 0 / 0.65);
 }
 .group-thumb {
   position: relative;
   width: 100%;
   aspect-ratio: 1;
-  border-radius: 8px;
+  border-radius: var(--r-control);
   overflow: hidden;
   background: #000;
 }
@@ -408,33 +504,59 @@ select {
   position: absolute;
   top: 6px;
   right: 6px;
-  background: rgba(0, 0, 0, 0.7);
-  color: var(--accent);
+  /* 规则17：压在照片上的文字必须先处理背景。纯 0.7 黑在亮部照片上
+     仍会显脏，加背景虚化后透出的环境色反而更通透。 */
+  background: rgb(0 0 0 / 0.55);
+  backdrop-filter: blur(6px);
+  color: var(--accent-300);
   font-size: 12px;
   font-weight: 700;
   padding: 2px 8px;
-  border-radius: 6px;
+  border-radius: var(--r-control);
 }
 .group-prompt {
   font-size: 12px;
   line-height: 1.4;
-  height: 3.6em;
+  /* 3 行 × 1.4 行高 = 4.2em。原先写 3.6em（那是按 1.2 行高推的），
+     容器比内容矮 0.6em，导致第三行被水平腰斩。 */
+  height: 4.2em;
   overflow: hidden;
   display: -webkit-box;
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
+  /* . 和 _ 在 CSS 中不是换行机会，文件名会当作单个超长词被硬切。 */
+  overflow-wrap: anywhere;
 }
 .group-meta {
+  position: relative;
   font-size: 11px;
   color: var(--muted);
+  min-width: 0;
+  overflow-wrap: anywhere;
+  /* 等宽字宽更大，模型文件名容易折到第三行，把卡片撑成参差的两排。
+     夹到 2 行即可，同时右侧留出按钮的位置。 */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  /* 给绝对定位的「文件夹视角」按钮预留横向空间，文本不会绕到它下面。 */
+  padding-right: 72px;
 }
 .folder-link {
+  /* 移出文本流、锚定在 .group-meta 右下角。这样两行截断不会把按钮切掉，
+     而按钮位置也不受下方 .model-facets 存在与否的影响。
+     margin-left 需覆盖 GroupList.tsx:753 的内联 marginLeft:8。 */
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  margin-left: 0 !important;
   padding: 1px 5px;
-  color: var(--accent);
+  color: var(--accent-300);
   border: 0;
-  border-radius: 4px;
+  border-radius: var(--r-control);
   background: transparent;
   font-size: 11px;
+  line-height: 1.4;
 }
 
 .swipe-view {
@@ -453,7 +575,7 @@ select {
   flex: 1;
   height: 6px;
   background: var(--panel);
-  border-radius: 3px;
+  border-radius: var(--r-control);
   overflow: hidden;
 }
 .progress-bar {
@@ -490,7 +612,7 @@ select {
   max-height: 100cqh;
   width: auto;
   height: auto;
-  border-radius: 16px;
+  border-radius: var(--r-card);
   overflow: hidden;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
   background: #000;
@@ -525,14 +647,14 @@ select {
   color: var(--accent);
   font-weight: 700;
   padding: 2px 8px;
-  border-radius: 6px;
+  border-radius: var(--r-control);
 }
 .card-badge .seed {
   background: rgba(0, 0, 0, 0.6);
   color: var(--muted);
   font-size: 11px;
   padding: 2px 6px;
-  border-radius: 6px;
+  border-radius: var(--r-control);
 }
 
 .swipe-meta {
@@ -556,7 +678,7 @@ select {
   font-size: 11px;
   background: var(--panel);
   padding: 8px;
-  border-radius: 8px;
+  border-radius: var(--r-control);
   max-height: 120px;
   overflow: auto;
 }
@@ -640,7 +762,7 @@ select {
 .arena-card {
   position: relative;
   cursor: pointer;
-  border-radius: 16px;
+  border-radius: var(--r-card);
   overflow: hidden;
   border: 2px solid transparent;
   transition: border-color 0.15s;
@@ -707,7 +829,7 @@ select {
   color: var(--accent);
   font-weight: 700;
   padding: 2px 8px;
-  border-radius: 6px;
+  border-radius: var(--r-control);
 }
 .arena-label {
   position: absolute;
@@ -718,7 +840,7 @@ select {
   color: var(--text);
   font-size: 11px;
   padding: 2px 8px;
-  border-radius: 6px;
+  border-radius: var(--r-control);
 }
 .arena-vs {
   font-size: 24px;
@@ -828,7 +950,7 @@ select {
   align-items: center;
   background: rgba(0, 0, 0, 0.55);
   padding: 6px 10px;
-  border-radius: 10px;
+  border-radius: var(--r-card);
 }
 .lightbox-hud .lb-scale {
   min-width: 56px;
@@ -944,7 +1066,7 @@ select {
   background: var(--panel);
   color: inherit;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--r-control);
   padding: 4px 8px;
   font-size: 13px;
   cursor: pointer;
@@ -993,7 +1115,7 @@ select {
   min-width: 0;
   min-height: 220px;
   height: 100%;
-  border-radius: 10px;
+  border-radius: var(--r-card);
   overflow: hidden;
   background: #000;
   border: 1px solid var(--border);
@@ -1021,7 +1143,7 @@ select {
   font-weight: 700;
   font-size: 12px;
   padding: 2px 8px;
-  border-radius: 6px;
+  border-radius: var(--r-control);
   z-index: 2;
 }
 .folder-actions {
@@ -1044,7 +1166,7 @@ select {
 .folder-actions button {
   padding: 2px 6px;
   font-size: 11px;
-  border-radius: 6px;
+  border-radius: var(--r-control);
 }
 @media (hover: none) {
   .folder-actions {
@@ -1104,14 +1226,14 @@ select {
   margin-left: 12px;
   padding: 2px 10px;
   border: 1px solid var(--accent);
-  border-radius: 999px;
+  border-radius: var(--r-pill);
   font-size: 12px;
   color: var(--accent);
 }
 .batch-bar button {
   font-size: 11px;
   padding: 1px 8px;
-  border-radius: 999px;
+  border-radius: var(--r-pill);
 }
 .move-target-card {
   display: flex;
@@ -1160,7 +1282,7 @@ select {
 }
 .gesture-extra-row .gesture-hide {
   padding: 6px 18px;
-  border-radius: 999px;
+  border-radius: var(--r-pill);
   border: 1px solid var(--warn);
   color: var(--warn);
   background: transparent;
@@ -1173,7 +1295,7 @@ select {
   margin-top: 10px;
   width: 100%;
   padding: 6px 10px;
-  border-radius: 8px;
+  border-radius: var(--r-control);
   border: 1px solid var(--warn);
   color: var(--warn);
   background: transparent;
@@ -1193,7 +1315,7 @@ select {
   font-size: 11px;
   font-weight: 700;
   padding: 2px 10px;
-  border-radius: 6px;
+  border-radius: var(--r-control);
   z-index: 2;
 }
 
@@ -1214,7 +1336,7 @@ select {
 .popover-panel {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--r-card);
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.55);
   max-width: 520px;
   max-height: 70vh;
@@ -1232,7 +1354,7 @@ select {
   background: rgba(0, 0, 0, 0.65);
   color: #ccc;
   border: 1px solid rgba(255, 255, 255, 0.15);
-  border-radius: 8px;
+  border-radius: var(--r-control);
   padding: 4px 10px;
   font-size: 13px;
   cursor: pointer;
@@ -1259,7 +1381,7 @@ select {
   overflow: auto;
   background: var(--bg);
   padding: 4px 8px;
-  border-radius: 4px;
+  border-radius: var(--r-control);
   font-size: 11px;
   color: var(--muted);
 }
@@ -1277,7 +1399,7 @@ select {
   font-size: 10px;
   margin-left: 6px;
   padding: 1px 6px;
-  border-radius: 3px;
+  border-radius: var(--r-control);
 }
 .diff-badge[data-side='left'] {
   background: rgba(229, 115, 115, 0.3);
@@ -1315,11 +1437,11 @@ select {
   overflow: auto;
   background: var(--bg);
   padding: 6px 8px;
-  border-radius: 4px;
+  border-radius: var(--r-control);
 }
 .diff-token {
   font-weight: 700;
-  border-radius: 2px;
+  border-radius: var(--r-control);
   padding: 0 1px;
 }
 .diff-token.diff-left {
@@ -1335,7 +1457,7 @@ select {
 .prompt-recommend-panel {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--r-card);
   padding: 12px 14px;
   margin-top: 8px;
   max-height: 360px;
@@ -1354,7 +1476,7 @@ select {
 }
 .recommend-item {
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--r-control);
   padding: 8px 10px;
   background: var(--bg);
 }
@@ -1387,7 +1509,7 @@ select {
   color: #ccc;
   background: rgba(0, 0, 0, 0.25);
   padding: 4px 8px;
-  border-radius: 4px;
+  border-radius: var(--r-control);
 }
 .recommend-reference {
   margin-top: 8px;
@@ -1434,7 +1556,7 @@ select {
 }
 .rec-highlight {
   background: rgba(129, 199, 132, 0.35);
-  border-radius: 2px;
+  border-radius: var(--r-control);
   padding: 0 2px;
   font-weight: 700;
   color: #8affa8;
@@ -1444,7 +1566,7 @@ select {
 .copy-btn {
   font-size: 11px;
   padding: 1px 8px;
-  border-radius: 6px;
+  border-radius: var(--r-control);
   margin-left: 8px;
   color: var(--accent);
   border-color: var(--border);
@@ -1502,7 +1624,7 @@ select {
   padding: 16px;
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: var(--r-card);
 }
 .keymap-head {
   display: flex;
@@ -1522,7 +1644,7 @@ select {
   padding: 12px;
   background: var(--bg);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--r-card);
   overflow-x: auto;
 }
 .kb-row {
@@ -1542,7 +1664,7 @@ select {
   padding: 4px 5px;
   background: var(--panel-2);
   border: 1px solid var(--border);
-  border-radius: 7px;
+  border-radius: var(--r-control);
   display: flex;
   flex-direction: column;
   align-items: flex-start;
@@ -1587,7 +1709,7 @@ select {
   line-height: 1.2;
   font-weight: 700;
   padding: 0 3px;
-  border-radius: 3px;
+  border-radius: var(--r-control);
   background: rgba(0, 0, 0, 0.35);
   white-space: nowrap;
 }
@@ -1612,7 +1734,7 @@ select {
   display: inline-block;
   width: 10px;
   height: 10px;
-  border-radius: 3px;
+  border-radius: var(--r-control);
   margin-right: 8px;
   vertical-align: middle;
 }
@@ -1620,7 +1742,7 @@ select {
   background: var(--bg);
   border: 1px solid var(--border);
   padding: 1px 6px;
-  border-radius: 5px;
+  border-radius: var(--r-control);
   font-size: 12px;
 }
 .km-warn {
@@ -1647,14 +1769,15 @@ select {
   gap: 6px;
 }
 .group-row {
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  background: var(--n-3);
+  border-radius: var(--r-card);
   overflow: hidden;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.4);
 }
 .group-row.row-focused {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent);
+  /* 规则16：焦点用强调色描边（shadow 环，零布局成本） */
+  background: var(--n-5);
+  box-shadow: 0 0 0 1px var(--accent-300);
 }
 .group-row-head {
   display: flex;
@@ -1692,7 +1815,7 @@ select {
   padding: 4px 10px;
   font-size: 13px;
   line-height: 1;
-  border-radius: 8px;
+  border-radius: var(--r-control);
   border: 1px solid var(--border);
   background: var(--panel);
   color: var(--text);
@@ -1724,7 +1847,7 @@ select {
   width: 86px;
   height: 86px;
   object-fit: cover;
-  border-radius: 8px;
+  border-radius: var(--r-control);
   border: 1px solid var(--border);
   cursor: default;
 }
@@ -1742,7 +1865,7 @@ select {
   position: relative;
   padding: 0;
   border: 2px solid transparent;
-  border-radius: 10px;
+  border-radius: var(--r-card);
   background: none;
   cursor: pointer;
   line-height: 0;
@@ -1801,7 +1924,7 @@ select {
   max-width: 380px;
   background: var(--panel-2);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--r-card);
   color: var(--text);
   cursor: pointer;
   text-align: left;
