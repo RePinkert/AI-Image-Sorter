@@ -867,6 +867,15 @@ select {
 .gesture-row button.ghost {
   background: transparent;
 }
+/* ghost 档（待优化 / 跳过）此前完全没有 hover 反馈 —— 游标悬上去毫无响应，
+   用户无法确认按钮是活的。悬停时提亮边框与文字，与主档 hover 同构但更弱。 */
+.gesture-row button.ghost:hover:not(:disabled) {
+  border-color: var(--n-6);
+  color: var(--n-8);
+}
+.gesture-row button.ghost:hover:not(:disabled) .kbd {
+  color: var(--n-7);
+}
 /* Button flash on verdict — key-based remount in SwipeDeck.tsx restarts
    this animation each press, providing virtual physical feedback. */
 .gesture-row button[data-flash='1'] {
@@ -884,7 +893,8 @@ select {
   flex-direction: column;
   overflow-y: auto;
 }
-/* 键位帮助条：去贴边空白，给换行可读的行高与节奏 */
+/* 键位帮助条：去贴边空白，给换行可读的行高与节奏（swipe 与 arena 共用） */
+.swipe-view > p.hint,
 .arena-view > p.hint {
   flex: 0 0 auto;
   margin: 0;
