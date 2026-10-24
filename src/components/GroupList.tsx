@@ -619,11 +619,12 @@ export function GroupList() {
             </option>
           ))}
         </select>
-        <button type="button" onClick={() => setView('import')}>+ 导入新源</button>
-        <button type="button" onClick={() => setView('settings')}>标签设置 / 导出</button>
+        <button type="button" className="btn-secondary" onClick={() => setView('import')}>+ 导入新源</button>
+        <button type="button" className="btn-secondary" onClick={() => setView('settings')}>标签设置 / 导出</button>
         {granularity === 2 && (
           <button
             type="button"
+            className="btn-secondary"
             onClick={() => setL2ListView(!l2ListView)}
             title="Prompt偏差 层级的呈现方式：卡片网格（旧视图，作为回滚保底）或可展开的分组列表"
           >
@@ -633,7 +634,7 @@ export function GroupList() {
         {granularity === 2 && (
           <button
             type="button"
-            className={mergeMode ? 'gran-active' : ''}
+            className={mergeMode ? 'gran-active' : 'btn-secondary'}
             disabled={mergeBusy || currentSourceId == null}
             onClick={() => (mergeMode ? exitMergeMode() : setMergeMode(true))}
             title={currentSourceId == null
@@ -748,7 +749,12 @@ export function GroupList() {
               )}
               <div className="group-meta">
                 {/* source_kind 全库恒为 'comfy'，单独展示是冗余（规则05），删去。 */}
-                <span className="group-meta-text">
+                <span
+                  className="group-meta-text"
+                  title={granularity === 1 && currentSourceId != null
+                    ? `${MODEL_DEVIATION_DIMENSION_LABELS[l1Dimension]} · ${g.checkpoint || '—'}`
+                    : (g.checkpoint || '—')}
+                >
                   {granularity === 1 && currentSourceId != null
                     ? `${MODEL_DEVIATION_DIMENSION_LABELS[l1Dimension]} · ${g.checkpoint || '—'}`
                     : (g.checkpoint || '—')}
@@ -936,7 +942,16 @@ export function GroupList() {
                   onClick={() => void moveConfirmed(null)}
                   title="为所选图片新建一个独立分组（移出成新组）"
                 >
-                  ➕ 新建分组
+                  <svg viewBox="0 0 12 12" width="10" height="10" aria-hidden="true" focusable="false" className="icon-glyph">
+                    <path
+                      d="M6 1.5v9 M1.5 6h9"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.1"
+                      strokeLinecap="round"
+                    />
+                  </svg>
+                  新建分组
                 </button>
                 {(moveTargets ?? []).map((t) => (
                   <button

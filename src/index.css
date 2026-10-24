@@ -644,11 +644,14 @@ select {
   padding-right: 72px;
 }
 .group-meta-text {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
+  /* 单行省略号替代两行 line-clamp：checkpoint 是一个不可自然断词的长文件名，
+     配 overflow-wrap:anywhere 会在 72px 预留边界处产出 `...safet / ensors`
+     式的腰斩断点且无截断提示。单行截断干净，全文交给 title 悬浮查看。
+     （.group-meta 的 min-width:0 + overflow-wrap 仍保留，守住 R00-overflow。） */
+  display: block;
+  white-space: nowrap;
   overflow: hidden;
-  overflow-wrap: anywhere;
+  text-overflow: ellipsis;
 }
 .empty-groups {
   margin-top: 12px;
