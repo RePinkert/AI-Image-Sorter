@@ -1758,6 +1758,13 @@ select {
   gap: 12px;
   flex-wrap: wrap;
 }
+
+/* 规则11：说明段落在 1100px 面板内行长过长（CJK 60-70 字/行），
+   收敛行长让折返视距回到舒适区；仅作用于 msg 面板内的长文案，
+   不影响单行状态消息 */
+.msg .hint {
+  max-width: 40em;
+}
 .settings-telemetry h3 {
   flex-basis: 100%;
   margin-bottom: 0;
