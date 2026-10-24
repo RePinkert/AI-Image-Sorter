@@ -6,19 +6,22 @@ AI Image Sorter is a local-first desktop application for organizing and reviewin
 
 ## Features
 
-- Discover and import ComfyUI output folders, or select a local folder manually
-- Parse PNG, JPEG, and WebP generation metadata from ComfyUI, A1111, and related formats
-- Group images by folder, model, prompt similarity, and independent prompt
-- Match ComfyUI workflow topology and retain generation recipes
-- Review images with swipe scoring or pairwise arena comparisons
-- Hide, label, archive, move, merge, split, and undo image actions
-- Incrementally rescan registered folders in the background
+- Discover ComfyUI output folders automatically (common paths and running processes), or import any local folder; registered folders are rescanned incrementally in the background
+- Parse generation metadata from ComfyUI PNG chunks, A1111 parameters (PNG/JPEG/WebP), and companion `.txt` files
+- Group images along four axes: folder, model deviation (mouse wheel switches the dimension), prompt similarity (adjustable threshold), and independent prompt
+- Match ComfyUI workflow topology and retain the full generation recipe for each image
+- Review with swipe scoring or Bradley–Terry arena comparisons; custom labels, undo, and a review session that survives a relaunch
+- Browse a virtualized masonry grid with eight sort keys, filename search, hidden-only filter, and batch select/unhide/split/move/delete
+- Inspect images in a true-zoom viewer: fit / 1:1 / free zoom, native fullscreen, filmstrip, metadata sidebar, and inline PNG prompt editing with write-back
+- Merge, split, move, and unmerge groups; manual groups are preserved across re-clustering
+- Hide, label, archive (copy), or send images to the OS recycle bin — normal organization never modifies source files
+- Rebind every keyboard shortcut through a visual rebinding panel
 - Export image data as CSV/JSON and export redacted diagnostics
 - Store application data locally; coarse app events stay in the local database only — no data ever leaves the machine
 
 ## Status
 
-`v0.2.0` is the latest release (`v0.1.0` was the first public preview). The core workflow is usable, but compatibility with unusual metadata formats and large libraries is still being expanded. Windows is the primary supported platform.
+`v0.3.0` is the latest release (`v0.1.0` was the first public preview). The core workflow is usable, but compatibility with unusual metadata formats and large libraries is still being expanded. Windows is the primary supported platform.
 
 ## Installation
 
@@ -37,7 +40,7 @@ The build in `Release` is a standalone `.exe` — you can run it directly, no in
    - `data\logs\` — run logs
    - WebView2 profile — kept at the OS default location while running, **wiped automatically on exit**
 
-Each normal exit erases the WebView2 profile (cache, cookies, browser state) from the host's AppData, while the database and logs stay on the drive beside the application — exactly the portable design: data travels with the software, and the host keeps no traces of it. To uninstall, just delete the `.exe` and `data\`; no directory belonging to this software remains in system AppData. (If a crash preempts the cleanup, only the WebView2 cache survives on the host; the next normal exit removes it.)
+Each normal exit erases the WebView2 profile (cache, cookies, browser state) from the host's local app data (`%LOCALAPPDATA%\com.aiimagesorter.app`), while the database and logs stay on the drive beside the application — exactly the portable design: data travels with the software, and the host keeps no traces of it. To uninstall, just delete the `.exe` and `data\`; no directory belonging to this software remains in system AppData. (If a crash preempts the cleanup, only the WebView2 cache survives on the host; the next normal exit removes it.)
 
 Delete the `ai-image-sorter.portable` file to revert to the default application mode: data is written to the system application data directory (`%APPDATA%\com.aiimagesorter.app`).
 
@@ -49,6 +52,14 @@ Delete the `ai-image-sorter.portable` file to revert to the default application 
 4. Select a grouping level, then review images using swipe or arena mode.
 
 The local database is stored in the platform-specific Tauri application data directory (in portable mode: `data\` beside the `.exe`). It contains indexes, scores, labels, recipes, and local telemetry events, but not copied image files.
+
+## Architecture
+
+The desktop shell is Tauri 2: a Rust backend drives a React 19 + TypeScript frontend built with Vite.
+
+- **Frontend** — a single Zustand store with a view switcher (no router), plain-CSS design system, and viewport-window virtualization for large grids. Images are shown through Tauri's asset protocol.
+- **Backend** — Rust exposes ~40 Tauri commands grouped by domain: folder discovery and incremental sync, grouping/clustering, review and scoring, labels and group operations, export, and telemetry. All image metadata parsing (ComfyUI PNG chunks, A1111 parameters, JPEG/WebP EXIF, workflow topology matching) happens here as well.
+- **Storage** — one local SQLite database (WAL mode) holds indexes, scores, labels, recipes, and telemetry; image files are never copied unless you explicitly archive them.
 
 ## Development
 
