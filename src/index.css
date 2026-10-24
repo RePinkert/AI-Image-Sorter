@@ -1045,6 +1045,9 @@ select {
   width: 100%;
   border-collapse: collapse;
   margin: 12px 0;
+  /* 规则08：四列稀疏内容不需要 1100px 面板全宽，
+     constrain 后「删除」回到行尾近处，视线横跳消失 */
+  max-width: 560px;
 }
 .label-table th,
 .label-table td {
