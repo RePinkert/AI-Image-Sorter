@@ -154,7 +154,7 @@ body,
   min-height: 30px;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   padding: 5px 16px;
   border-bottom: 1px solid var(--border);
   background: var(--panel);
@@ -206,7 +206,7 @@ body,
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   padding: 10px 14px;
   margin: 12px 0;
   border: 1px solid var(--accent);
@@ -321,7 +321,7 @@ h2 {
 
 .row {
   display: flex;
-  gap: 10px;
+  gap: 8px;
   align-items: center;
   flex-wrap: wrap;
   margin: 12px 0;
@@ -329,7 +329,7 @@ h2 {
 
 .granularity-bar {
   display: flex;
-  gap: 6px;
+  gap: 4px;
   margin: 12px 0;
 }
 .granularity-bar button {
@@ -464,7 +464,7 @@ select {
 .check {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   color: var(--muted);
 }
 
@@ -513,7 +513,7 @@ select {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 10px;
+  gap: 8px;
   margin: 0;
   padding: 7px 16px;
   color: var(--bad);
@@ -540,7 +540,7 @@ select {
 .group-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-  gap: 14px;
+  gap: 12px;
   margin-top: 16px;
 }
 .group-card {
@@ -659,7 +659,7 @@ select {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 6px;
+  gap: 4px;
   border-radius: var(--r-card);
   background: var(--panel-2);
 }
@@ -863,7 +863,8 @@ select {
   color: var(--muted);
 }
 .gesture-row button .kbd {
-  font-size: 10px;
+  /* v2 R03-size：最低字号 11px。10px 下低对比 muted + 细字重可读性差（规则03）。 */
+  font-size: 11px;
   color: var(--muted);
   letter-spacing: 1px;
 }
@@ -957,7 +958,7 @@ select {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 10px;
+  gap: 8px;
   padding: 5px 16px;
   font-size: 13px;
   color: var(--text);
@@ -1106,7 +1107,7 @@ select {
   left: 50%;
   transform: translateX(-50%);
   display: flex;
-  gap: 6px;
+  gap: 4px;
   align-items: center;
   background: rgba(0, 0, 0, 0.55);
   padding: 6px 10px;
@@ -1243,7 +1244,7 @@ select {
   font-size: 12px;
 }
 
-.filename-search { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; }
+.filename-search { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; }
 .filename-search input { width: min(280px, 34vw); }
 .meta-field textarea { width: 100%; resize: vertical; box-sizing: border-box; font: inherit; line-height: 1.45; }
 .meta-edit-actions { display: flex; gap: 8px; margin-bottom: 10px; }
@@ -1260,7 +1261,7 @@ select {
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   grid-auto-rows: minmax(220px, 1fr);
   align-content: start;
-  gap: 10px;
+  gap: 8px;
   padding: 14px 16px;
   overflow: auto;
 }
@@ -1381,7 +1382,7 @@ select {
 .batch-bar {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   margin-left: 12px;
   padding: 2px 10px;
   border: 1px solid var(--accent);
@@ -1397,7 +1398,7 @@ select {
 .move-target-card {
   display: flex;
   align-items: stretch;
-  gap: 10px;
+  gap: 8px;
   width: 100%;
   margin: 8px 0;
   padding: 8px;
@@ -1420,7 +1421,7 @@ select {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
   overflow: hidden;
 }
 .move-target-info strong,
@@ -1531,7 +1532,7 @@ select {
   font-size: 12px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
 }
 .meta-field pre {
   margin: 2px 0 0;
@@ -1556,7 +1557,8 @@ select {
 
 .diff-badge {
   font-weight: 400;
-  font-size: 10px;
+  /* v2 R03-size：最低字号 11px（此前 10px 的 badge 在 1× 屏难辨，规则03）。 */
+  font-size: 11px;
   margin-left: 6px;
   padding: 1px 6px;
   border-radius: var(--r-control);
@@ -1632,7 +1634,7 @@ select {
 .recommend-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
 }
 .recommend-item {
   border-radius: var(--r-control);
@@ -1696,7 +1698,7 @@ select {
 .recommend-recipe {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 5px 16px;
+  gap: 4px 16px;
   margin: 9px 0 0;
   color: var(--muted);
   font-size: 11px;
@@ -1704,7 +1706,7 @@ select {
 .recommend-recipe > div {
   display: grid;
   grid-template-columns: 74px minmax(0, 1fr);
-  gap: 6px;
+  gap: 4px;
 }
 .recommend-recipe dt {
   color: var(--n-8);
@@ -1786,7 +1788,7 @@ select {
   .recommend-header {
     align-items: flex-start;
     flex-direction: column;
-    gap: 5px;
+    gap: 4px;
   }
   .recommend-recipe {
     grid-template-columns: 1fr;
@@ -1814,7 +1816,7 @@ select {
 .keyboard-vis {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
   margin: 14px 0 20px;
   padding: 12px;
   background: var(--bg);
@@ -1823,7 +1825,7 @@ select {
 }
 .kb-row {
   display: flex;
-  gap: 5px;
+  gap: 4px;
   justify-content: center;
   flex-wrap: nowrap;
 }
@@ -1878,10 +1880,11 @@ select {
   min-height: 0;
 }
 .kb-chip {
-  font-size: 9px;
+  /* v2 R03-size：最低字号 11px。9px 的键帽缩写在 2× 高分屏可读，1× 下不可读（规则03）。 */
+  font-size: 11px;
   line-height: 1.2;
   font-weight: 700;
-  padding: 0 3px;
+  padding: 0 4px;
   border-radius: var(--r-control);
   background: rgba(0, 0, 0, 0.35);
   white-space: nowrap;
@@ -1938,7 +1941,7 @@ select {
 .group-list-rows {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
 }
 .group-row {
   background: var(--n-3);
@@ -1954,14 +1957,14 @@ select {
 .group-row-head {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   padding: 8px 12px;
   cursor: pointer;
 }
 .group-row-title {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   min-width: 0;
   flex: 1;
   cursor: pointer;
@@ -1980,7 +1983,7 @@ select {
 }
 .group-row-actions {
   display: flex;
-  gap: 6px;
+  gap: 4px;
   flex: 0 0 auto;
 }
 .row-action {
@@ -2014,7 +2017,7 @@ select {
 .row-image-strip {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 4px;
   min-height: 40px;
   padding-top: 8px;
 }
