@@ -71,6 +71,8 @@ The desktop shell is Tauri 2: a Rust backend drives a React 19 + TypeScript fron
 
 ### Commands
 
+This repository is a Tauri 2 hybrid project: `npm` manages the Web UI (frontend) and `cargo` manages the Rust backend. `npm run dev` only starts the Web UI dev server in the browser (no Rust backend); use `npm run tauri:dev` for the full desktop app.
+
 ```bash
 npm install
 npm run dev          # Browser development shell

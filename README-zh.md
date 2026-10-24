@@ -71,6 +71,8 @@ Release 构建产物是独立的 `.exe`，无需安装即可直接运行。所�
 
 ### 常用命令
 
+本仓库为 Tauri 2 混合工程：`npm` 负责 Web UI（前端），`cargo` 负责 Rust 后端。`npm run dev` 仅在浏览器中拉起 Web UI 开发服务（不含 Rust 后端）；完整桌面应用请使用 `npm run tauri:dev`。
+
 ```bash
 npm install
 npm run dev          # 浏览器开发壳
