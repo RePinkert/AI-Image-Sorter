@@ -59,7 +59,7 @@ function ClusterSection() {
         <span style={{ minWidth: 50, color: 'var(--accent)', fontWeight: 700 }}>
           {l2Threshold.toFixed(2)}
         </span>
-        <button type="button" disabled={busy} onClick={() => void apply(l2Threshold)}>
+        <button className="btn-primary" type="button" disabled={busy} onClick={() => void apply(l2Threshold)}>
           应用并重新聚类
         </button>
       </div>
@@ -150,7 +150,7 @@ export function Settings() {
                 <span className="color-dot" style={{ background: r.color ?? '#888' }} />
               </td>
               <td>
-                <button type="button" disabled={busy} onClick={() => void remove(r.id)}>删除</button>
+                <button className="btn-danger" type="button" disabled={busy} onClick={() => void remove(r.id)}>删除</button>
               </td>
             </tr>
           ))}
@@ -178,11 +178,15 @@ export function Settings() {
           value={draft.color}
           onChange={(e) => setDraft({ ...draft, color: e.target.value })}
         />
-        <button type="button" disabled={busy || loading} onClick={() => void add()}>添加</button>
+        <button className="btn-secondary" type="button" disabled={busy || loading} onClick={() => void add()}>
+          添加
+        </button>
       </div>
 
       <div className="row">
-        <button type="button" onClick={() => setView('groups')}>返回</button>
+        <button className="btn-tertiary" type="button" onClick={() => setView('groups')}>
+          返回
+        </button>
         <button type="button" className={showKeymap ? 'gran-active' : ''} onClick={() => setShowKeymap(!showKeymap)}>
           {showKeymap ? '收起键位设置' : '键位设置'}
         </button>
@@ -237,6 +241,7 @@ function ExportButtons() {
   return (
     <>
       <button
+        className="btn-secondary"
         type="button"
         disabled={busy}
         onClick={() => void run('csv')}
@@ -244,6 +249,7 @@ function ExportButtons() {
         导出 CSV
       </button>
       <button
+        className="btn-secondary"
         type="button"
         disabled={busy}
         onClick={() => void run('json')}
@@ -264,6 +270,7 @@ function ArchiveButton() {
   return (
     <>
       <button
+        className="btn-secondary"
         type="button"
         disabled={busy}
         onClick={async () => {

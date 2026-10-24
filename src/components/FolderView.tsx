@@ -428,16 +428,20 @@ export function FolderView() {
   return (
     <div className="folder-view">
       <div className="folder-topbar">
-        <button type="button" onClick={() => setView('groups')}>← 返回分组</button>
+        <button className="btn-tertiary" type="button" onClick={() => setView('groups')}>
+          ← 返回分组
+        </button>
         <span className="counter">文件夹视角</span>
         <span style={{ flex: 1 }} />
         {batchMode ? (
-          <button type="button" onClick={() => { setBatchMode(false); setSelected(new Set()) }}>
+          <button className="btn-tertiary" type="button" onClick={() => { setBatchMode(false); setSelected(new Set()) }}>
             退出批量
           </button>
         ) : (
           <>
-            <button type="button" onClick={() => setBatchMode(true)}>批量管理</button>
+            <button className="btn-primary" type="button" onClick={() => setBatchMode(true)}>
+              批量管理
+            </button>
             <select
               className="sort-select"
               value={sortKey}
@@ -455,8 +459,12 @@ export function FolderView() {
             </select>
           </>
         )}
-        <button type="button" onClick={() => setView('swipe')}>滑卡模式</button>
-        <button type="button" onClick={() => setView('arena')}>擂台模式</button>
+        <button className="btn-secondary" type="button" onClick={() => setView('swipe')}>
+          滑卡模式
+        </button>
+        <button className="btn-secondary" type="button" onClick={() => setView('arena')}>
+          擂台模式
+        </button>
       </div>
       <div className="folder-toolbar">
         共 {images.length} 张 · 可评分 {summary.visible} 张 · 已屏蔽 {summary.hidden} 张 ·
@@ -492,10 +500,15 @@ export function FolderView() {
         {batchMode && (
           <span className="batch-bar">
             已选 {selected.size} 张
-            <button type="button" onClick={selectAll} disabled={busy !== null}>全选</button>
-            <button type="button" onClick={() => void batchUnhide()} disabled={selected.size === 0 || busy !== null}>批量取消屏蔽</button>
+            <button className="btn-secondary" type="button" onClick={selectAll} disabled={busy !== null}>
+              全选
+            </button>
+            <button className="btn-secondary" type="button" onClick={() => void batchUnhide()} disabled={selected.size === 0 || busy !== null}>
+              批量取消屏蔽
+            </button>
             {granularity === 2 && (
               <button
+                className="btn-secondary"
                 type="button"
                 onClick={batchSplit}
                 disabled={selected.size === 0 || busy !== null}
@@ -504,12 +517,19 @@ export function FolderView() {
                 拆出为新分组
               </button>
             )}
-            {granularity === 2 && <button type="button" onClick={() => void openMoveDialog()} disabled={selected.size === 0 || busy !== null}>移动至其他组</button>}
+            {granularity === 2 && (
+              <button className="btn-primary" type="button" onClick={() => void openMoveDialog()} disabled={selected.size === 0 || busy !== null}>
+                移动至其他组
+              </button>
+            )}
+            {/* 破坏性操作：原先用 borderColor 内联样式在一排中性按钮里标红边框，
+                仍是「同级按钮」的语气。改为低存在感的红色文字 —— 确认交给对话框，
+                对话框里才升格为醒目的危险色（规则06）。 */}
             <button
+              className="btn-danger"
               type="button"
               onClick={batchDelete}
               disabled={selected.size === 0 || busy !== null}
-              style={{ borderColor: 'var(--bad)' }}
             >
               批量删除
             </button>

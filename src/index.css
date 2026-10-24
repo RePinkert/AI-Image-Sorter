@@ -392,12 +392,56 @@ button {
 button:hover:not(:disabled) {
   background: var(--n-4);
 }
-button:hover:not(:disabled) {
-  background: var(--n-4);
-}
 button:disabled {
   opacity: 0.5;
   cursor: not-default;
+}
+
+/* ------------------------------------------------------------------
+   按钮的重要性金字塔（规则06）。
+
+   页面上应当只有一个主要操作：一两个次要操作，几个很少用到的辅助操作。
+   破坏性操作（删除、屏蔽）即使看起来重要，也**先降级为次要或辅助** ——
+   只有在用户点击后弹出的确认对话框里，才把它升格为醒目鲜红的主要操作。
+   否则满屏都是同权重的实心按钮，谁都抢不到焦点。
+
+   层级由重到轻：btn-primary > btn-secondary > btn-tertiary
+   破坏性另设 btn-danger：常态低存在感，悬停才显出语义。
+   ------------------------------------------------------------------ */
+.btn-primary {
+  background: var(--accent-700);
+  color: var(--ink-inverse);
+  font-weight: 700;
+}
+.btn-primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-700) 86%, white);
+}
+
+.btn-secondary {
+  background: var(--n-2);
+  color: var(--n-9);
+}
+
+/* 辅助操作：容易找到但绝不抢戏 —— 朴素文本链接 */
+.btn-tertiary {
+  background: transparent;
+  color: var(--accent-300);
+  padding: 7px 10px;
+}
+.btn-tertiary:hover:not(:disabled) {
+  background: var(--n-2);
+  color: var(--n-9);
+}
+
+/* 破坏性：不占实心底，用文字颜色携带语义；确认交给对话框 */
+.btn-danger {
+  background: transparent;
+  color: var(--bad-500);
+  padding: 6px 10px;
+}
+.btn-danger:hover:not(:disabled) {
+  background: var(--bad-100);
+  color: var(--bad-500);
 }
 
 input,
@@ -770,17 +814,26 @@ select {
   height: 2px;
   background: transparent;
 }
+/* ---- 规则06 + 04：按钮的重要性金字塔 ----
+   差 / 优 是本页唯一的主要操作（打分闭环），用「浅底深字」做到醒目而不刺眼；
+   待优化 / 跳过 是次要操作，边框中性化、退到背景；
+   屏蔽 是低频破坏性操作 —— 原先它是全页最抢眼的元素（琥珀色药丸，彩度最高），
+   权重与核心操作完全倒挂。降为辅助级：平时近乎隐身，悬停才显出破坏性语义。 */
 .gesture-left {
-  border-color: var(--bad);
+  background: var(--bad-100);
+  border-color: color-mix(in srgb, var(--bad-500) 45%, transparent);
+  color: var(--bad-500);
 }
 .gesture-right {
-  border-color: var(--good);
+  background: var(--good-100);
+  border-color: color-mix(in srgb, var(--good-500) 45%, transparent);
+  color: var(--good-500);
 }
-.gesture-up {
-  border-color: var(--warn);
-}
+.gesture-up,
 .gesture-down {
-  border-color: var(--muted);
+  background: transparent;
+  border-color: var(--n-4);
+  color: var(--muted);
 }
 .gesture-row button .kbd {
   font-size: 10px;
@@ -1336,15 +1389,17 @@ select {
   padding: 8px 0 2px;
 }
 .gesture-extra-row .gesture-hide {
-  padding: 6px 18px;
-  border-radius: var(--r-pill);
-  border: 1px solid var(--warn);
-  color: var(--warn);
+  padding: 5px 12px;
+  border-radius: var(--r-control);
+  border: 0;
+  color: var(--muted);
   background: transparent;
-  font-size: 13px;
+  font-size: 12px;
 }
-.gesture-extra-row .gesture-hide:hover {
-  background: color-mix(in srgb, var(--warn) 15%, transparent);
+/* 破坏性语义只在用户主动靠近时才浮现，平时不与主要操作争夺注意力 */
+.gesture-extra-row .gesture-hide:hover:not(:disabled) {
+  color: var(--bad-500);
+  background: var(--bad-100);
 }
 .meta-hide-btn {
   margin-top: 10px;
