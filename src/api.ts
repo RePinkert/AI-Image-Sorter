@@ -491,8 +491,25 @@ export async function confirmAction(message: string, detail?: string): Promise<b
   })
 }
 
+// Placeholder mode. With `?ph=1` on the page URL the dev bridge answers
+// every image request with a deterministic SVG stand-in instead of the
+// original bytes, so the screenshot instrument never embeds the user's own
+// generated images. Desktop (Tauri) is unaffected: it reads the real file
+// through the asset protocol.
+export function placeholderMode(): boolean {
+  if (typeof window === 'undefined') return false
+  try {
+    return new URLSearchParams(window.location.search).get('ph') === '1'
+  } catch {
+    return false
+  }
+}
+
 export function assetUrl(absPath: string): string {
-  if (isWebDev()) return `/api/file?path=${encodeURIComponent(absPath)}`
+  if (isWebDev()) {
+    const ph = placeholderMode() ? '&ph=1' : ''
+    return `/api/file?path=${encodeURIComponent(absPath)}${ph}`
+  }
   return convertFileSrc(absPath)
 }
 

@@ -19,6 +19,21 @@ export interface Keymap {
   arenaHideRight: Binding
   arenaUndoHide: Binding
   closeLightbox: Binding
+  /** 查看器：上一张 / 下一张 */
+  viewerPrev: Binding
+  viewerNext: Binding
+  /** 查看器：放大 / 缩小 */
+  viewerZoomIn: Binding
+  viewerZoomOut: Binding
+  /** 查看器：适应窗口 / 实际像素(1:1) */
+  viewerFit: Binding
+  viewerActual: Binding
+  /** 查看器：原生全屏 / 元数据侧栏 */
+  viewerFullscreen: Binding
+  viewerMeta: Binding
+  /** 文件夹视角：在当前分类轴上翻到上一组 / 下一组 */
+  folderPrevGroup: Binding
+  folderNextGroup: Binding
 }
 
 export const DEFAULT_KEYMAP: Keymap = {
@@ -38,6 +53,16 @@ export const DEFAULT_KEYMAP: Keymap = {
   arenaHideRight: 'Shift+ArrowRight',
   arenaUndoHide: 'Backspace',
   closeLightbox: 'Escape',
+  viewerPrev: 'ArrowLeft',
+  viewerNext: 'ArrowRight',
+  viewerZoomIn: '+',
+  viewerZoomOut: '-',
+  viewerFit: '0',
+  viewerActual: '1',
+  viewerFullscreen: 'f',
+  viewerMeta: 'm',
+  folderPrevGroup: 'ArrowLeft',
+  folderNextGroup: 'ArrowRight',
 }
 
 export interface KeymapAction {
@@ -45,7 +70,7 @@ export interface KeymapAction {
   label: string
   /** Short name shown on the visual keyboard key chip. */
   short: string
-  group: 'swipe' | 'arena' | 'global'
+  group: 'swipe' | 'arena' | 'viewer' | 'global'
 }
 
 export const KEYMAP_ACTIONS: KeymapAction[] = [
@@ -63,6 +88,16 @@ export const KEYMAP_ACTIONS: KeymapAction[] = [
   { key: 'arenaHideRight', label: '擂台 · 屏蔽右卡', short: '屏蔽右', group: 'arena' },
   { key: 'arenaUndoHide', label: '擂台 · 撤销屏蔽', short: '撤销屏蔽', group: 'arena' },
   { key: 'closeLightbox', label: '通用 · 关闭灯箱', short: '关灯箱', group: 'global' },
+  { key: 'viewerPrev', label: '查看器 · 上一张', short: '上张', group: 'viewer' },
+  { key: 'viewerNext', label: '查看器 · 下一张', short: '下张', group: 'viewer' },
+  { key: 'viewerZoomIn', label: '查看器 · 放大', short: '放大', group: 'viewer' },
+  { key: 'viewerZoomOut', label: '查看器 · 缩小', short: '缩小', group: 'viewer' },
+  { key: 'viewerFit', label: '查看器 · 适应窗口', short: '适应', group: 'viewer' },
+  { key: 'viewerActual', label: '查看器 · 实际像素', short: '1:1', group: 'viewer' },
+  { key: 'viewerFullscreen', label: '查看器 · 全屏', short: '全屏', group: 'viewer' },
+  { key: 'viewerMeta', label: '查看器 · 元数据侧栏', short: '元数据', group: 'viewer' },
+  { key: 'folderPrevGroup', label: '文件夹视角 · 上一组', short: '上组', group: 'global' },
+  { key: 'folderNextGroup', label: '文件夹视角 · 下一组', short: '下组', group: 'global' },
 ]
 
 const MODIFIERS = ['Shift', 'Control', 'Ctrl', 'Alt', 'Meta'] as const
@@ -79,10 +114,20 @@ export function isModifierKey(key: string): boolean {
   return (MODIFIERS as readonly string[]).includes(key)
 }
 
+/** '=' and '+' are the same physical key on a US layout. A user reaching for
+ *  "zoom in" may press either, so the two are treated as equivalent. */
+const KEY_ALIASES: Record<string, string[]> = {
+  '=': ['+'],
+  '+': ['='],
+}
+
 function keyMatches(pressed: string, expected: string): boolean {
   if (expected === 'Space') return pressed === ' ' || pressed === 'Spacebar'
   if (pressed.length === 1 && expected.length === 1) {
-    return pressed.toLowerCase() === expected.toLowerCase()
+    const p = pressed.toLowerCase()
+    const e = expected.toLowerCase()
+    if (p === e) return true
+    return (KEY_ALIASES[e] ?? []).includes(p)
   }
   return pressed === expected
 }

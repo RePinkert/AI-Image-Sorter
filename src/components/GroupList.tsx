@@ -28,13 +28,8 @@ import {
   MODEL_DEVIATION_DIMENSION_LABELS,
 } from '../types'
 import { useStore } from '../store'
+import { GRANULARITY_LEVELS, groupLabel } from '../lib/groupLabel'
 
-const LEVELS: { value: Granularity; label: string }[] = [
-  { value: 0, label: '文件夹' },
-  { value: 1, label: 'Model偏差' },
-  { value: 2, label: 'Prompt偏差' },
-  { value: 3, label: '独立Prompt' },
-]
 
 const groupThumbCache = new Map<string, string[]>()
 const groupThumbInflight = new Map<string, Promise<string[]>>()
@@ -394,15 +389,6 @@ export function GroupList() {
     setView('folder')
   }
 
-  function displayLabel(g: GroupInfo): string {
-    if (granularity === 0) {
-      return g.source_path || '(文件夹)'
-    }
-    if (granularity === 1) {
-      return g.model_param || g.workflow_name || '未命名 Model偏差'
-    }
-    return g.prompt_pos.slice(0, 120) || '(无 prompt)'
-  }
 
   const syncProgress = useStore((s) => s.syncProgress)
   const syncing = syncProgress.active && syncProgress.pending > 0
@@ -490,7 +476,7 @@ export function GroupList() {
       const targets = await listMoveTargets(currentSourceId, rowKey)
       setMoveRequest({
         rowKey,
-        label: group ? displayLabel(group) : rowKey,
+        label: group ? groupLabel(group, granularity) : rowKey,
         imageIds: ids,
       })
       setMoveTargets(targets)
@@ -596,7 +582,7 @@ export function GroupList() {
   }
 
   function dangerGuardLabel(g: GroupInfo): string {
-    return `「${displayLabel(g)}」`
+    return `「${groupLabel(g, granularity)}」`
   }
 
   return (
@@ -647,7 +633,7 @@ export function GroupList() {
       </div>
 
       <div className="granularity-bar">
-        {LEVELS.map((l) =>
+        {GRANULARITY_LEVELS.map((l) =>
           l.value !== 1 ? (
             <button
               type="button"
@@ -725,7 +711,7 @@ export function GroupList() {
                   mergeMode && granularity === 2 ? toggleMergeSelect(g.group_key) : openGroup(g)
                 }
               }}
-              title={displayLabel(g)}
+              title={groupLabel(g, granularity)}
             >
               {mergeMode && granularity === 2 && (
                 <input
@@ -741,7 +727,7 @@ export function GroupList() {
               )}
               <LazyGroupThumb groupKey={g.group_key} level={granularity} />
               <span className="group-count-badge">{g.count}</span>
-              <div className="group-prompt">{displayLabel(g)}</div>
+              <div className="group-prompt">{groupLabel(g, granularity)}</div>
               {granularity === 2 && g.manually_merged && (
                 <span className="merged-badge" title="该组为手动合并结果，自动重聚类不会拆开">
                   已手动合并
@@ -835,7 +821,7 @@ export function GroupList() {
                   >
                     <span className="group-chevron">{open ? '▾' : '▸'}</span>
                     <span className="group-count-badge">{g.count}</span>
-                    <span className="group-prompt">{displayLabel(g)}</span>
+                    <span className="group-prompt">{groupLabel(g, granularity)}</span>
                     {g.manually_merged && <span className="merged-badge" title="该组为手动合并结果，自动重聚类不会拆开">已手动合并</span>}
                   </div>
                   <div className="group-row-actions">
@@ -1011,7 +997,7 @@ export function GroupList() {
                   >
                     <LazyGroupThumb groupKey={g.group_key} level={granularity} />
                     <span className="group-count-badge">{g.count}</span>
-                    <div className="group-prompt">{displayLabel(g)}</div>
+                    <div className="group-prompt">{groupLabel(g, granularity)}</div>
                   </motion.div>
                 ))}
               </div>

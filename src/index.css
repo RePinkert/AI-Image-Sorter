@@ -189,8 +189,9 @@ body,
   color: var(--accent);
   border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
 }
+/* 手动合并的选中信号同样是 accent 描边（规则16）；`border-color` 同样是
+   规则19 删边框后遗留的死声明，一并清掉。 */
 .group-card.merge-selected {
-  border-color: var(--accent);
   box-shadow: 0 0 0 1px var(--accent) inset;
 }
 .merge-check {
@@ -1063,44 +1064,117 @@ select {
   border-radius: 50%;
 }
 
-/* ---------- Lightbox ---------- */
-/* Flex row: the image stage always keeps the whole viewport minus the side
-   rail. Metadata lives in the sidebar — never over the image — so clicking
-   an image to enlarge always yields an unobstructed full view. */
+/* ---------- Viewer (lightbox) ---------- */
+/* Flex row: the stage always keeps the whole viewport minus the side rail.
+   Metadata lives in the sidebar — never over the image — so opening an
+   image for a full look always yields an unobstructed full view.
+   The image itself is laid out at its NATURAL pixel size and transformed
+   (scale + translate), so "1:1" means actual pixels and the zoom can be
+   anchored at the cursor. */
 .lightbox {
   position: fixed;
   inset: 0;
   z-index: 999;
-  background: rgba(0, 0, 0, 0.92);
+  background: var(--n-pure);
   display: flex;
   user-select: none;
 }
 .lightbox-stage {
   flex: 1;
   min-width: 0;
-  position: relative;
+  min-height: 0;
   display: flex;
-  align-items: center;
-  justify-content: center;
+  flex-direction: column;
+  background: var(--n-pure);
+}
+/* The canvas hosts the transformed image plus the overlays. It never
+   scrolls: panning is a transform, not a scroll. */
+.lightbox-canvas {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  cursor: zoom-in;
+}
+.lightbox-canvas.dragging {
+  cursor: grabbing;
 }
 .lightbox-img-wrap {
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform-origin: 50% 50%;
   will-change: transform;
   touch-action: none;
-  max-width: 100%;
-  max-height: 100%;
-  min-width: 0;
-  min-height: 0;
+  transition: transform 0.16s ease-out;
 }
 .lightbox-img-wrap img {
-  max-width: 100%;
-  max-height: 86vh;
-  object-fit: contain;
   display: block;
+  width: 100%;
+  height: 100%;
   user-select: none;
+  -webkit-user-drag: none;
 }
+
+/* 规则17：压在图上的文字必须先处理背景 —— 半透明深色蒙版压住高光。 */
+.viewer-status {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  display: flex;
+  /* 规则12：不同字号同行混排用基线对齐，不用几何居中 */
+  align-items: baseline;
+  gap: 12px;
+  max-width: min(62%, 760px);
+  padding: 6px 12px;
+  border-radius: var(--r-control);
+  background: rgba(0, 0, 0, 0.62);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+  pointer-events: none;
+}
+.viewer-status-index {
+  font-weight: 700;
+}
+.viewer-status-dim {
+  color: var(--muted);
+}
+.viewer-status-zoom {
+  color: var(--accent-300);
+  font-weight: 600;
+}
+.viewer-status-model {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+/* 上一张 / 下一张：贴边悬浮，垂直居中 */
+.viewer-nav {
+  position: absolute;
+  top: 50%;
+  right: 12px;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.viewer-nav-btn {
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  font-size: 20px;
+  line-height: 1;
+  background: rgba(0, 0, 0, 0.62);
+  color: var(--n-9);
+}
+.viewer-nav-btn:hover:not(:disabled) {
+  background: rgba(40, 40, 52, 0.9);
+}
+
 .lightbox-hud {
   position: absolute;
   bottom: 16px;
@@ -1109,9 +1183,9 @@ select {
   display: flex;
   gap: 4px;
   align-items: center;
-  background: rgba(0, 0, 0, 0.55);
-  padding: 6px 10px;
+  padding: 4px 6px;
   border-radius: var(--r-card);
+  background: rgba(0, 0, 0, 0.62);
 }
 .lightbox-hud .lb-scale {
   min-width: 56px;
@@ -1121,12 +1195,79 @@ select {
 }
 .lb-hint {
   position: absolute;
-  bottom: 4px;
+  bottom: 62px;
   left: 50%;
   transform: translateX(-50%);
+  max-width: 92%;
+  padding: 4px 10px;
+  border-radius: var(--r-control);
+  background: rgba(0, 0, 0, 0.62);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
   text-align: center;
-  width: 100%;
+  pointer-events: none;
 }
+
+/* 胶片条：位于舞台**下方**，永不压住放大后的图。
+   规则19（慎用边框）：舞台是纯黑 --n-pure，胶片条是 --n-1 —— 底色差
+   已经把两者分得清清楚楚，再画一根 1px 发丝边只是噪音，删掉。 */
+.filmstrip {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  height: 76px;
+  padding: 6px 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  background: var(--n-1);
+}
+.filmstrip-item {
+  position: relative;
+  flex: 0 0 auto;
+  width: 64px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-control);
+  background: transparent;
+  overflow: hidden;
+  cursor: pointer;
+}
+.filmstrip-item img {
+  display: block;
+  width: 64px;
+  height: 64px;
+  object-fit: cover;
+  background: var(--n-2);
+}
+.filmstrip-item.active {
+  box-shadow: 0 0 0 2px var(--accent-300);
+}
+.filmstrip-label {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 1px 4px;
+  font-size: 11px;
+  line-height: 1.2;
+  color: var(--n-9);
+  background: rgba(0, 0, 0, 0.62);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+  /* 一排缩略图各挂一条被截断到看不出所以然的文件名，是纯噪音。
+     只在当前项与悬停项上显示 —— 需要时才出现。 */
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.filmstrip-item.active .filmstrip-label,
+.filmstrip-item:hover .filmstrip-label {
+  opacity: 1;
+}
+
 /* Right sidebar (FolderView zoom view): summons the metadata panel on
    demand. The panel scrolls internally so long prompts stay usable. */
 .lightbox-side {
@@ -1232,6 +1373,60 @@ select {
   font-size: 13px;
   cursor: pointer;
 }
+
+/* 虚拟分类轴说明条。
+   四个层级是**平行分类轴**（源目录 / 模型参数指纹 / Prompt 相似簇 / 单条
+   Prompt），不是包含关系 —— 所以这里不画路径，只说明「当前在哪条轴上、
+   该轴的第几组、这一组是谁」，并提供横向翻页。 */
+.fb-axis {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex: 0 0 auto;
+  min-height: 36px;
+  padding: 6px 16px;
+  background: var(--n-2);
+  color: var(--muted);
+  font-size: 12px;
+}
+/* 规则09（间距的亲疏之别）：轴名与序号是一组（"哪条轴、第几组"），
+   组内距离必须**小于**组与组之间的距离。否则四个元素等距排开，
+   读的人无从判断谁和谁是一伙的。8px 组内 vs 16px 组间，且都落在 4px 网格上。 */
+.fb-axis-ident {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+.fb-axis-name {
+  font-weight: 700;
+  color: var(--n-9);
+}
+.fb-axis-pos {
+  font-variant-numeric: tabular-nums;
+}
+.fb-axis-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fb-axis-nav {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 4px;
+}
+
+/* 空状态（规则20）：给出明确的下一步，而不是一句冷冰冰的「没有内容」。 */
+.folder-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 40px 16px;
+  text-align: center;
+}
 .folder-toolbar {
   display: flex;
   align-items: center;
@@ -1280,7 +1475,7 @@ select {
   overflow: hidden;
   background: var(--n-pure);
   cursor: zoom-in;
-  transition: border-color 0.15s;
+  transition: box-shadow 0.15s;
 }
 .folder-item:hover {
   border-color: var(--accent);
@@ -1348,8 +1543,11 @@ select {
 .folder-item.batch {
   cursor: pointer;
 }
+/* 选中态的可见信号是下面那圈 accent 描边（规则16）。
+   旧写法里的 `border-color: var(--accent)` 在规则19 删掉整框发丝边之后
+   已经没有边框可染 —— 是一条**死声明**，留着只会误导后来人以为选中态靠
+   边框颜色表达。 */
 .folder-item.selected {
-  border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent);
 }
 .folder-item.selected .batch-check {

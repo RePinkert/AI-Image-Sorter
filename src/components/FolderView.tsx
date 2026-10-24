@@ -15,8 +15,11 @@ import {
 } from '../api'
 import type { ImageRow } from '../types'
 import { useStore } from '../store'
+import { matchesBinding } from '../keymap'
 import { Lightbox } from './Lightbox'
+import { FolderAxisStrip } from './FolderAxisStrip'
 import { PromptRecommendPanel } from './PromptRecommendPanel'
+import { granularityLabel, groupLabel, groupLabelCompact } from '../lib/groupLabel'
 import { useViewportWindow } from '../hooks/useViewportWindow'
 import { getTelemetrySessionId, trackAction } from '../telemetry'
 
@@ -40,6 +43,11 @@ export function FolderView() {
   const currentSourceId = useStore((s) => s.currentSourceId)
   const granularity = useStore((s) => s.granularity)
   const bumpDataRevision = useStore((s) => s.bumpDataRevision)
+  // The flat list of buckets on the active axis. The four levels are
+  // PARALLEL classification axes (not a containment hierarchy), so moving
+  // between buckets is lateral: previous / next sibling on this axis.
+  const groups = useStore((s) => s.groups)
+  const setCurrentGroupKey = useStore((s) => s.setCurrentGroupKey)
   const [images, setImages] = useState<ImageRow[]>([])
   const [busy, setBusy] = useState<number | null>(null)
   const [lightbox, setLightbox] = useState<ImageRow | null>(null)
@@ -123,6 +131,48 @@ export function FolderView() {
     return sorted.filter((image) => (!showHiddenOnly || image.hidden)
       && (!query || image.filename.toLocaleLowerCase().includes(query)))
   }, [sorted, showHiddenOnly, searchQuery])
+
+  // The images of the grid, in display order — the viewer pages through
+  // exactly this list.
+  const lightboxIndex = useMemo(
+    () => (lightbox ? visible.findIndex((i) => i.id === lightbox.id) : -1),
+    [lightbox, visible],
+  )
+
+  // Lateral navigation on the active classification axis. The levels are
+  // parallel axes, so the neighbours of a bucket are its SIBLINGS on that
+  // axis — never a parent or a child.
+  const groupIndex = useMemo(
+    () => (currentGroupKey == null ? -1 : groups.findIndex((g) => g.group_key === currentGroupKey)),
+    [groups, currentGroupKey],
+  )
+  const currentGroup = groupIndex >= 0 ? groups[groupIndex] : null
+
+  const gotoSiblingGroup = useCallback((delta: number) => {
+    if (groupIndex < 0) return
+    const next = groups[groupIndex + delta]
+    if (!next) return
+    setCurrentGroupKey(next.group_key)
+  }, [groups, groupIndex, setCurrentGroupKey])
+
+  // ←/→ page through the buckets of the active axis. Suspended while the
+  // viewer is open — there the same keys page through the IMAGES.
+  const folderPrevBinding = useStore((s) => s.keybindings.folderPrevGroup)
+  const folderNextBinding = useStore((s) => s.keybindings.folderNextGroup)
+  useEffect(() => {
+    if (lightbox) return
+    const onKey = (e: KeyboardEvent) => {
+      if (matchesBinding(folderPrevBinding, e)) {
+        e.preventDefault()
+        gotoSiblingGroup(-1)
+      } else if (matchesBinding(folderNextBinding, e)) {
+        e.preventDefault()
+        gotoSiblingGroup(1)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [lightbox, folderPrevBinding, folderNextBinding, gotoSiblingGroup])
 
   // Viewport windowing: the DB-driven masonry layout above always spans the
   // whole list (pure arithmetic), but only the items inside the scroll
@@ -466,6 +516,15 @@ export function FolderView() {
           擂台模式
         </button>
       </div>
+      <FolderAxisStrip
+        axisLabel={granularityLabel(granularity)}
+        index={groupIndex}
+        total={groups.length}
+        label={currentGroup ? groupLabelCompact(currentGroup, granularity) : '—'}
+        title={currentGroup ? groupLabel(currentGroup, granularity) : ''}
+        onPrev={() => gotoSiblingGroup(-1)}
+        onNext={() => gotoSiblingGroup(1)}
+      />
       <div className="folder-toolbar">
         共 {images.length} 张 · 可评分 {summary.visible} 张 · 已屏蔽 {summary.hidden} 张 ·
         平均 {avg.toFixed(1)} · 区间 {summary.visible > 0 ? `${summary.min.toFixed(0)}–${summary.max.toFixed(0)}` : '—'}
@@ -539,8 +598,21 @@ export function FolderView() {
       </div>
       {actionError && <div className="action-error" role="alert"><span>{actionError}</span></div>}
       {visible.length === 0 ? (
-        <div className="panel">
-          <p className="muted">{searchQuery.trim() ? `当前分组中没有名称匹配“${searchQuery.trim()}”的图片。` : showHiddenOnly ? '没有已屏蔽的图片。' : '该组无图片。'}</p>
+        <div className="panel folder-empty">
+          <p className="muted">
+            {searchQuery.trim()
+              ? `当前分组中没有名称匹配“${searchQuery.trim()}”的图片。`
+              : showHiddenOnly ? '没有已屏蔽的图片。' : '该组无图片。'}
+          </p>
+          {searchQuery.trim() ? (
+            <button type="button" className="btn-secondary" onClick={() => setSearchQuery('')}>
+              清除筛选
+            </button>
+          ) : (
+            <button type="button" className="btn-secondary" onClick={() => setView('groups')}>
+              返回分组
+            </button>
+          )}
         </div>
       ) : (
         <div
@@ -574,11 +646,22 @@ export function FolderView() {
         单击图片放大 · 屏蔽可随时取消 · 删除送入系统回收站可从桌面恢复 · 批量管理支持全选 / 批量删除 / 批量取消屏蔽
       </p>
       {lightbox && (
-        <Lightbox src={assetUrl(lightbox.abs_path)} meta={lightbox} onClose={() => setLightbox(null)} onMetaUpdated={(updated) => {
-          setLightbox(updated)
-          setImages((rows) => rows.map((row) => row.id === updated.id ? updated : row))
-          bumpDataRevision()
-        }} />
+        <Lightbox
+          src={assetUrl(lightbox.abs_path)}
+          meta={lightbox}
+          siblings={visible}
+          index={lightboxIndex}
+          onNavigate={(i) => {
+            const next = visible[i]
+            if (next) setLightbox(next)
+          }}
+          onClose={() => setLightbox(null)}
+          onMetaUpdated={(updated) => {
+            setLightbox(updated)
+            setImages((rows) => rows.map((row) => row.id === updated.id ? updated : row))
+            bumpDataRevision()
+          }}
+        />
       )}
       {moveTargets && (
         <div className="merge-confirm-overlay" onClick={() => !moveBusy && setMoveTargets(null)}>

@@ -48,9 +48,10 @@ function isConflicting(actionKey: keyof Keymap, keymap: Keymap): boolean {
   )
 }
 
-const GROUPS: { id: 'swipe' | 'arena' | 'global'; label: string }[] = [
+const GROUPS: { id: 'swipe' | 'arena' | 'viewer' | 'global'; label: string }[] = [
   { id: 'swipe', label: '滑卡模式' },
   { id: 'arena', label: '擂台模式' },
+  { id: 'viewer', label: '查看器' },
   { id: 'global', label: '通用' },
 ]
 

@@ -10,6 +10,63 @@ const xx = await xxhash()
 const isTauri = (req: { headers: { origin?: string } }) =>
   req.headers.origin?.startsWith('tauri://') || req.headers.origin?.startsWith('http://tauri.localhost')
 
+// ---------------------------------------------------------------------------
+// Placeholder image mode (copyright safety for the screenshot instrument).
+//
+// The user owns the generated images; screenshots of the real library would
+// embed copyrighted content. The dev bridge therefore serves a DETERMINISTIC
+// SVG stand-in instead of the original bytes whenever the request asks for
+// it (`?ph=1`, which the front end forwards from the page URL `?ph=1`).
+//
+// Determinism matters for a second reason: identical DB state → identical
+// bytes → screenshots become a real pixel-diff regression baseline.
+//
+// The placeholder keeps the REAL width/height from the DB, so the masonry
+// layout, card sizes and every layout/overflow measurement stay identical to
+// production. Only the pixels inside the frame differ.
+// ---------------------------------------------------------------------------
+function fnv1a(input: string): number {
+  let h = 0x811c9dc5
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return h >>> 0
+}
+
+function xmlEscape(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;')
+}
+
+function placeholderSvg(absPath: string, filename: string, width: number, height: number): string {
+  const w = Math.max(1, Math.round(width))
+  const h = Math.max(1, Math.round(height))
+  const hash = fnv1a(absPath)
+  const hue = hash % 360
+  const hue2 = (hue + 42) % 360
+  const label = xmlEscape(filename.length > 42 ? `${filename.slice(0, 40)}…` : filename)
+  const fontSize = Math.max(11, Math.min(20, Math.round(Math.min(w, h) / 16)))
+  return [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">`,
+    '<defs>',
+    `<linearGradient id="g" x1="0" y1="0" x2="1" y2="1">`,
+    `<stop offset="0" stop-color="hsl(${hue} 16% 27%)"/>`,
+    `<stop offset="1" stop-color="hsl(${hue2} 13% 15%)"/>`,
+    '</linearGradient>',
+    '</defs>',
+    `<rect width="${w}" height="${h}" fill="url(#g)"/>`,
+    `<circle cx="${Math.round(w * 0.78)}" cy="${Math.round(h * 0.24)}" r="${Math.round(Math.min(w, h) * 0.13)}" fill="hsl(${hue2} 22% 40%)" opacity="0.5"/>`,
+    `<text x="${Math.round(w / 2)}" y="${Math.round(h / 2)}" fill="#e6e6ea" opacity="0.62" font-family="monospace" font-size="${fontSize}" text-anchor="middle" dominant-baseline="middle">${label}</text>`,
+    `<text x="${Math.round(w / 2)}" y="${Math.round(h / 2 + fontSize * 1.6)}" fill="#9a9aa8" opacity="0.5" font-family="monospace" font-size="${Math.max(10, fontSize - 3)}" text-anchor="middle">${w}×${h}</text>`,
+    '</svg>',
+  ].join('')
+}
+
 function webBridge() {
   return {
     name: 'local-image-sorter-web-bridge',
@@ -322,6 +379,7 @@ function webBridge() {
             send(200, Math.abs(score(left) - score(right)) < 5)
           } else if (url.pathname === '/api/file') {
             const filePath = url.searchParams.get('path')
+            const placeholder = url.searchParams.get('ph') === '1'
             if (!filePath) send(400, { error: 'missing path' })
             else {
               const ext = path.extname(filePath).toLowerCase()
@@ -329,7 +387,18 @@ function webBridge() {
               const registered = db.prepare('SELECT COUNT(*) AS count FROM images WHERE abs_path = ?').get(filePath) as { count: number }
               if (!registered.count) send(403, { error: 'file is not registered' })
               else if (!types[ext]) send(415, { error: 'unsupported image type' })
-              else if (!fs.existsSync(filePath)) send(404, { error: 'file not found' })
+              else if (placeholder) {
+                // Copyright-safe stand-in: never read the original bytes.
+                const row = db.prepare('SELECT filename, width, height FROM images WHERE abs_path = ?').get(filePath) as
+                  { filename?: string; width?: number | null; height?: number | null } | undefined
+                const svg = placeholderSvg(
+                  filePath,
+                  row?.filename ?? path.basename(filePath),
+                  Number(row?.width ?? 0) || 512,
+                  Number(row?.height ?? 0) || 512,
+                )
+                send(200, svg, 'image/svg+xml')
+              } else if (!fs.existsSync(filePath)) send(404, { error: 'file not found' })
               else send(200, fs.readFileSync(filePath), types[ext])
             }
           } else {
