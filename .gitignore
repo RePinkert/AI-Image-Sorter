@@ -32,3 +32,17 @@ Thumbs.db
 # Personal work logs (timestamped .md) — never push these
 0???????.md
 [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].md
+# autoresearch instrument shots (real user images �� never commit)
+shots/
+# L2 lab outputs: embeddings are derived from the user's private images and
+# prompts — reversible in principle, never committed.
+tools/l2lab/out/
+# L2 lab model weights: fetched by tools/l2lab/fetch_models.ps1 (same policy
+# as LAP's scripts/download_models.sh — weights are downloaded, not committed).
+tools/l2lab/models/
+# L2 lab python env: onnxruntime 1.22.0 must match the ort crate's bundled
+# ONNX Runtime, otherwise int8 quantization numerics diverge (see embed.py).
+tools/l2lab/.venv/
+
+# Playwright harness imports (ui_checks) leave bytecode caches
+__pycache__/

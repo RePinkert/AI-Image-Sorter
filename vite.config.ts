@@ -5,6 +5,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import xxhash from 'xxhash-wasm'
 
+import { maskText } from './tools/l2lab/mask.mjs'
+
 const xx = await xxhash()
 
 const isTauri = (req: { headers: { origin?: string } }) =>
@@ -24,6 +26,13 @@ const isTauri = (req: { headers: { origin?: string } }) =>
 // The placeholder keeps the REAL width/height from the DB, so the masonry
 // layout, card sizes and every layout/overflow measurement stay identical to
 // production. Only the pixels inside the frame differ.
+//
+// PROMPT SAFETY (stage six guardrail P1): the same `?ph=1` channel also masks
+// the prompt text. The images are the user's copyrighted output, but the
+// PROMPTS are private content too — the real prompt never belongs in a
+// screenshot, a probe report or a log line. Masking is width-preserving
+// (〇 is full-width like a han character, x is half-width like a latin letter),
+// so every layout measurement stays comparable to production.
 // ---------------------------------------------------------------------------
 function fnv1a(input: string): number {
   let h = 0x811c9dc5
@@ -88,6 +97,10 @@ function webBridge() {
 
         try {
           const url = new URL(req.url, 'http://localhost')
+          // Prompt masking rides the same channel as the placeholder image:
+          // `?ph=1` means "this output may be captured by an instrument".
+          const maskPrompts = url.searchParams.get('ph') === '1'
+          const maskIf = (value: unknown) => (maskPrompts ? maskText(String(value ?? '')) : value)
           const db = new Database(dbPath, { readonly: true, fileMustExist: true })
           const tableExists = (name: string) => {
             const row = db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name=?").get(name) as { count: number }
@@ -261,6 +274,10 @@ function webBridge() {
                 }
               }
             }
+            // The group card renders `prompt_pos` as the group's name — the
+            // most privacy-sensitive string in the whole UI. Mask it in the
+            // capture channel; the desktop app is unaffected.
+            for (const row of rows) row.prompt_pos = maskIf(row.prompt_pos)
             send(200, rows)
           } else if (url.pathname === '/api/group-thumbnails') {
             const keys = (url.searchParams.get('keys') ?? '').split(',').filter(Boolean)
@@ -271,6 +288,186 @@ function webBridge() {
               thumb_paths: statement.all(key).map((row: any) => row.abs_path),
             })).filter((item) => item.thumb_paths.length > 0)
             send(200, result)
+          } else if (url.pathname === '/api/move-targets') {
+            // 移动对话框的候选组（与 db.rs 的 list_l2_targets 同口径）。
+            // 这条端点之前一直缺着 —— 结果是「移动至其他组」在浏览器里
+            // 永远 404，界面根本点不开（探针也就永远验不到它）。
+            const sourceId = Number(url.searchParams.get('sourceId') ?? 0)
+            const currentL2 = url.searchParams.get('currentL2') ?? ''
+            const rows = db.prepare(`SELECT i.group_key_l2 AS group_key, COUNT(*) AS count,
+                MIN(i.prompt_pos) AS prompt_pos, MIN(i.checkpoint) AS checkpoint,
+                MIN(i.source_kind) AS source_kind, MIN(s.path) AS source_path,
+                ${workflowName} AS workflow_name
+              FROM images i JOIN sources s ON s.id=i.source_id
+              ${workflowJoin}
+              WHERE i.source_id=? AND i.group_key_l2 IS NOT NULL
+                AND i.group_key_l2 != ? AND i.hidden=0
+              GROUP BY i.group_key_l2 ORDER BY count DESC`)
+              .all(sourceId, currentL2) as Array<Record<string, unknown>>
+            send(200, rows.map((row) => ({ ...row, prompt_pos: maskIf(row.prompt_pos ?? '') })))
+          } else if (url.pathname === '/api/suggest-move-targets') {
+            // 「可能相关」推荐（阶段六）。桌面端用 Rust 侧的同一套口径；
+            // dev bridge 这里实现同样的两种基准：有视觉签名用视觉余弦，
+            // 没有就退回 prompt 的词 Jaccard（与 clustering.rs 的 tokenize 同口径）。
+            const sourceId = Number(url.searchParams.get('sourceId') ?? 0)
+            const currentL2 = url.searchParams.get('currentL2') ?? ''
+            const imageIds = (url.searchParams.get('imageIds') ?? '')
+              .split(',')
+              .map((x) => Number(x))
+              .filter((x) => Number.isFinite(x) && x > 0)
+            // 与 clustering.rs:15 同口径的词切分：逗号/空白切分，CJK 逐字。
+            const tokenize = (prompt: string): string[] => {
+              const tokens: string[] = []
+              for (const part of prompt.toLowerCase().split(/[,\s]+/)) {
+                if (!part) continue
+                if (/[\u4e00-\u9fff]/.test(part)) {
+                  let buf = ''
+                  for (const ch of part) {
+                    if (/[\u4e00-\u9fff]/.test(ch)) {
+                      if (buf) { tokens.push(buf); buf = '' }
+                      tokens.push(ch)
+                    } else if (/[0-9a-z']/i.test(ch) || ch === '-') {
+                      buf += ch
+                    } else if (buf) { tokens.push(buf); buf = '' }
+                  }
+                  if (buf) tokens.push(buf)
+                } else {
+                  tokens.push(part)
+                }
+              }
+              return tokens
+            }
+            if (imageIds.length === 0) {
+              send(200, [])
+            } else {
+              const groupRows = db.prepare(`SELECT group_key_l2 AS k, COUNT(*) AS n, MIN(prompt_pos) AS p
+                FROM images WHERE source_id = ? AND group_key_l2 IS NOT NULL AND hidden = 0
+                GROUP BY group_key_l2`).all(sourceId) as Array<{ k: string; n: number; p: string | null }>
+              const memberStmt = db.prepare(`SELECT id FROM images
+                WHERE source_id = ? AND group_key_l2 = ? AND hidden = 0`)
+              const hasSignatures = tableExists('image_signatures')
+              const vectors = new Map<number, Float32Array>()
+              if (hasSignatures) {
+                const vecStmt = db.prepare(`SELECT image_id, vec FROM image_signatures
+                  WHERE slot = 'vision' AND model_id = 'clip-vit-b32-q'`)
+                for (const row of vecStmt.all() as Array<{ image_id: number; vec: Buffer }>) {
+                  const bytes = row.vec
+                  if (bytes.length % 4 !== 0) continue
+                  const arr = new Float32Array(bytes.length / 4)
+                  for (let i = 0; i < arr.length; i++) {
+                    arr[i] = bytes.readFloatLE(i * 4)
+                  }
+                  vectors.set(row.image_id, arr)
+                }
+              }
+              // 文本基准：每个图的词集合
+              const tokenStmt = db.prepare(`SELECT id, prompt_pos FROM images
+                WHERE source_id = ? AND hidden = 0 AND prompt_pos != ''`)
+              const tokenSets = new Map<number, Set<string>>()
+              for (const row of tokenStmt.all(sourceId) as Array<{ id: number; prompt_pos: string }>) {
+                tokenSets.set(row.id, new Set(tokenize(row.prompt_pos)))
+              }
+              const useVision = imageIds.some((id) => vectors.has(id))
+              const dot = (a: Float32Array, b: Float32Array) => {
+                let sum = 0
+                const n = Math.min(a.length, b.length)
+                for (let i = 0; i < n; i++) sum += a[i] * b[i]
+                return sum
+              }
+              const jaccard = (a: Set<string>, b: Set<string>) => {
+                if (!a.size && !b.size) return 1
+                let inter = 0
+                for (const t of a) if (b.has(t)) inter++
+                const union = a.size + b.size - inter
+                return union === 0 ? 1 : inter / union
+              }
+              const out = groupRows
+                .filter((g) => g.k !== currentL2)
+                .map((g) => {
+                  const memberIds = (memberStmt.all(sourceId, g.k) as Array<{ id: number }>).map((m) => m.id)
+                  let total = 0
+                  let counted = 0
+                  for (const id of imageIds) {
+                    let best = -Infinity
+                    if (useVision) {
+                      const vec = vectors.get(id)
+                      if (!vec) continue
+                      for (const mid of memberIds) {
+                        const mv = vectors.get(mid)
+                        if (mv) best = Math.max(best, dot(vec, mv))
+                      }
+                    } else {
+                      const tok = tokenSets.get(id)
+                      if (!tok) continue
+                      for (const mid of memberIds) {
+                        const mt = tokenSets.get(mid)
+                        if (mt) best = Math.max(best, jaccard(tok, mt))
+                      }
+                    }
+                    if (Number.isFinite(best)) { total += best; counted += 1 }
+                  }
+                  if (!counted) return null
+                  return {
+                    group_key: g.k,
+                    count: g.n,
+                    prompt_pos: maskIf(g.p ?? ''),
+                    score: total / counted,
+                    basis: useVision ? 'vision' : 'text',
+                  }
+                })
+                .filter((x): x is NonNullable<typeof x> => x !== null)
+                .sort((a, b) => b.score - a.score)
+                .slice(0, 12)
+              send(200, out)
+            }
+          } else if (url.pathname === '/api/group-outliers') {
+            // 组内「疑似错分」的图（阶段六 Round 4）。桌面端用 Rust 侧同一套口径：
+            // 组内每个成员与其它成员的最大余弦，低于门槛的就是「没有够格伙伴」。
+            const groupKey = url.searchParams.get('groupKey') ?? ''
+            const threshold = Number(url.searchParams.get('threshold') ?? 0.75)
+            if (!tableExists('image_signatures')) {
+              send(200, [])
+            } else {
+              const vecStmt = db.prepare(`SELECT image_id, vec FROM image_signatures
+                WHERE slot = 'vision' AND model_id = 'clip-vit-b32-q'`)
+              const vectors = new Map<number, Float32Array>()
+              for (const row of vecStmt.all() as Array<{ image_id: number; vec: Buffer }>) {
+                const bytes = row.vec
+                if (bytes.length % 4 !== 0) continue
+                const arr = new Float32Array(bytes.length / 4)
+                for (let i = 0; i < arr.length; i++) arr[i] = bytes.readFloatLE(i * 4)
+                vectors.set(row.image_id, arr)
+              }
+              const memberStmt = db.prepare(`SELECT id FROM images
+                WHERE group_key_l2 = ? AND hidden = 0 ORDER BY id`)
+              const members = (memberStmt.all(groupKey) as Array<{ id: number }>)
+                .map((m) => m.id)
+                .filter((id) => vectors.has(id))
+              const dot = (a: Float32Array, b: Float32Array) => {
+                let sum = 0
+                const n = Math.min(a.length, b.length)
+                for (let i = 0; i < n; i++) sum += a[i] * b[i]
+                return sum
+              }
+              const out: Array<Record<string, unknown>> = []
+              for (const id of members) {
+                let best = -Infinity
+                for (const other of members) {
+                  if (other === id) continue
+                  best = Math.max(best, dot(vectors.get(id)!, vectors.get(other)!))
+                }
+                if (best < threshold) {
+                  out.push({
+                    image_id: id,
+                    max_similarity: best,
+                    best_group_key: null,
+                    best_score: 0,
+                  })
+                }
+              }
+              out.sort((a, b) => (a.max_similarity as number) - (b.max_similarity as number))
+              send(200, out)
+            }
           } else if (url.pathname === '/api/group-images') {
             const groupKey = url.searchParams.get('groupKey') ?? ''
             const includeHidden = url.searchParams.get('includeHidden') === '1'
@@ -282,7 +479,14 @@ function webBridge() {
               (SELECT internal_score FROM scores WHERE scores.image_id = i.id) AS score
               FROM images i ${workflowJoin}
               WHERE i.${keyColumn} = ? ${hidden} ORDER BY i.seed, i.filename`).all(groupKey)
-            send(200, rows.map((row: any) => ({ ...row, labels: [], hidden: Boolean(row.hidden), meta_ok: Boolean(row.meta_ok) })))
+            send(200, rows.map((row: any) => ({
+              ...row,
+              prompt_pos: maskIf(row.prompt_pos),
+              prompt_neg: maskIf(row.prompt_neg),
+              labels: [],
+              hidden: Boolean(row.hidden),
+              meta_ok: Boolean(row.meta_ok),
+            })))
           } else if (url.pathname === '/api/recommend-prompts') {
             if (level >= 3) {
               send(200, [])
@@ -370,7 +574,13 @@ function webBridge() {
                   image_count: sampleCount,
                 }
               }).sort((a, b) => b.rank - a.rank || b.avg_score - a.avg_score || b.sample_count - a.sample_count)
-              send(200, ranked.slice(offset, offset + limit).map(({ rank: _rank, ...item }) => item))
+              // Mask AFTER grouping: the grouping key is the raw prompt, and
+              // masking first would collapse distinct prompts into one entry.
+              send(200, ranked.slice(offset, offset + limit).map(({ rank: _rank, ...item }) => ({
+                ...item,
+                prompt_text: maskIf(item.prompt_text),
+                prompt_neg: maskIf(item.prompt_neg),
+              })))
             }
           } else if (url.pathname === '/api/arena-suggested') {
             const left = Number(url.searchParams.get('left'))
@@ -416,4 +626,20 @@ function webBridge() {
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react(), webBridge()],
+  server: {
+    watch: {
+      // Rust 的构建产物与实验产物必须排除在文件监视之外：
+      //  · `src-tauri/target/` 会被 cargo 反复改写，Windows 上文件监视器
+      //    撞上被占用的 DLL 会抛 EBUSY 并**直接崩掉 dev server**
+      //    （实测：dev server 开着时跑一次 cargo test 就崩）
+      //  · `tools/l2lab/out/` 是研究产物（向量 JSON），一直在变，
+      //    盯着它会让页面无意义地重载
+      ignored: [
+        '**/src-tauri/target/**',
+        '**/tools/l2lab/out/**',
+        '**/tools/l2lab/.venv/**',
+        '**/src-tauri/resources/models/**',
+      ],
+    },
+  },
 })
