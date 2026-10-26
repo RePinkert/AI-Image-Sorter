@@ -1,6 +1,6 @@
 [package]
 name = "AI-Image-Sorter"
-version = "0.1.0"
+version = "0.4.0"
 description = "Local-first desktop application for organizing and reviewing AI-generated images"
 authors = ["RePinkert"]
 license = "MIT"

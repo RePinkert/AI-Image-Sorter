@@ -9,6 +9,10 @@ AI Image Sorter is a local-first desktop application for organizing and reviewin
 - Discover ComfyUI output folders automatically (common paths and running processes), or import any local folder; registered folders are rescanned incrementally in the background
 - Parse generation metadata from ComfyUI PNG chunks, A1111 parameters (PNG/JPEG/WebP), and companion `.txt` files
 - Group images along four axes: folder, model deviation (mouse wheel switches the dimension), prompt similarity (adjustable threshold), and independent prompt
+- Cluster prompt-similarity groups by three interchangeable means — word overlap (Jaccard), image embeddings (a CLIP tower), or prompt meaning (a BGE tower) — each with its own threshold, because those are different quantities and the scales are not interchangeable
+- Run both embedding towers in-process (ONNX Runtime, no Python and no external service) over the images you already have
+- Suggest likely destinations when you move a group, and flag images whose group has no visually close companion
+- Describe its own build: the executable carries capability markers for the features it really contains, and the release probe verifies them against the binary
 - Match ComfyUI workflow topology and retain the full generation recipe for each image
 - Review with swipe scoring or Bradley–Terry arena comparisons; custom labels, undo, and a review session that survives a relaunch
 - Browse a virtualized masonry grid with eight sort keys, filename search, hidden-only filter, and batch select/unhide/split/move/delete
@@ -21,7 +25,9 @@ AI Image Sorter is a local-first desktop application for organizing and reviewin
 
 ## Status
 
-`v0.3.0` is the latest release (`v0.1.0` was the first public preview). The core workflow is usable, but compatibility with unusual metadata formats and large libraries is still being expanded. Windows is the primary supported platform.
+`v0.4.0` is the latest release (`v0.1.0` was the first public preview). The core workflow is usable, but compatibility with unusual metadata formats and large libraries is still being expanded. Windows is the primary supported platform.
+
+`v0.4.0` adds the two embedding towers and the semantic L2 modes described above. Word overlap stays the default mode, and the application remains fully usable without the model weights — see [Model weights](#model-weights-for-the-visual-and-semantic-modes).
 
 ## Installation
 
@@ -44,6 +50,21 @@ Each normal exit erases the WebView2 profile (cache, cookies, browser state) fro
 
 Delete the `ai-image-sorter.portable` file to revert to the default application mode: data is written to the system application data directory (`%APPDATA%\com.aiimagesorter.app`).
 
+### Model weights for the visual and semantic modes
+
+Word overlap works out of the box. The visual and semantic modes need three ONNX model files, which are deliberately not part of the repository (about 113 MB in total):
+
+- `vision_clip.onnx` — CLIP ViT-B/32, for the visual mode
+- `text_bge.onnx` and `tokenizer_bge.json` — BGE-small-zh, for the semantic mode
+
+Fetch them with the bundled script; it verifies the size and the sha256 of every file:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\download_models.ps1
+```
+
+The script writes them to `src-tauri\resources\models\`, which the Tauri bundle configuration picks up. With the portable `.exe`, copy the same three files into `data\models\` next to the `.exe`, or point the environment variable `AI_IMAGE_SORTER_MODELS` at the folder that holds them. Without the weights the application still runs: it reports that the visual and semantic modes are unavailable, and word overlap keeps working unchanged.
+
 ## Usage
 
 1. Launch the application.
@@ -59,6 +80,8 @@ The desktop shell is Tauri 2: a Rust backend drives a React 19 + TypeScript fron
 
 - **Frontend** — a single Zustand store with a view switcher (no router), plain-CSS design system, and viewport-window virtualization for large grids. Images are shown through Tauri's asset protocol.
 - **Backend** — Rust exposes ~40 Tauri commands grouped by domain: folder discovery and incremental sync, grouping/clustering, review and scoring, labels and group operations, export, and telemetry. All image metadata parsing (ComfyUI PNG chunks, A1111 parameters, JPEG/WebP EXIF, workflow topology matching) happens here as well.
+- **Embedding towers** — the visual and semantic towers run in-process through ONNX Runtime (`ort`): images are embedded by CLIP, prompts by BGE with a hand-written WordPiece tokenizer. No Python, no side process, no network traffic at runtime.
+- **Self-description** — every capability is backed by a marker string that lives in the module implementing it, so a built executable can be scanned to prove which features it actually contains instead of taking the documentation's word for it.
 - **Storage** — one local SQLite database (WAL mode) holds indexes, scores, labels, recipes, and telemetry; image files are never copied unless you explicitly archive them.
 
 ## Development
@@ -66,7 +89,7 @@ The desktop shell is Tauri 2: a Rust backend drives a React 19 + TypeScript fron
 ### Requirements
 
 - Node.js 20 or newer
-- Rust 1.77.2 or newer
+- Rust 1.85 or newer (ONNX Runtime 2.0.0-rc.10, used by the embedding towers, requires it)
 - Tauri 2 prerequisites for the target platform
 
 ### Commands
@@ -79,15 +102,28 @@ npm run dev          # Browser development shell
 npm run tauri:dev   # Desktop development application
 npm run build
 npm run lint
+npm run release:exe  # Release executable, frontend embedded
 cargo check --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
+
+`npm run release:exe` is the release build: it compiles the frontend first and then the backend with `--features custom-protocol`. That flag is not optional — without it the Tauri build script takes its development branch and the executable ships without the frontend embedded at all.
+
+The release probe verifies a built executable: it scans the binary for the `ais.cap.` capability markers, checks each marker against a feature string on the implementation path, and fails when the frontend assets are missing.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\verify-release-binary.ps1 -Report artifacts\probe.txt
+```
+
+The fingerprint ledger for released executables lives in `artifacts/README.md`.
 
 Some integration tests use a developer-local ComfyUI image directory and are not portable to a clean checkout. The portable unit tests do not require that directory.
 
 ## Privacy
 
 The application is local-first. Coarse application events are recorded for debugging and product improvement, and they stay in the local database — the app has no networking at all. Events do not intentionally include prompts, image pixels, source paths, or other image contents. Recording can be disabled in Settings, and redacted diagnostics can be exported from the same panel.
+
+The embedding towers keep that promise: inference runs in-process, and the model weights are fetched by a separate script, never by the application. Prompts are treated as private content as well — the development bridge can mask them (width-preserving, so measurements stay comparable) for any capture that is meant to be shared.
 
 ## Contributing
 

@@ -1,0 +1,31 @@
+﻿══ 发行版二进制探针 ══
+[本档] C:\Yet\AI-Image-Sorter\src-tauri\target\release\AI-Image-Sorter.exe
+         大小   34283520 字节
+         SHA256 2BAAAF25E687DB94AFE67211EED4294E025FB83075343F69F267CAF2BDA502E2
+         修改   2026-10-26 00:56:53
+
+能力标记串（扫到 5 条）
+  · ais.cap.l2.text-jaccard.v1
+  · ais.cap.l2.visual-avg-linkage.v1
+  · ais.cap.provenance.build-info.v1
+  · ais.cap.tower.text.v1
+  · ais.cap.tower.vision.v1
+
+能力核对（标记串 + 实现特征串，两者都要在场）
+  [OK]   l2.text-jaccard          L2 词 Jaccard 单链（历史行为）
+  [OK]   l2.visual-avg-linkage    L2 视觉塔平均连接
+  [OK]   tower.vision             视觉塔（CLIP ViT-B/32）推理路径
+  [OK]   tower.text               文本塔（BGE-small-zh）推理路径（阶段七轮 1 起接进命令层）
+  [OK]   provenance.build-info    构建能力自述（后端能力清单 + 设置页面板）
+  [OK]   frontend-embedded        前端资源已嵌入二进制
+
+[基线] C:\Users\28174\AppData\Local\Temp\opencode\AI-Image-Sorter.prev.exe
+         大小   34283520 字节
+         SHA256 A788AA7811C19028FDBB44667B188BD6776C5822CE8223C957F795801CD169DF
+         修改   2026-10-26 00:00:16
+
+相对基线的差异
+  指纹    已变（大小 34283520 → 34283520，差 0 字节）
+  能力集合未变
+
+结论：登记的能力全部就位
