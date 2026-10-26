@@ -2,3 +2,6 @@
 # will have compiled files and executables
 /target/
 /gen/schemas
+# Stage-six ONNX weights: fetched by scripts/download_models.ps1, bundled into
+# the installer by tauri.conf.json — never committed (89 MB + 24 MB).
+/resources/models/

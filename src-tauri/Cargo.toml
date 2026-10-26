@@ -6,11 +6,28 @@ authors = ["RePinkert"]
 license = "MIT"
 repository = "https://github.com/RePinkert/AI-Image-Sorter"
 edition = "2021"
-rust-version = "1.77.2"
+# 阶段六：ort 2.0.0-rc.10 需要 1.85+（edition 2024 的推导基线）。
+rust-version = "1.85"
 
 [lib]
 name = "app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# Tauri 的发行版档位。
+#
+# **为什么必须有它**：tauri 的 build.rs 里 `cfg(dev) = !custom-protocol`。
+# 不开这个 feature 时，`cargo build --release` 产出的是**不含前端**的 exe ——
+# `generate_context!` 会走 dev 分支，指向 `devUrl`（本机 5173 开发服务器），
+# 前端资源压根没进二进制。实测：不开这个 feature 时，二进制里搜不到
+# `assets/index-*.js` 任何一个字符串（资源是 brotli 压缩的，但资源**键名**
+# 也在二进制里）。
+#
+# 也就是说：**不开它，「发行版 EXE 有没有变」这句话只覆盖 Rust 那一半**，
+# 前端改动完全不在里面 —— 而用户审查的正是这个文件。
+# `npm run tauri build` 会自动带上这个 feature；手工构建时必须显式加。
+default = []
+custom-protocol = ["tauri/custom-protocol"]
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
@@ -33,6 +50,25 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # DB
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+# 阶段六：本地 AI 推理（识图 → 语义 L2 聚类）
+# ort = ONNX Runtime 的 Rust 绑定，进程内推理，不依赖 Python / ComfyUI。
+# download-binaries 在构建期拉取 ORT 运行时；copy-dylibs 负责 Windows 的 DLL。
+# 先例：LAP（julyx10/lap）用同一套组合把 CLIP / InsightFace 的 ONNX 模型
+# 随安装包分发。硬约束 #4 的唯一例外已在 ui-program.md 预登记。
+ort = { version = "=2.0.0-rc.10", default-features = false, features = [
+    "std",
+    "ndarray",
+    "download-binaries",
+    "copy-dylibs",
+] }
+ndarray = "0.16"
+
+# 阶段七：手写 WordPiece 分词器（文本塔）只需要 Unicode 通用类别表。
+# unicode_categories = 纯查表 crate，零依赖，1.2 万行类别表。
+# 这是硬约束 #4 的第二次动用，理由与 ort 同源（模型随包分发、任何人可用、
+# 不依赖 Python），已在 ui-program.md 预登记。
+unicode_categories = "0.1"
 
 # Misc
 chrono = { version = "0.4", features = ["serde"] }

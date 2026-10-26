@@ -5,12 +5,23 @@ use crate::{archive, comfy_finder, db::GroupInfo, scoring};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{Emitter, State};
+use tauri::{AppHandle, Emitter, State};
 
 pub struct AppState {
     pub db: Arc<crate::db::Db>,
+    /// 视觉签名引擎（阶段六）。模型文件缺失时 model_path 指向一个不存在的
+    /// 路径 —— 功能保持「不可用」而不是让应用起不来。
+    pub vision: Arc<crate::vision::VisionEngine>,
+    /// 文本塔引擎槽（阶段七轮 1 接线）。权重与分词器**缺任一份**就整体
+    /// 不可用 —— 同样保持「不可用」而不是让应用起不来。
+    pub text: Arc<crate::text::TextEngineSlot>,
+    /// 当前批处理的取消标志（None = 没有在跑）。
+    pub signature_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    /// 文本塔批处理的取消标志 —— 与视觉塔**分开**，两边的任务互不打断。
+    pub text_signature_cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -373,7 +384,6 @@ fn scan_source(
         db.insert_image(&row).map_err(|e| e.to_string())?;
         stats.added += 1;
     }
-
     // Remove rows for files that vanished from disk.
     let (removed, deleted_l1) = db
         .delete_missing_source_images(source_id, &on_disk)
@@ -543,7 +553,9 @@ pub async fn sync_all(
 ) -> Result<SyncAllResult, String> {
     let db = state.db.clone();
     let handle = app.clone();
-    tauri::async_runtime::spawn_blocking(move || run_sync(&db, &handle))
+    let vision = state.vision.clone();
+    let text = state.text.clone();
+    tauri::async_runtime::spawn_blocking(move || run_sync(&db, &handle, &vision, &text))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -551,6 +563,8 @@ pub async fn sync_all(
 fn run_sync(
     db: &crate::db::Db,
     app: &tauri::AppHandle,
+    vision: &crate::vision::VisionEngine,
+    text: &crate::text::TextEngineSlot,
 ) -> Result<SyncAllResult, String> {
     let sources = db.list_sources().map_err(|e| e.to_string())?;
     let source_total = sources.len();
@@ -590,6 +604,23 @@ fn run_sync(
         let l2_threshold = db
             .get_source_threshold(src.id)
             .map_err(|e| e.to_string())?;
+        // 阶段六：聚类方式由用户决定（词匹配 / 视觉 / 语义）。
+        // 语义模式的阈值是**余弦**，量纲与 Jaccard 完全不同 → 单独存。
+        let l2_mode = crate::clustering::L2Mode::parse(
+            &db.get_source_l2_mode(src.id).unwrap_or_else(|_| "text".into()),
+        );
+        let l2_visual_threshold = db
+            .get_source_visual_threshold(src.id)
+            .unwrap_or(crate::clustering::DEFAULT_VISUAL_THRESHOLD);
+        // 语义档（BGE）的阈值是**另一个量纲**，单独存（v18 迁移）。
+        // 0.75 是 CLIP 的值，绝不可沿用到 BGE。
+        let l2_semantic_threshold = db
+            .get_source_semantic_threshold(src.id)
+            .unwrap_or(crate::clustering::DEFAULT_SEMANTIC_THRESHOLD);
+        let mode_threshold = match l2_mode {
+            crate::clustering::L2Mode::Semantic => l2_semantic_threshold,
+            _ => l2_visual_threshold,
+        };
 
         // Only touch sources whose on-disk state actually changed since the
         // last scan. Unchanged sources emit NO progress events so the UI
@@ -638,14 +669,115 @@ fn run_sync(
                 pending,
                 backfill_parse_errors,
             );
-            crate::clustering::recluster_l2_keys(
-                db,
-                src.id,
-                &affected,
-                l2_threshold,
-            )
-            .map_err(|e| e.to_string())?;
+            match l2_mode {
+                crate::clustering::L2Mode::Text => {
+                    crate::clustering::recluster_l2_keys(
+                        db,
+                        src.id,
+                        &affected,
+                        l2_threshold,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                mode => {
+                    // 语义/视觉模式：只重算受影响的 L1 桶。
+                    // 槽位与模型一律走 `signature_spec`（口径收口，防错空间）。
+                    let Some((slot, model_id)) = mode.signature_spec() else {
+                        return Err("未知的 L2 聚类档位".into());
+                    };
+                    crate::clustering::recluster_l2_vectors(
+                        db,
+                        src.id,
+                        slot,
+                        model_id,
+                        mode_threshold,
+                        Some(&affected),
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
             any_recluster = true;
+        }
+        // 语义模式下，新入库的图还没有向量 —— 补算一批（限量，别让同步被
+        // 拖住），补完再重算受影响的桶，否则它们会一直停在 L1 占位组里。
+        //
+        // ⚠ 口径：槽位与模型必须与档位**一一对应**（`L2Mode::signature_spec`），
+        // **引擎也必须对应**：这里曾经用**视觉引擎**算语义模式的向量却写进
+        // text 槽 —— 错空间。维度一样（视觉塔 512 维 / 文本塔 512 维）、
+        // 条数也对，只有**值**属于另一个空间，肉眼查不出来。
+        if let Some((slot, model_id)) = l2_mode.signature_spec() {
+            match l2_mode {
+                crate::clustering::L2Mode::Semantic => {
+                    // 文本塔：输入是 **prompt 文本**，不读图。
+                    let missing = db
+                        .images_without_text_signatures(src.id, model_id, 64)
+                        .map_err(|e| e.to_string())?;
+                    if !missing.is_empty() {
+                        let items: Vec<(i64, String)> = missing;
+                        let computed = text.with_engine(|engine| {
+                            engine.embed_prompts(&items, &mut |_, _| {}, &|| false)
+                        });
+                        if let Ok(Ok((rows, _failed))) = computed {
+                            if !rows.is_empty() {
+                                let _ = db.upsert_signatures(
+                                    slot,
+                                    model_id,
+                                    &rows
+                                        .iter()
+                                        .map(|(id, vec)| (*id, vec.as_slice()))
+                                        .collect::<Vec<_>>(),
+                                );
+                                let _ = crate::clustering::recluster_l2_vectors(
+                                    db,
+                                    src.id,
+                                    slot,
+                                    model_id,
+                                    mode_threshold,
+                                    None,
+                                );
+                                any_recluster = true;
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    // 视觉塔：输入是**文件路径**。
+                    let missing = db
+                        .images_without_signatures(src.id, slot, model_id, 64)
+                        .map_err(|e| e.to_string())?;
+                    if !missing.is_empty() {
+                        let items: Vec<(i64, PathBuf)> = missing
+                            .into_iter()
+                            .filter(|(_, path)| std::path::Path::new(path).is_file())
+                            .map(|(id, path)| (id, PathBuf::from(path)))
+                            .collect();
+                        if !items.is_empty() {
+                            let computed = vision.embed_batch(&items, &mut |_, _| {}, &|| false);
+                            if let Ok((rows, _failed)) = computed {
+                                if !rows.is_empty() {
+                                    let _ = db.upsert_signatures(
+                                        slot,
+                                        model_id,
+                                        &rows
+                                            .iter()
+                                            .map(|(id, vec)| (*id, vec.as_slice()))
+                                            .collect::<Vec<_>>(),
+                                    );
+                                    let _ = crate::clustering::recluster_l2_vectors(
+                                        db,
+                                        src.id,
+                                        slot,
+                                        model_id,
+                                        mode_threshold,
+                                        None,
+                                    );
+                                    any_recluster = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         if changed || backfilled_count > 0 {
             emit(
@@ -1156,18 +1288,55 @@ pub fn trash_image(
 /// Jaccard threshold. Caller then refreshes group lists on the frontend.
 /// The threshold is persisted on the source so the background sync keeps
 /// re-clustering at the same value (never silently reverting to the default).
+///
+/// 阶段六：方式可切。`text` 是历史行为（词 Jaccard 单链）；`visual` / `semantic`
+/// 用签名向量 + 平均连接。后两者的阈值是**余弦**，量纲与 Jaccard 完全不同，
+/// 所以由调用方分别传入（`threshold` 是 Jaccard，`visual_threshold` 是余弦）。
 #[tauri::command]
 pub fn recluster_source(
     source_id: i64,
     threshold: f64,
+    mode: Option<String>,
+    visual_threshold: Option<f64>,
+    semantic_threshold: Option<f64>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    crate::clustering::recluster_l2(&state.db, source_id, threshold)
-        .map_err(|e| e.to_string())?;
+    let mode = crate::clustering::L2Mode::parse(mode.as_deref().unwrap_or("text"));
+    let visual_threshold = visual_threshold
+        .unwrap_or(crate::clustering::DEFAULT_VISUAL_THRESHOLD);
+    // 语义档（BGE）的阈值是**另一个量纲**，绝不可沿用 CLIP 的 0.75。
+    let semantic_threshold = semantic_threshold
+        .unwrap_or(crate::clustering::DEFAULT_SEMANTIC_THRESHOLD);
+    // 文本模式的阈值始终按源保存（后台同步要沿用同一个值）
     state
         .db
         .set_source_threshold(source_id, threshold)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    state
+        .db
+        .set_source_l2_mode(source_id, mode.as_str())
+        .map_err(|e| e.to_string())?;
+    if mode.uses_cosine() {
+        state
+            .db
+            .set_source_visual_threshold(source_id, visual_threshold)
+            .map_err(|e| e.to_string())?;
+    }
+    if mode == crate::clustering::L2Mode::Semantic {
+        state
+            .db
+            .set_source_semantic_threshold(source_id, semantic_threshold)
+            .map_err(|e| e.to_string())?;
+    }
+    crate::clustering::recluster_l2_with_mode(
+        &state.db,
+        source_id,
+        mode,
+        threshold,
+        visual_threshold,
+        semantic_threshold,
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1175,7 +1344,6 @@ pub struct ManualGroupResult {
     pub group_key: String,
     pub moved: usize,
 }
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct MergeGroupsArgs {
     pub level: u8,
@@ -1935,3 +2103,673 @@ mod e2e_tests {
         assert!(checked >= 1, "expected at least one CivitAI PNG");
     }
 }
+
+// ---------------------------------------------------------------------------
+// 视觉签名（阶段六 Round 1）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SignatureProgressDto {
+    pub slot: String,
+    pub done: usize,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SignatureResultDto {
+    pub computed: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub total: usize,
+    pub model_id: String,
+    pub dim: usize,
+    pub cancelled: bool,
+}
+
+/// 组内「疑似错分」的图片。
+///
+/// 用户最痛的描述是「大组里那两三张被错误识别出来的」。这个命令把那张图
+/// 找出来：它在组里**没有任何视觉上够格的伙伴**（与组内其它成员的最大余弦
+/// 低于门槛），并且给出它**最像**的那个别的组。
+#[derive(Debug, Clone, Serialize)]
+pub struct OutlierInfo {
+    pub image_id: i64,
+    /// 它在组内与其它成员的最大余弦（越低越像「不属于这里」）。
+    pub max_similarity: f64,
+    /// 最像的别的组（没有向量时为 None）。
+    pub best_group_key: Option<String>,
+    pub best_score: f64,
+}
+
+/// 找出组内疑似错分的图片。
+#[tauri::command]
+pub fn group_outliers(
+    group_key: String,
+    threshold: Option<f64>,
+    state: State<'_, AppState>,
+) -> Result<Vec<OutlierInfo>, String> {
+    // 门槛用「视觉上算不算同一类」的尺度：0.75 与语义聚类的默认阈值同源。
+    let threshold = threshold.unwrap_or(crate::clustering::DEFAULT_VISUAL_THRESHOLD);
+    let db = &state.db;
+    let members = db.group_member_ids(&group_key).map_err(|e| e.to_string())?;
+    if members.len() < 2 {
+        return Ok(Vec::new());
+    }
+    // 组内成员的向量。
+    //
+    // 槽位跟着该组的 L2 档位走（口径收口在 `L2Mode::signature_spec`）：
+    // 语义档用文本槽的向量，视觉档用视觉槽的向量。读错槽就是**错空间**
+    // （两塔都是 512 维，肉眼查不出来）。
+    let Some(source_id) = db.group_source_id(&group_key).map_err(|e| e.to_string())? else {
+        return Ok(Vec::new());
+    };
+    let mode = crate::clustering::L2Mode::parse(
+        &db.get_source_l2_mode(source_id)
+            .unwrap_or_else(|_| "text".into()),
+    );
+    let (slot, model_id) = mode
+        .signature_spec()
+        .unwrap_or(("vision", crate::vision::VISION_MODEL_ID));
+    let mut vectors: HashMap<i64, Vec<f32>> = HashMap::new();
+    for (id, vec) in db
+        .signatures_for_slot(slot, model_id)
+        .map_err(|e| e.to_string())?
+    {
+        vectors.insert(id, vec);
+    }
+    let member_ids: Vec<i64> = members
+        .iter()
+        .copied()
+        .filter(|id| vectors.contains_key(id))
+        .collect();
+    if member_ids.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let dot = |a: i64, b: i64| -> f32 {
+        let (Some(x), Some(y)) = (vectors.get(&a), vectors.get(&b)) else {
+            return f32::NEG_INFINITY;
+        };
+        let mut sum = 0f32;
+        for i in 0..x.len().min(y.len()) {
+            sum += x[i] * y[i];
+        }
+        sum
+    };
+    // 每个成员与组内其它成员的最大相似度
+    let mut max_sim: HashMap<i64, f32> = HashMap::new();
+    for a in &member_ids {
+        let mut best = f32::NEG_INFINITY;
+        for b in &member_ids {
+            if a == b {
+                continue;
+            }
+            best = best.max(dot(*a, *b));
+        }
+        max_sim.insert(*a, best);
+    }
+    let outliers: Vec<i64> = member_ids
+        .iter()
+        .copied()
+        .filter(|id| (max_sim.get(id).copied().unwrap_or(1.0) as f64) < threshold)
+        .collect();
+    if outliers.is_empty() {
+        return Ok(Vec::new());
+    }
+    // 别的组（同一来源，排除自己）作为候选
+    let mut groups: Vec<(String, Vec<i64>)> = Vec::new();
+    for (key, _count, _prompt, ids) in db.group_members_for_source(source_id).unwrap_or_default() {
+        if key != group_key {
+            groups.push((key, ids));
+        }
+    }
+    let mut out = Vec::new();
+    for id in outliers {
+        let mut best_key: Option<String> = None;
+        let mut best_score = 0f32;
+        for (key, ids) in &groups {
+            let mut best = f32::NEG_INFINITY;
+            for mid in ids {
+                if !vectors.contains_key(mid) {
+                    continue;
+                }
+                best = best.max(dot(id, *mid));
+            }
+            if best.is_finite() && best > best_score {
+                best_score = best;
+                best_key = Some(key.clone());
+            }
+        }
+        out.push(OutlierInfo {
+            image_id: id,
+            max_similarity: max_sim.get(&id).copied().unwrap_or(0.0) as f64,
+            best_group_key: best_key,
+            best_score: best_score as f64,
+        });
+    }
+    out.sort_by(|a, b| {
+        a.max_similarity
+            .partial_cmp(&b.max_similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(out)
+}
+
+/// 「可能相关」推荐：给定选中的图，哪个组最可能该收留它们。
+///
+/// 这是阶段六最直接解痛的一步：用户在大组里发现两三张图被错误识别，
+/// 想把它们挪走，但目标组在一长串里看不出来。这个命令把每个候选组按
+/// 「与选中图的最大相似度」排好序 —— 有视觉签名时用视觉余弦，
+/// 没有时退回 prompt 的词 Jaccard（永远可用）。
+#[tauri::command]
+pub fn suggest_move_targets(
+    source_id: i64,
+    image_ids: Vec<i64>,
+    current_l2: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::suggest::Suggestion>, String> {
+    let db = &state.db;
+    let groups = db.group_members_for_source(source_id).map_err(|e| e.to_string())?;
+    let mut members: Vec<crate::suggest::GroupMembers> = Vec::new();
+    for (key, count, prompt, ids) in groups {
+        if key == current_l2 {
+            continue;
+        }
+        members.push(crate::suggest::GroupMembers {
+            group_key: key,
+            count,
+            prompt_pos: prompt,
+            members: ids,
+        });
+    }
+    if members.is_empty() {
+        return Ok(Vec::new());
+    }
+    // 基准跟着该源的 L2 档位走：视觉档用视觉余弦，语义档用语义余弦，
+    // 文本档没有向量 → 退回词 Jaccard（永远可用）。
+    //
+    // 口径收口在 `L2Mode::signature_spec()`：槽位与模型必须配套，
+    // 读错槽就是**错空间**（两塔都是 512 维，肉眼查不出来）。
+    let mode = crate::clustering::L2Mode::parse(
+        &db.get_source_l2_mode(source_id).unwrap_or_else(|_| "text".into()),
+    );
+    let spec = mode.signature_spec();
+    let vector_basis = match spec {
+        Some(("vision", _)) => "vision",
+        Some(("text", _)) => "semantic",
+        _ => "text",
+    };
+    // 签名（有就用向量）
+    let mut vectors: HashMap<i64, Vec<f32>> = HashMap::new();
+    if let Some((slot, model_id)) = spec {
+        for (id, vec) in db
+            .signatures_for(source_id, slot, model_id)
+            .map_err(|e| e.to_string())?
+        {
+            vectors.insert(id, vec);
+        }
+    }
+    // 文本退路：prompt 的词集合
+    let conn = db.0.lock().unwrap();
+    let mut stmt = conn
+        .prepare("SELECT id, prompt_pos FROM images WHERE source_id=?1 AND prompt_pos != ''")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params![source_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut tokens: crate::suggest::TokenSets = HashMap::new();
+    {
+        let rows = rows;
+        for row in rows {
+            let (id, prompt) = row.map_err(|e| e.to_string())?;
+            tokens.insert(
+                id,
+                crate::clustering::tokenize(&prompt).into_iter().collect(),
+            );
+        }
+    }
+    drop(stmt);
+    drop(conn);
+
+    Ok(crate::suggest::score_groups(
+        &members,
+        &image_ids,
+        &vectors,
+        &tokens,
+        vector_basis,
+    ))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VisionStatusDto {    /// 权重是否就位。不就位时前端把「识图」入口标成不可用，而不是让用户
+    /// 点下去才报错。
+    pub available: bool,
+    pub model_id: String,
+    pub model_path: String,
+}
+
+/// 「识图」是否可用（模型权重是否就位）。
+#[tauri::command]
+pub fn vision_status(state: State<'_, AppState>) -> Result<VisionStatusDto, String> {
+    let path = state.vision.model_path().to_path_buf();
+    Ok(VisionStatusDto {
+        available: path.is_file(),
+        model_id: crate::vision::VISION_MODEL_ID.to_string(),
+        model_path: path.to_string_lossy().to_string(),
+    })
+}
+
+/// 取消正在跑的签名批处理。
+#[tauri::command]
+pub fn cancel_signatures(state: State<'_, AppState>) -> Result<bool, String> {
+    let guard = state.signature_cancel.lock().map_err(|_| "取消标志锁已中毒")?;
+    match guard.as_ref() {
+        Some(flag) => {
+            flag.store(true, Ordering::SeqCst);
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// 文本塔（prompt 语义）的状态。
+#[derive(Debug, Clone, Serialize)]
+pub struct TextStatusDto {
+    /// 权重与分词器是否**都在**（缺任一份 → 整个塔不可用）。
+    pub available: bool,
+    pub model_id: String,
+    pub model_path: String,
+    pub tokenizer_path: String,
+    /// 分词器词表大小（可读时才有值）。
+    pub vocab_size: Option<usize>,
+}
+
+/// 「文本塔」是否可用。
+#[tauri::command]
+pub fn text_status(state: State<'_, AppState>) -> Result<TextStatusDto, String> {
+    let available = state.text.available();
+    let vocab_size = if available {
+        state
+            .text
+            .with_engine(|engine| engine.tokenizer().vocab_size())
+            .ok()
+    } else {
+        None
+    };
+    Ok(TextStatusDto {
+        available,
+        model_id: crate::text::TEXT_MODEL_ID.to_string(),
+        model_path: state.text.model_path().to_string_lossy().to_string(),
+        tokenizer_path: state.text.tokenizer_path().to_string_lossy().to_string(),
+        vocab_size,
+    })
+}
+
+/// 文本塔覆盖率（该源有多少条 prompt 已经算出向量）。
+#[derive(Debug, Clone, Serialize)]
+pub struct TextCoverageDto {
+    /// 有非空 prompt 的图数（分母）。
+    pub total: usize,
+    /// 已算出文本签名的图数（分子）。
+    pub computed: usize,
+    /// 向量维度（已算过才有值）。
+    pub dim: Option<usize>,
+}
+
+/// 该源的文本塔覆盖率。
+#[tauri::command]
+pub fn text_coverage(
+    source_id: i64,
+    state: State<'_, AppState>,
+) -> Result<TextCoverageDto, String> {
+    let total = state
+        .db
+        .count_images_with_prompts(source_id)
+        .map_err(|e| e.to_string())?;
+    let computed = state
+        .db
+        .signature_image_ids(source_id, "text", crate::text::TEXT_MODEL_ID)
+        .map_err(|e| e.to_string())?
+        .len();
+    let dim = state
+        .db
+        .signatures_for(source_id, "text", crate::text::TEXT_MODEL_ID)
+        .map_err(|e| e.to_string())?
+        .first()
+        .map(|(_, v)| v.len());
+    Ok(TextCoverageDto {
+        total,
+        computed,
+        dim,
+    })
+}
+
+/// 取消正在跑的文本签名批处理。
+#[tauri::command]
+pub fn cancel_text_signatures(state: State<'_, AppState>) -> Result<bool, String> {
+    let guard = state
+        .text_signature_cancel
+        .lock()
+        .map_err(|_| "取消标志锁已中毒")?;
+    match guard.as_ref() {
+        Some(flag) => {
+            flag.store(true, Ordering::SeqCst);
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// 给一个源的所有 prompt 算文本签名（BGE）。
+///
+/// 与视觉塔的差别：
+/// * 输入是 **prompt 文本**，不读图 —— 所以快得多（1000 条 prompt 约十几秒）；
+/// * 批大小恒为 8（`text::TEXT_BATCH`）—— int8 量化权重对批大小敏感，
+///   与实验室 `embed.py` 同口径，否则向量闸门失去判别力；
+/// * 写进 `slot='text'`、`model_id='bge-small-zh-q'` —— **错空间**的坑就在
+///   这里（视觉塔也是 512 维，肉眼查不出来）。
+///
+/// 逐批回传进度（`text-signature-progress` 事件），可取消。
+#[tauri::command]
+pub async fn compute_text_signatures(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    source_id: i64,
+    force: Option<bool>,
+) -> Result<SignatureResultDto, String> {
+    if !state.text.available() {
+        return Err("未找到文本塔资源（需要 text_bge.onnx 与 tokenizer_bge.json，请运行 scripts\\download_models.ps1）".to_string());
+    }
+    // 同一时刻只允许一批（文本塔与视觉塔各一把锁，互不打断）。
+    {
+        let guard = state
+            .text_signature_cancel
+            .lock()
+            .map_err(|_| "取消标志锁已中毒")?;
+        if guard.is_some() {
+            return Err("已有文本签名任务在运行".to_string());
+        }
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut guard = state
+            .text_signature_cancel
+            .lock()
+            .map_err(|_| "取消标志锁已中毒")?;
+        *guard = Some(Arc::clone(&cancel));
+    }
+    let db = Arc::clone(&state.db);
+    let text = Arc::clone(&state.text);
+    let force = force.unwrap_or(false);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let images = db
+            .list_images_for_prompts(source_id)
+            .map_err(|e| e.to_string())?;
+        let total = images.len();
+        let already = if force {
+            std::collections::HashSet::new()
+        } else {
+            db.signature_image_ids(source_id, "text", crate::text::TEXT_MODEL_ID)
+                .map_err(|e| e.to_string())?
+        };
+        let todo: Vec<(i64, String)> = images
+            .into_iter()
+            .filter(|(id, _)| !already.contains(id))
+            .collect();
+        let skipped = total.saturating_sub(todo.len());
+        let mut failed = 0usize;
+        let mut computed = 0usize;
+        let mut dim = 0usize;
+        if !todo.is_empty() {
+            let base = crate::progress::ProgressBase::new();
+            let mut progress = |done: usize, _total: usize| {
+                let _ = app.emit(
+                    "text-signature-progress",
+                    SignatureProgressDto {
+                        slot: "text".to_string(),
+                        done: base.global(done),
+                        total: todo.len(),
+                    },
+                );
+            };
+            for chunk in todo.chunks(64) {
+                if cancel.load(Ordering::SeqCst) {
+                    break;
+                }
+                let computed_chunk = text.with_engine(|engine| {
+                    engine.embed_prompts(chunk, &mut progress, &|| cancel.load(Ordering::SeqCst))
+                });
+                match computed_chunk {
+                    Ok(Ok((rows, chunk_failed))) => {
+                        failed += chunk_failed;
+                        computed += rows.len();
+                        if let Some(first) = rows.first() {
+                            dim = first.1.len();
+                        }
+                        db.upsert_signatures(
+                            "text",
+                            crate::text::TEXT_MODEL_ID,
+                            &rows
+                                .iter()
+                                .map(|(id, vec)| (*id, vec.as_slice()))
+                                .collect::<Vec<_>>(),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                    Ok(Err(e)) => {
+                        log::warn!("文本签名批次失败：{e}");
+                        failed += chunk.len();
+                    }
+                    Err(e) => {
+                        log::warn!("文本塔不可用：{e}");
+                        failed += chunk.len();
+                    }
+                }
+                base.advance(chunk.len());
+            }
+        }
+        let cancelled = cancel.load(Ordering::SeqCst);
+        Ok::<SignatureResultDto, String>(SignatureResultDto {
+            computed,
+            skipped,
+            failed,
+            total,
+            model_id: crate::text::TEXT_MODEL_ID.to_string(),
+            dim,
+            cancelled,
+        })
+    })
+    .await
+    .map_err(|e| format!("文本签名任务异常：{e}"))??;
+    {
+        let mut guard = state
+            .text_signature_cancel
+            .lock()
+            .map_err(|_| "取消标志锁已中毒")?;
+        *guard = None;
+    }
+    Ok(result)
+}
+
+/// 一个模型塔的运行时状态。
+#[derive(Debug, Clone, Serialize)]
+pub struct TowerCapabilityDto {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub model_id: String,
+    /// 权重是否就位 —— 就位 = 这次运行里这个塔真的能用（不是「代码在」）。
+    pub available: bool,
+}
+
+/// 构建能力自述。
+#[derive(Debug, Clone, Serialize)]
+pub struct AppCapabilitiesDto {
+    /// 应用版本（来自 `tauri.conf.json`）。
+    pub version: String,
+    /// 构建时刻（编译期烧进二进制的 epoch 秒）—— 用来认出「这是哪一份 exe」。
+    pub build_ts: String,
+    /// 构建时的 git 短 SHA（无 git 时为 `nogit`）。
+    pub build_id: String,
+    /// 本次构建具备的能力（标记串住在实现模块里，见 `capabilities.rs`）。
+    pub capabilities: Vec<crate::capabilities::Capability>,
+    /// L2 聚类档位（运行时真值）。
+    pub l2_modes: Vec<String>,
+    /// 各塔的就位状态。
+    pub towers: Vec<TowerCapabilityDto>,
+}
+
+/// 这个 exe 里到底有什么。
+///
+/// 为什么要有这个命令：发行版 EXE 是**用户主动审查的产物**。用户要能
+/// 打开应用就看到「这一份带哪些能力」，而不是靠文件大小 / 时间戳去猜
+/// （阶段七轮 2 的 exe 与上一版逐字节等价，肉眼完全看不出来）。
+///
+/// 标记串的纪律见 `capabilities.rs`：它们住在**实现模块**里，所以这份
+/// 清单不可能声称一个没实现的能力。
+#[tauri::command]
+pub fn app_capabilities(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AppCapabilitiesDto, String> {
+    let version = app.package_info().version.to_string();
+    let build_ts = match env!("AI_SORTER_BUILD_TS").parse::<i64>() {
+        Ok(ts) => chrono::DateTime::from_timestamp(ts, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| env!("AI_SORTER_BUILD_TS").to_string()),
+        Err(_) => env!("AI_SORTER_BUILD_TS").to_string(),
+    };
+    let towers = vec![TowerCapabilityDto {
+        id: "tower.vision",
+        label: "视觉塔（CLIP ViT-B/32）",
+        model_id: crate::vision::VISION_MODEL_ID.to_string(),
+        available: state.vision.model_path().is_file(),
+    }];
+    Ok(AppCapabilitiesDto {
+        version,
+        build_ts,
+        build_id: env!("AI_SORTER_BUILD_ID").to_string(),
+        capabilities: crate::capabilities::capabilities(),
+        l2_modes: crate::clustering::L2Mode::all()
+            .iter()
+            .map(|m| m.as_str().to_string())
+            .collect(),
+        towers,
+    })
+}
+
+/// 给一个源的所有图片算视觉签名。
+///
+/// 逐批处理并回传进度（`signature-progress` 事件）：1000 张在 CPU 上约 5 分钟，
+/// 必须让用户看得见进度、也必须能取消。已算过的图默认跳过（`force` 可重算）。
+#[tauri::command]
+pub async fn compute_signatures(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    source_id: i64,
+    force: Option<bool>,
+) -> Result<SignatureResultDto, String> {
+    if !state.vision.model_path().is_file() {
+        return Err("未找到视觉模型权重（请运行 scripts\\download_models.ps1）".to_string());
+    }
+    // 同一时刻只允许一批
+    {
+        let guard = state.signature_cancel.lock().map_err(|_| "取消标志锁已中毒")?;
+        if guard.is_some() {
+            return Err("已有签名任务在运行".to_string());
+        }
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut guard = state.signature_cancel.lock().map_err(|_| "取消标志锁已中毒")?;
+        *guard = Some(Arc::clone(&cancel));
+    }
+    let db = Arc::clone(&state.db);
+    let vision = Arc::clone(&state.vision);
+    let force = force.unwrap_or(false);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let images = db.list_images_for_signatures(source_id).map_err(|e| e.to_string())?;
+        let total = images.len();
+        let already = if force {
+            std::collections::HashSet::new()
+        } else {
+            db.signature_image_ids(source_id, "vision", crate::vision::VISION_MODEL_ID)
+                .map_err(|e| e.to_string())?
+        };
+        let todo: Vec<(i64, PathBuf)> = images
+            .into_iter()
+            .filter(|(id, path)| {
+                !already.contains(id) && std::path::Path::new(path).is_file()
+            })
+            .map(|(id, path)| (id, PathBuf::from(path)))
+            .collect();
+        let skipped = total.saturating_sub(todo.len());
+        let mut failed = 0usize;
+        let mut computed = 0usize;
+        let mut dim = 0usize;
+        if !todo.is_empty() {
+            // 跨块累加的进度基址。`embed_batch` 上报的是**块内**计数
+            // （每 8 张一批，上限 = 块长 ≤ 64），直接当全局计数发出会让
+            // 进度条在每块开头**重置** —— 实测症状是 1%↔7% 反复横跳，
+            // 而计算本身完全正常。详见 `progress.rs`。
+            let base = crate::progress::ProgressBase::new();
+            let mut progress = |done: usize, _total: usize| {
+                let _ = app.emit(
+                    "signature-progress",
+                    SignatureProgressDto {
+                        slot: "vision".to_string(),
+                        done: base.global(done),
+                        total: todo.len(),
+                    },
+                );
+            };
+            // 分块跑：单张图读失败不该让整批失败（embed_batch 内部跳过并计数）。
+            for chunk in todo.chunks(64) {
+                if cancel.load(Ordering::SeqCst) {
+                    break;
+                }
+                match vision.embed_batch(chunk, &mut progress, &|| cancel.load(Ordering::SeqCst)) {
+                    Ok((rows, chunk_failed)) => {
+                        failed += chunk_failed;
+                        computed += rows.len();
+                        if let Some(first) = rows.first() {
+                            dim = first.1.len();
+                        }
+                        db.upsert_signatures(
+                            "vision",
+                            crate::vision::VISION_MODEL_ID,
+                            &rows
+                                .iter()
+                                .map(|(id, vec)| (*id, vec.as_slice()))
+                                .collect::<Vec<_>>(),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                    Err(e) => {
+                        log::warn!("签名批次失败：{e}");
+                        failed += chunk.len();
+                    }
+                }
+                base.advance(chunk.len());
+            }
+        }
+        let cancelled = cancel.load(Ordering::SeqCst);
+        Ok::<SignatureResultDto, String>(SignatureResultDto {
+            computed,
+            skipped,
+            failed,
+            total,
+            model_id: crate::vision::VISION_MODEL_ID.to_string(),
+            dim,
+            cancelled,
+        })
+    })
+    .await
+    .map_err(|e| format!("签名任务异常：{e}"))??;
+    {
+        let mut guard = state.signature_cancel.lock().map_err(|_| "取消标志锁已中毒")?;
+        *guard = None;
+    }
+    Ok(result)
+}
+

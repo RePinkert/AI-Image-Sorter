@@ -231,7 +231,7 @@ impl Db {
 mod migrations {
     use super::*;
 
-    pub(crate) const CURRENT_VERSION: i32 = 16;
+    pub(crate) const CURRENT_VERSION: i32 = 18;
 
     pub fn run(conn: &Connection) -> Result<()> {
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -431,6 +431,48 @@ mod migrations {
         if has_prev_key == 0 {
             conn.execute_batch(
                 "ALTER TABLE manual_group_bindings ADD COLUMN prev_group_key TEXT;",
+            )?;
+        }
+        // v17: 视觉签名表（阶段六）。CREATE TABLE IF NOT EXISTS 已覆盖新库，
+        // 这里只保证老库也有这张表。
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS image_signatures (
+                image_id INTEGER NOT NULL,
+                slot TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                dim INTEGER NOT NULL,
+                vec BLOB NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(image_id, slot),
+                FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE
+            );",
+        )?;
+        // v17: L2 聚类方式与语义模式的阈值。文本模式用 Jaccard 阈值，
+        // 视觉/语义模式用余弦阈值 —— 两者量纲不同，必须分开存，
+        // 共用一个滑块会让「调了没反应」变成常态。
+        let src_cols = source_columns(conn)?;
+        if !src_cols.contains("l2_mode") {
+            conn.execute_batch(
+                "ALTER TABLE sources ADD COLUMN l2_mode TEXT NOT NULL DEFAULT 'text';",
+            )?;
+        }
+        if !src_cols.contains("l2_visual_threshold") {
+            conn.execute_batch(
+                "ALTER TABLE sources ADD COLUMN l2_visual_threshold REAL NOT NULL DEFAULT 0.75;",
+            )?;
+        }
+        // v18: 语义档（BGE）的阈值**单独存**。
+        //
+        // 为什么必须分开：`l2_visual_threshold` 的 0.75 是 **CLIP 的值**
+        // （实测标定出来的，见 ui-log.md 0b-2）。BGE 余弦的分布与 CLIP 不同，
+        // 沿用 0.75 就是拿另一个空间的刻度去卡这个空间 —— 分组会莫名其妙。
+        //
+        // 默认值 0.70 是**暂定值，未标定**（阶段七轮 3 走双源标定：A 轨合成
+        // 语料判别力 + 用户自己的聚类反标定）。标定完成前语义档**不得设为
+        // 默认档**（ui-program.md 阶段七「已定问题」第 3 条）。
+        if !src_cols.contains("l2_semantic_threshold") {
+            conn.execute_batch(
+                "ALTER TABLE sources ADD COLUMN l2_semantic_threshold REAL NOT NULL DEFAULT 0.7;",
             )?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {};", CURRENT_VERSION))?;
@@ -648,9 +690,11 @@ mod migrations {
                 scanned_at TEXT,
                 file_count INTEGER NOT NULL DEFAULT 0,
                 newest_mtime INTEGER NOT NULL DEFAULT 0,
-                l2_threshold REAL NOT NULL DEFAULT 0.3,
-                model_deviation_dimensions TEXT NOT NULL DEFAULT '[]'
-            );
+                 l2_threshold REAL NOT NULL DEFAULT 0.3,
+                 l2_visual_threshold REAL NOT NULL DEFAULT 0.75,
+                 l2_mode TEXT NOT NULL DEFAULT 'text',
+                 model_deviation_dimensions TEXT NOT NULL DEFAULT '[]'
+             );
             CREATE TABLE IF NOT EXISTS images (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_id INTEGER NOT NULL,
@@ -751,6 +795,20 @@ mod migrations {
                 created_at TEXT,
                 prev_group_key TEXT,
                  PRIMARY KEY(level, image_id),
+                 FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE
+             );
+             -- v17: 视觉/语义签名（阶段六）。每个图每个槽位一条向量。
+             -- slot: 'vision'（图像塔）| 'text'（prompt 文本塔）
+             -- model_id 必存：不同模型的向量不在同一空间里，绝不能混着比 ——
+             -- 换模型 = 换分区 = 必须重算。
+             CREATE TABLE IF NOT EXISTS image_signatures (
+                 image_id INTEGER NOT NULL,
+                 slot TEXT NOT NULL,
+                 model_id TEXT NOT NULL,
+                 dim INTEGER NOT NULL,
+                 vec BLOB NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 PRIMARY KEY(image_id, slot),
                  FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE
              );
              CREATE TABLE IF NOT EXISTS review_actions (
@@ -1503,6 +1561,400 @@ impl Db {
         let mut out = Vec::new();
         for row in rows { out.push(row?); }
         Ok(out)
+    }
+
+    // ---- 视觉签名（阶段六）----
+
+    /// 需要算签名的图（id + 路径）。已隐藏的图不参与：它们本来就不参与
+    /// 评分与浏览，没必要花 CPU 去算向量。
+    pub fn list_images_for_signatures(&self, source_id: i64) -> Result<Vec<(i64, String)>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id, abs_path FROM images WHERE source_id=?1 AND hidden=0 ORDER BY id")?;
+        let rows = stmt.query_map(rusqlite::params![source_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 已经有签名的图 id（同一 slot + 同一模型）。换模型时这个集合会变空
+    /// —— 不同模型的向量不在同一空间，不能混用。
+    pub fn signature_image_ids(
+        &self,
+        source_id: i64,
+        slot: &str,
+        model_id: &str,
+    ) -> Result<std::collections::HashSet<i64>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT s.image_id FROM image_signatures s JOIN images i ON i.id = s.image_id
+             WHERE i.source_id=?1 AND s.slot=?2 AND s.model_id=?3",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![source_id, slot, model_id], |r| {
+            Ok(r.get::<_, i64>(0)?)
+        })?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+
+    /// 写入签名。向量以归一化 f32 小端字节存 BLOB（1KB/512 维）。
+    pub fn upsert_signatures(
+        &self,
+        slot: &str,
+        model_id: &str,
+        rows: &[(i64, &[f32])],
+    ) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.0.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO image_signatures (image_id, slot, model_id, dim, vec, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(image_id, slot) DO UPDATE SET
+                   model_id=excluded.model_id, dim=excluded.dim,
+                   vec=excluded.vec, updated_at=excluded.updated_at",
+            )?;
+            for (image_id, vec) in rows {
+                let mut bytes = Vec::with_capacity(vec.len() * 4);
+                for v in *vec {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                stmt.execute(rusqlite::params![
+                    image_id,
+                    slot,
+                    model_id,
+                    vec.len() as i64,
+                    bytes,
+                    now
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(rows.len())
+    }
+
+    /// 读回一个源在某槽位/模型下的全部签名（Round 2 的聚类用它）。
+    pub fn signatures_for(
+        &self,
+        source_id: i64,
+        slot: &str,
+        model_id: &str,
+    ) -> Result<Vec<(i64, Vec<f32>)>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT s.image_id, s.vec FROM image_signatures s JOIN images i ON i.id = s.image_id
+             WHERE i.source_id=?1 AND s.slot=?2 AND s.model_id=?3 ORDER BY s.image_id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![source_id, slot, model_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (image_id, bytes) = row?;
+            if bytes.len() % 4 != 0 {
+                continue;
+            }
+            let vec: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            out.push((image_id, vec));
+        }
+        Ok(out)
+    }
+
+    /// 一个源里所有图片的 (id, L1 键, L2 键) —— 语义聚类需要按 L1 桶分组。
+    pub fn list_images_for_clustering(&self, source_id: i64) -> Result<Vec<(i64, String, String)>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, group_key_l1, group_key_l2 FROM images WHERE source_id=?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![source_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 某个组属于哪个源（离群检测要拿同源的其它组当候选）。
+    pub fn group_source_id(&self, group_key: &str) -> Result<Option<i64>> {
+        let conn = self.0.lock().unwrap();
+        let value: Option<i64> = conn
+            .query_row(
+                "SELECT source_id FROM images WHERE group_key_l2=? LIMIT 1",
+                rusqlite::params![group_key],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(value)
+    }
+
+    /// 某个槽位/模型下的**全部**签名（跨源；离群检测要比对别的组）。
+    pub fn signatures_for_slot(&self, slot: &str, model_id: &str) -> Result<Vec<(i64, Vec<f32>)>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT image_id, vec FROM image_signatures WHERE slot=?1 AND model_id=?2 ORDER BY image_id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![slot, model_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (image_id, bytes) = row?;
+            if bytes.len() % 4 != 0 {
+                continue;
+            }
+            let vec: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            out.push((image_id, vec));
+        }
+        Ok(out)
+    }
+
+    /// 某个组的成员 id（阶段六的离群检测用）。
+    pub fn group_member_ids(&self, group_key: &str) -> Result<Vec<i64>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id FROM images WHERE group_key_l2=? AND hidden=0 ORDER BY id")?;
+        let rows = stmt.query_map(rusqlite::params![group_key], |r| r.get::<_, i64>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 源里每个 L2 组的成员 id（阶段六的推荐用）。
+    pub fn group_members_for_source(&self, source_id: i64) -> Result<Vec<(String, i64, String, Vec<i64>)>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT group_key_l2, COUNT(*), MIN(prompt_pos) FROM images
+             WHERE source_id=?1 AND group_key_l2 IS NOT NULL AND hidden=0
+             GROUP BY group_key_l2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![source_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ))
+        })?;
+        let mut groups = Vec::new();
+        for row in rows {
+            let (key, count, prompt) = row?;
+            let mut members_stmt = conn.prepare(
+                "SELECT id FROM images WHERE source_id=?1 AND group_key_l2=?2 AND hidden=0 ORDER BY id",
+            )?;
+            let member_rows = members_stmt.query_map(rusqlite::params![source_id, &key], |r| {
+                r.get::<_, i64>(0)
+            })?;
+            let mut members = Vec::with_capacity(count as usize);
+            for m in member_rows {
+                members.push(m?);
+            }
+            groups.push((key, count, prompt, members));
+        }
+        Ok(groups)
+    }
+
+    /// 源里所有 level-2 手动绑定（image_id → 绑定的组键）。
+    /// 手动 pin 永远优先于自动聚类：合并/拆分/移动过的图不会被重新聚类带走。
+    pub fn manual_l2_bindings(&self, source_id: i64) -> Result<std::collections::HashMap<i64, String>> {        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT b.image_id, b.group_key FROM manual_group_bindings b
+             JOIN images i ON i.id=b.image_id
+             WHERE b.level=2 AND i.source_id=?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![source_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (id, key) = row?;
+            out.insert(id, key);
+        }
+        Ok(out)
+    }
+
+    /// 还没有签名的图（id + 路径），按 id 升序，可限量。
+    ///
+    /// 用途：视觉/语义聚类模式下，新入库的图还没有向量 —— 同步时按批补算，
+    /// 否则这些图会一直停在自己的 L1 占位组里。限量是为了不让同步被
+    /// 一次几千张的补算拖住（补算是分批推进的，每轮同步啃掉一批）。
+    pub fn images_without_signatures(
+        &self,
+        source_id: i64,
+        slot: &str,
+        model_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String)>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT i.id, i.abs_path FROM images i
+             WHERE i.source_id=?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM image_signatures s
+                 WHERE s.image_id=i.id AND s.slot=?2 AND s.model_id=?3)
+             ORDER BY i.id LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![source_id, slot, model_id, limit as i64],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 该源的图 + 它们的 prompt（文本塔的输入）。
+    ///
+    /// 只取**有 prompt** 的 —— 空 prompt 没有语义可算，算出来的向量是噪声。
+    pub fn list_images_for_prompts(&self, source_id: i64) -> Result<Vec<(i64, String)>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, prompt_pos FROM images
+             WHERE source_id=?1 AND prompt_pos != '' ORDER BY id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![source_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 还没有文本签名的图（id + prompt），按 id 升序，可限量。
+    ///
+    /// 与 `images_without_signatures` 的区别：那个给的是**文件路径**（视觉塔
+    /// 要读图），这个给的是 **prompt 文本**（文本塔不读图）。
+    ///
+    /// 维度校验：槽位里的向量必须与 `model_id` 匹配 —— 换模型必须重算，
+    /// 不同模型的向量不在同一空间里，绝不能混着比。
+    pub fn images_without_text_signatures(
+        &self,
+        source_id: i64,
+        model_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String)>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT i.id, i.prompt_pos FROM images i
+             WHERE i.source_id=?1 AND i.prompt_pos != ''
+               AND NOT EXISTS (
+                 SELECT 1 FROM image_signatures s
+                 WHERE s.image_id=i.id AND s.slot='text' AND s.model_id=?2)
+             ORDER BY i.id LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![source_id, model_id, limit as i64],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 该源的 L2 聚类方式（阶段六）。
+    pub fn get_source_l2_mode(&self, source_id: i64) -> Result<String> {        let conn = self.0.lock().unwrap();
+        let value: Option<String> = conn
+            .query_row(
+                "SELECT l2_mode FROM sources WHERE id=?1",
+                rusqlite::params![source_id],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(value.unwrap_or_else(|| "text".to_string()))
+    }
+
+    /// 语义档（BGE）的余弦阈值。**与视觉档的阈值分开存** —— 0.75 是 CLIP
+    /// 的值，绝不可沿用到 BGE（见 v18 迁移的注释）。
+    pub fn get_source_semantic_threshold(&self, source_id: i64) -> Result<f64> {
+        let conn = self.0.lock().unwrap();
+        let value: Option<f64> = conn
+            .query_row(
+                "SELECT l2_semantic_threshold FROM sources WHERE id=?1",
+                rusqlite::params![source_id],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(value.unwrap_or(crate::clustering::DEFAULT_SEMANTIC_THRESHOLD))
+    }
+
+    pub fn set_source_semantic_threshold(&self, source_id: i64, value: f64) -> Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE sources SET l2_semantic_threshold=?2 WHERE id=?1",
+            rusqlite::params![source_id, value],
+        )?;
+        Ok(())
+    }
+
+    /// 该源有多少条**非空 prompt**（文本塔的分母）。
+    pub fn count_images_with_prompts(&self, source_id: i64) -> Result<usize> {
+        let conn = self.0.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM images WHERE source_id=?1 AND prompt_pos != ''",
+            rusqlite::params![source_id],
+            |r| r.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    pub fn set_source_l2_mode(&self, source_id: i64, mode: &str) -> Result<()> {        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE sources SET l2_mode=?2 WHERE id=?1",
+            rusqlite::params![source_id, mode],
+        )?;
+        Ok(())
+    }
+
+    /// 视觉/语义模式的余弦阈值（与文本模式的 Jaccard 阈值分开存 ——
+    /// 两者的量纲根本不同，共用一个滑块会互相打架）。
+    pub fn get_source_visual_threshold(&self, source_id: i64) -> Result<f64> {
+        let conn = self.0.lock().unwrap();
+        let value: Option<f64> = conn
+            .query_row(
+                "SELECT l2_visual_threshold FROM sources WHERE id=?1",
+                rusqlite::params![source_id],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(value.unwrap_or(crate::clustering::DEFAULT_VISUAL_THRESHOLD))
+    }
+
+    pub fn set_source_visual_threshold(&self, source_id: i64, threshold: f64) -> Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE sources SET l2_visual_threshold=?2 WHERE id=?1",
+            rusqlite::params![source_id, threshold],
+        )?;
+        Ok(())
     }
 
     /// The single wheel-selected Model偏差 dimension for a source

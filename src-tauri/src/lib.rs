@@ -1,4 +1,5 @@
 mod archive;
+mod capabilities;
 mod clustering;
 mod commands;
 mod comfy_finder;
@@ -6,7 +7,11 @@ mod db;
 mod grouper;
 mod metadata;
 mod paths;
+mod progress;
 mod scoring;
+mod suggest;
+mod text;
+mod vision;
 mod workflow;
 
 use std::path::PathBuf;
@@ -35,8 +40,43 @@ pub fn run() {
             let dir = paths::data_root(app.handle());
             let db_path: PathBuf = dir.join("ai-image-sorter.db");
             let db = db::open(&db_path)?;
+            // 视觉签名引擎（阶段六）：模型权重缺失时功能不可用，但应用照常启动。
+            let model_dir = vision::resolve_model_dir(app.handle());
+            let model_path = model_dir
+                .map(|d| d.join("vision_clip.onnx"))
+                .unwrap_or_else(|| dir.join("models").join("vision_clip.onnx"));
+            if !model_path.is_file() {
+                log::info!("视觉模型权重缺失，识图功能不可用：{}", model_path.display());
+            }
+            // 文本塔（阶段七轮 1 接线）：权重与分词器**缺任一份**就不可用，
+            // 但应用照常启动 —— 与视觉塔同口径。
+            let text_model_dir = text::resolve_text_model_dir(app.handle());
+            let (text_model_path, text_tokenizer_path) = match text_model_dir {
+                Some(d) => (d.join(text::TEXT_WEIGHTS), d.join(text::TEXT_TOKENIZER)),
+                None => {
+                    let fallback = dir.join("models");
+                    (
+                        fallback.join(text::TEXT_WEIGHTS),
+                        fallback.join(text::TEXT_TOKENIZER),
+                    )
+                }
+            };
+            if !text_model_path.is_file() || !text_tokenizer_path.is_file() {
+                log::info!(
+                    "文本塔资源缺失，prompt 语义功能不可用：{} / {}",
+                    text_model_path.display(),
+                    text_tokenizer_path.display()
+                );
+            }
             app.manage(commands::AppState {
                 db: Arc::new(db),
+                vision: Arc::new(vision::VisionEngine::new(model_path)),
+                text: Arc::new(text::TextEngineSlot::new(
+                    text_model_path,
+                    text_tokenizer_path,
+                )),
+                signature_cancel: std::sync::Mutex::new(None),
+                text_signature_cancel: std::sync::Mutex::new(None),
             });
 
             #[cfg(desktop)]
@@ -105,6 +145,16 @@ pub fn run() {
             commands::recommend_prompts,
             commands::record_telemetry_event,
             commands::export_diagnostics,
+            commands::vision_status,
+            commands::compute_signatures,
+            commands::cancel_signatures,
+            commands::text_status,
+            commands::text_coverage,
+            commands::compute_text_signatures,
+            commands::cancel_text_signatures,
+            commands::suggest_move_targets,
+            commands::group_outliers,
+            commands::app_capabilities,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
