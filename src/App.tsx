@@ -27,6 +27,7 @@ export default function App() {
   const applySyncProgress = useStore((s) => s.applySyncProgress)
   const resetSyncProgress = useStore((s) => s.resetSyncProgress)
   const bumpDataRevision = useStore((s) => s.bumpDataRevision)
+  const bumpGroupRevision = useStore((s) => s.bumpGroupRevision)
 
   useEffect(() => {
     const enteredAt = Date.now()
@@ -151,6 +152,9 @@ export default function App() {
           setSources(sources)
           await refreshGroups()
           bumpDataRevision()
+          // 重聚类换了组 → 列表里的缩略图全部作废（同步每 8 秒一次，
+          // 所以只在真的重聚类时才作废，不跟着每次同步都刷）。
+          if (result.reclustered) bumpGroupRevision()
           track('sync', {
             success: true,
             source_count: result.sources,
@@ -194,7 +198,7 @@ export default function App() {
       if (hideTimer) clearTimeout(hideTimer)
       refreshRequest += 1
     }
-  }, [bumpDataRevision, setCurrentGroupKey, setGroups, setSources, setSyncState, setView, resetSyncProgress])
+  }, [bumpDataRevision, bumpGroupRevision, setCurrentGroupKey, setGroups, setSources, setSyncState, setView, resetSyncProgress])
 
   const pendingText =
     syncProgress.active && syncProgress.pending > 0

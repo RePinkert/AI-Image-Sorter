@@ -90,6 +90,14 @@ export interface UpdateImagePromptsResult {
 
 export type Granularity = 0 | 1 | 2 | 3
 
+/**
+ * L2 聚类方式（阶段六）。
+ *  - text     词 Jaccard（历史行为；L3 与「本地改 prompt」依赖它）
+ *  - visual   视觉塔向量 + 平均连接（默认；实测追平并超过人工合并）
+ *  - semantic 文本塔向量 + 平均连接（没有视觉塔时的退路）
+ */
+export type L2Mode = 'text' | 'visual' | 'semantic'
+
 export interface ModelFacet {
   model: string
   count: number
@@ -161,6 +169,119 @@ export interface SyncAllResult {
 export interface GroupThumbDto {
   group_key: string
   thumb_paths: string[]
+}
+
+/** 「识图」是否可用（视觉模型权重是否就位）。 */
+export interface VisionStatusDto {
+  available: boolean
+  model_id: string
+  model_path: string
+}
+
+/**
+ * 文本塔（prompt 语义）是否可用。
+ *
+ * 权重与分词器**缺任一份**就整体不可用 —— 所以这里只有一个 `available`，
+ * 没有「有模型但没有分词器」这种半可用状态。
+ */
+export interface TextStatusDto {
+  available: boolean
+  model_id: string
+  model_path: string
+  tokenizer_path: string
+  /** 分词器词表大小（可读时才有值）。 */
+  vocab_size?: number | null
+}
+
+/** 文本塔覆盖率（该源有多少条 prompt 已算出向量）。 */
+export interface TextCoverageDto {
+  /** 有非空 prompt 的图数（分母）。 */
+  total: number
+  /** 已算出文本签名的图数（分子）。 */
+  computed: number
+  /** 向量维度（已算过才有值）。 */
+  dim?: number | null
+}
+
+/**
+ * 一条构建能力。
+ *
+ * `marker` 是**二进制里能被探针扫到的标记串**，它由实现该能力的模块生成
+ * （Rust 侧 `capabilities.rs`）—— 所以「声称有但没实现」在二进制层面
+ * 就会被 `scripts\verify-release-binary.ps1` 发现。
+ */
+export interface CapabilityDto {
+  id: string
+  marker: string
+  label: string
+  /** 'clustering' | 'tower' | 'provenance' */
+  kind: string
+  /** 作用层级。本轮只有 L2（Prompt偏差）。 */
+  axis: string
+}
+
+/** 一个模型塔的就位状态（就位 = 这次运行里真的能用）。 */
+export interface TowerCapabilityDto {
+  id: string
+  label: string
+  model_id: string
+  available: boolean
+}
+
+/** 构建能力自述：这个 exe 里到底有什么。 */
+export interface AppCapabilitiesDto {
+  version: string
+  build_ts: string
+  build_id: string
+  capabilities: CapabilityDto[]
+  l2_modes: string[]
+  towers: TowerCapabilityDto[]
+}
+
+/** 签名批处理的进度（signature-progress 事件）。 */
+export interface SignatureProgressDto {
+  slot: string
+  done: number
+  total: number
+}
+
+/** 签名批处理的结果。 */
+export interface SignatureResultDto {
+  computed: number
+  skipped: number
+  failed: number
+  total: number
+  model_id: string
+  dim: number
+  cancelled: boolean
+}
+
+/** 「可能相关」推荐的一条。 */
+export interface MoveSuggestion {
+  group_key: string
+  count: number
+  prompt_pos: string
+  /** 0..1 的相似度（两种基准的量纲不同，靠 basis 区分）。 */
+  score: number
+  /**
+   * 相似度基准：
+   * - 'vision'（视觉余弦，CLIP）
+   * - 'semantic'（语义余弦，BGE）
+   * - 'text'（词 Jaccard）
+   *
+   * 三者的量纲**不可比** —— 标错会让用户以为「24% 的视觉相似」其实是语义相似。
+   */
+  basis: 'vision' | 'semantic' | 'text'
+}
+
+/** 组内「疑似错分」的一张图。 */
+export interface OutlierInfo {
+  image_id: number
+  /** 它在组内与其它成员的最大余弦（越低越像「不属于这里」）。 */
+  max_similarity: number
+  /** 最像的别的组。 */
+  best_group_key: string | null
+  best_score: number
 }
 
 export interface PromptRecommendation {

@@ -20,6 +20,14 @@ export type TelemetryPayload = Record<string, PayloadValue>
 const ENABLED_KEY = 'ai-image-sorter-telemetry-enabled'
 const DIAGNOSTICS_KEY = 'ai-image-sorter-diagnostics'
 const SCHEMA_VERSION = '1'
+
+/**
+ * 诊断导出文件的结构版本。
+ *
+ * 与事件 schema **分开**：v2 只加了一个顶层 `build` 段（构建清单），
+ * 事件结构本身没变 —— 改事件版本号会让历史事件看起来"格式不对"。
+ */
+const DIAGNOSTICS_SCHEMA_VERSION = '2'
 const MAX_DIAGNOSTICS = 60
 const DWELL_THRESHOLD_MS = 30_000
 
@@ -220,9 +228,28 @@ export async function exportDiagnostics() {
       // The local browser report remains useful if the backend is unavailable.
     }
   }
+  // 构建清单（版本 / 构建指纹 / 能力列表 / 模型塔就位状态）。
+  //
+  // 为什么放在诊断导出里而不是设置页：构建清单是**诊断数据**，不是用户偏好。
+  // 放进设置页会变成一坨开发者术语；而这里恰好就是「把这一份构建的来龙去脉
+  // 记录下来」的地方 —— 用户审查发行版 EXE 时要的正是这份清单。
+  //
+  // 通用性口径（这份导出可能被转发给别的用户看）：
+  // * 拿不到就写 null，**绝不让诊断导出失败**；
+  // * 老版本后端没有这个命令 → invoke 抛错 → 捕获 → null；
+  // * 浏览器预览模式（web dev）本来就没有桌面后端 → null。
+  let build: unknown = null
+  if (!isWebDev()) {
+    try {
+      build = await invoke('app_capabilities')
+    } catch {
+      // 老后端没有这个命令 —— 诊断导出照常成功。
+    }
+  }
   downloadDiagnostics({
-    schema_version: SCHEMA_VERSION,
+    schema_version: DIAGNOSTICS_SCHEMA_VERSION,
     session_id: sessionId,
+    build,
     events,
     backend,
   })

@@ -9,6 +9,7 @@ import {
   listGroupImages,
   listGroups,
   listMoveTargets,
+  suggestMoveTargets,
   mergeGroups,
   moveImagesToGroup,
   reclusterL1,
@@ -22,6 +23,7 @@ import type {
   GroupThumbDto,
   ImageRow,
   ModelDeviationDimension,
+  MoveSuggestion,
 } from '../types'
 import {
   MODEL_DEVIATION_DIMENSIONS,
@@ -29,15 +31,36 @@ import {
 } from '../types'
 import { useStore } from '../store'
 import { GRANULARITY_LEVELS, groupLabel } from '../lib/groupLabel'
+import {
+  deleteRowImageCache,
+  deleteThumbCache,
+  deleteThumbInflight,
+  getRowImageCache,
+  getThumbCache,
+  getThumbInflight,
+  setRowImageCache,
+  setThumbCache,
+  setThumbInflight,
+} from '../lib/groupCache'
+import {
+  applyListAnchor,
+  captureListAnchor,
+  setFocusKey,
+} from '../lib/listAnchor'
 
 
-const groupThumbCache = new Map<string, string[]>()
-const groupThumbInflight = new Map<string, Promise<string[]>>()
-
-
-function LazyGroupThumb({ groupKey, level }: { groupKey: string; level: Granularity }) {
+function LazyGroupThumb({
+  groupKey,
+  level,
+  reloadToken = 0,
+}: {
+  groupKey: string
+  level: Granularity
+  /** 组成员变化的代数。变了就说明这一格的缩略图不再代表这个组。 */
+  reloadToken?: number
+}) {
   const hostRef = useRef<HTMLDivElement | null>(null)
-  const [paths, setPaths] = useState<string[]>(() => groupThumbCache.get(`${level}:${groupKey}`) ?? [])
+  const [paths, setPaths] = useState<string[]>([])
   const [visible, setVisible] = useState(false)
 
   useEffect(() => {
@@ -56,24 +79,46 @@ function LazyGroupThumb({ groupKey, level }: { groupKey: string; level: Granular
     return () => observer.disconnect()
   }, [])
 
+  // 组成员变了 → 这一格的缩略图不再代表这个组 → 丢掉缓存与在途结果，重取。
+  // 声明在取数 effect **之前**：同一次提交里先作废再取数，才能保证这次拿到
+  // 的是新成员，而不是作废前就已经在途的旧结果。
+  //
+  // 用 ref 记住「上次见到的代数」：组件刚挂载时不该作废缓存（那会让每次
+  // 打开移动对话框都把全部目标组重取一遍）。全局作废由 invalidateGroupCaches
+  // 负责，这里只处理「自己还挂着，但组变了」。
+  const lastRevisionRef = useRef(reloadToken)
   useEffect(() => {
-    if (!visible || paths.length > 0) return
+    if (reloadToken === lastRevisionRef.current) return
+    lastRevisionRef.current = reloadToken
     const cacheKey = `${level}:${groupKey}`
-    let request = groupThumbInflight.get(cacheKey)
+    deleteThumbCache(cacheKey)
+    deleteThumbInflight(cacheKey)
+    setPaths([])
+  }, [reloadToken, level, groupKey])
+
+  useEffect(() => {
+    if (!visible) return
+    const cacheKey = `${level}:${groupKey}`
+    const cached = getThumbCache(cacheKey)
+    if (cached && cached.length > 0) {
+      setPaths(cached)
+      return
+    }
+    let request = getThumbInflight(cacheKey)
     if (!request) {
       request = getGroupThumbnails([groupKey], level).then((rows: GroupThumbDto[]) => rows[0]?.thumb_paths ?? [])
-      groupThumbInflight.set(cacheKey, request)
+      setThumbInflight(cacheKey, request)
     }
     let cancelled = false
     void request.then((next) => {
-      groupThumbCache.set(cacheKey, next)
-      groupThumbInflight.delete(cacheKey)
+      setThumbCache(cacheKey, next)
+      deleteThumbInflight(cacheKey)
       if (!cancelled) setPaths(next)
     }).catch(() => {
-      groupThumbInflight.delete(cacheKey)
+      deleteThumbInflight(cacheKey)
     })
     return () => { cancelled = true }
-  }, [groupKey, level, paths.length, visible])
+  }, [groupKey, level, visible, reloadToken])
 
   return (
     <div className="group-thumb" ref={hostRef}>
@@ -87,8 +132,6 @@ function LazyGroupThumb({ groupKey, level }: { groupKey: string; level: Granular
     </div>
   )
 }
-
-const groupImagesCache = new Map<string, Promise<ImageRow[]>>()
 
 function LazyRowImages({
   groupKey,
@@ -110,6 +153,7 @@ function LazyRowImages({
   const [images, setImages] = useState<ImageRow[]>([])
   const [loaded, setLoaded] = useState(false)
   const [visible, setVisible] = useState(false)
+  const groupRevision = useStore((s) => s.groupRevision)
 
   useEffect(() => {
     const el = hostRef.current
@@ -129,10 +173,10 @@ function LazyRowImages({
 
   useEffect(() => {
     if (!visible || loaded) return
-    let request = groupImagesCache.get(cacheKey)
+    let request = getRowImageCache(cacheKey)
     if (!request) {
       request = listGroupImages(groupKey, level)
-      groupImagesCache.set(cacheKey, request)
+      setRowImageCache(cacheKey, request)
     }
     let cancelled = false
     void request
@@ -142,7 +186,7 @@ function LazyRowImages({
           setLoaded(true)
         }
       })
-      .catch(() => groupImagesCache.delete(cacheKey))
+      .catch(() => deleteRowImageCache(cacheKey))
     return () => {
       cancelled = true
     }
@@ -151,7 +195,7 @@ function LazyRowImages({
   // A fresh reloadToken invalidates the (now stale) cached promise.
   useEffect(() => {
     if (reloadToken === 0) return
-    groupImagesCache.delete(cacheKey)
+    deleteRowImageCache(cacheKey)
     setLoaded(false)
     setImages([])
     setVisible(false)
@@ -159,6 +203,20 @@ function LazyRowImages({
     const el = hostRef.current
     if (el) setVisible(true)
   }, [reloadToken, cacheKey])
+
+  // 组成员变了（别的组搬进来 / 搬走）→ 这一行的图片条也不再代表这个组。
+  // 与 reloadToken 分开：前者是「本行被操作了」，后者是「全组的成员变了」。
+  const lastRevisionRef = useRef(groupRevision)
+  useEffect(() => {
+    if (groupRevision === lastRevisionRef.current) return
+    lastRevisionRef.current = groupRevision
+    deleteRowImageCache(cacheKey)
+    setLoaded(false)
+    setImages([])
+    setVisible(false)
+    const el = hostRef.current
+    if (el) setVisible(true)
+  }, [groupRevision, cacheKey])
 
   if (!loaded) {
     return <div className="row-image-strip" ref={hostRef}><div className="thumb-placeholder" /></div>
@@ -200,6 +258,8 @@ export function GroupList() {
   const setGranularity = useStore((s) => s.setGranularity)
   const sources = useStore((s) => s.sources)
   const dataRevision = useStore((s) => s.dataRevision)
+  const groupRevision = useStore((s) => s.groupRevision)
+  const bumpGroupRevision = useStore((s) => s.bumpGroupRevision)
   const [mergeMode, setMergeMode] = useState(false)
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set())
   const [mergeBusy, setMergeBusy] = useState(false)
@@ -247,6 +307,8 @@ export function GroupList() {
     try {
       await reclusterL1(currentSourceIdRef.current, busyTarget)
       await loadGroups(currentSourceIdRef.current, useStore.getState().granularity)
+      // 重聚类把组全换了一遍 → 缩略图全部作废。
+      useStore.getState().bumpGroupRevision()
     } catch (error) {
       setGroupError(errorMessage(error))
     } finally {
@@ -348,6 +410,51 @@ export function GroupList() {
     await loadGroups(currentSourceId, granularity)
   }
 
+  // ── 列表视口锚点 ───────────────────────────────────────────────────────
+  // 离开分组列表时组件会卸载，而列表没有内部滚动容器（滚的是文档），
+  // 滚动位置随之消失 → 回来时人在列表顶部。用户处理列表下半段的零碎
+  // 分组时，每搬一个组就要重新滚回去一次，非常累。
+  //
+  // 口径：滚动时记下「视口顶部那一行」，回来时**按行**还原（不是按像素）
+  // —— 行被删掉时下面整体上移，按行还原才能保证眼睛看到的内容不变。
+  // 详见 src/lib/listAnchor.ts。
+  const userScrollingRef = useRef(false)
+
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const onScroll = () => {
+      userScrollingRef.current = true
+      if (timer) clearTimeout(timer)
+      // 滚动停下来后记一次锚点。
+      //
+      // ⚠ 锚点**只在滚动时记**，不能在卸载时记 —— 卸载那一刻布局已经被
+      // 下一个视图接管，文档高度塌缩会把滚动位置钳到很小；再对已消失的
+      // 行调用 getBoundingClientRect() 还会强制重排，把「钳制后的滚动
+      // 位置」当成锚点存下来（实测存成了 scrollTop=25，回来时直接落到
+      // 列表顶部附近）。滚动时记就没有这个问题：那时列表还在。
+      timer = setTimeout(() => {
+        userScrollingRef.current = false
+        captureListAnchor(currentSourceId, granularity)
+      }, 100)
+    }
+    window.addEventListener('scroll', onScroll, { passive: true })
+    return () => {
+      window.removeEventListener('scroll', onScroll)
+      if (timer) clearTimeout(timer)
+    }
+  }, [currentSourceId, granularity])
+
+  // 分组加载完成后恢复位置。分组数组每次重载都是新引用 → 这个 effect
+  // 会在每次刷新后跑一次，把视口放回原位（行被删掉导致下移时由它补偿）。
+  useEffect(() => {
+    if (loadingGroups) return
+    applyListAnchor({
+      sourceId: currentSourceId,
+      granularity,
+      userScrolling: userScrollingRef.current,
+    })
+  }, [groups, loadingGroups, currentSourceId, granularity])
+
   async function doMerge() {
     const keys = Array.from(selectedKeys)
     if (keys.length < 2 || mergeBusy) return
@@ -371,6 +478,8 @@ export function GroupList() {
       const r = await mergeGroups(2, keys, currentSourceId)
       setMergeMsg(`已合并 ${r.moved} 张到同一分组（自动重聚类不会再拆开，可在文件夹视角撤销合并）`)
       setSelectedKeys(new Set())
+      // 合并改变了成员 → 缩略图与图片条都要重取。
+      bumpGroupRevision()
       await reloadGroupsAtLevel()
     } catch (e) {
       setMergeMsg(`合并失败：${errorMessage(e)}`)
@@ -381,11 +490,14 @@ export function GroupList() {
 
   function openGroup(g: GroupInfo) {
     setCurrentGroupKey(g.group_key)
+    // 回来时落在这一行上（用户刚看过它）。
+    setFocusKey(g.group_key)
     setView('swipe')
   }
 
   function openFolder(g: GroupInfo) {
     setCurrentGroupKey(g.group_key)
+    setFocusKey(g.group_key)
     setView('folder')
   }
 
@@ -411,6 +523,7 @@ export function GroupList() {
     imageIds: number[]
   } | null>(null)
   const [moveTargets, setMoveTargets] = useState<GroupInfo[] | null>(null)
+  const [moveSuggestions, setMoveSuggestions] = useState<MoveSuggestion[]>([])
   const [moveBusy, setMoveBusy] = useState(false)
 
   function selectionOf(key: string): number[] {
@@ -480,6 +593,11 @@ export function GroupList() {
         imageIds: ids,
       })
       setMoveTargets(targets)
+      setMoveSuggestions([])
+      // 「可能相关」：推荐失败不该挡住主流程。
+      void suggestMoveTargets(currentSourceId, ids, rowKey)
+        .then((list) => setMoveSuggestions(list.slice(0, 12)))
+        .catch(() => undefined)
     } catch (e) {
       setRowActionMsg(`加载迁移目标失败：${errorMessage(e)}`)
     } finally {
@@ -490,6 +608,7 @@ export function GroupList() {
   function closeMoveDialog() {
     setMoveRequest(null)
     setMoveTargets(null)
+    setMoveSuggestions([])
   }
 
   async function moveConfirmed(targetKey: string | null) {
@@ -505,6 +624,10 @@ export function GroupList() {
       setRowActionMsg(`已迁移 ${r.moved} 张 → ${targetLabel}`)
       clearRowSelection(moveRequest.rowKey)
       bumpRowImages(moveRequest.rowKey)
+      // 源组与目标组的成员都变了 → 两边的缩略图都要重取。
+      bumpGroupRevision()
+      // 整组搬走 → 回到列表时优先定位到它原来所在的那一行。
+      setFocusKey(moveRequest.rowKey)
       closeMoveDialog()
       await reloadGroupsAtLevel()
     } catch (e) {
@@ -530,9 +653,12 @@ export function GroupList() {
         setRowActionMsg(`已隐藏所选 ${ids.length} 张 — 可在文件夹视角撤销`)
         clearRowSelection(g.group_key)
         bumpRowImages(g.group_key)
+        // 缩略图只取未屏蔽的图 → 屏蔽之后缩略图就变了。
+        bumpGroupRevision()
       } else {
         const hiddenCount = await hideGroupImages(currentSourceId, g.group_key, true)
         setRowActionMsg(`已整组隐藏 ${hiddenCount} 张 — 可在文件夹视角撤销`)
+        bumpGroupRevision()
       }
       await reloadGroupsAtLevel()
     } catch (e) {
@@ -573,6 +699,8 @@ export function GroupList() {
       setRowActionMsg(`已删除 ${deleted} 张（回收站可恢复文件）`)
       clearRowSelection(g.group_key)
       bumpRowImages(g.group_key)
+      // 成员没了 → 缩略图与图片条都要重取。
+      bumpGroupRevision()
       await reloadGroupsAtLevel()
     } catch (e) {
       setRowActionMsg(`删除失败：${errorMessage(e)}`)
@@ -701,6 +829,7 @@ export function GroupList() {
           {groups.map((g) => (
             <div
               key={g.group_key}
+              data-group-key={g.group_key}
               className={`group-card ${mergeMode && granularity === 2 && selectedKeys.has(g.group_key) ? 'merge-selected' : ''}`}
               onClick={() => (mergeMode && granularity === 2 ? toggleMergeSelect(g.group_key) : openGroup(g))}
               role="button"
@@ -725,7 +854,7 @@ export function GroupList() {
                   onClick={(e) => e.stopPropagation()}
                 />
               )}
-              <LazyGroupThumb groupKey={g.group_key} level={granularity} />
+              <LazyGroupThumb groupKey={g.group_key} level={granularity} reloadToken={groupRevision} />
               <span className="group-count-badge">{g.count}</span>
               <div className="group-prompt">{groupLabel(g, granularity)}</div>
               {granularity === 2 && g.manually_merged && (
@@ -783,6 +912,7 @@ export function GroupList() {
               <div
                 key={g.group_key}
                 role="listitem"
+                data-group-key={g.group_key}
                 className={`group-row ${focused ? 'row-focused' : ''} ${open ? 'row-open' : ''} ${mergeMode && selectedKeys.has(g.group_key) ? 'merge-selected' : ''}`}
               >
                 <div className="group-row-head">
@@ -920,42 +1050,77 @@ export function GroupList() {
             >
               <h3>迁移 {moveRequest.imageIds.length} 张图片</h3>
               <p className="muted">来源：{moveRequest.label || '(无标签组)'}。迁移后自动重聚类不会拆开；目标可以是现有组，或新建一个分组。</p>
-              <div className="move-target-picker">
-                <button
-                  type="button"
-                  className="move-target new-group"
-                  disabled={moveBusy}
-                  onClick={() => void moveConfirmed(null)}
-                  title="为所选图片新建一个独立分组（移出成新组）"
-                >
-                  <svg viewBox="0 0 12 12" width="10" height="10" aria-hidden="true" focusable="false" className="icon-glyph">
-                    <path
-                      d="M6 1.5v9 M1.5 6h9"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.1"
-                      strokeLinecap="round"
-                    />
-                  </svg>
-                  新建分组
-                </button>
-                {(moveTargets ?? []).map((t) => (
-                  <button
-                    type="button"
-                    key={t.group_key}
-                    className="move-target"
-                    disabled={moveBusy}
-                    title={t.prompt_pos.slice(0, 200)}
-                    onClick={() => void moveConfirmed(t.group_key)}
-                  >
-                    <LazyGroupThumb groupKey={t.group_key} level={granularity} />
-                    <span className="group-count-badge">{t.count}</span>
-                    <span className="group-prompt">{t.prompt_pos.slice(0, 120) || '(无 prompt)'}</span>
-                  </button>
-                ))}
-                {moveTargets != null && moveTargets.length === 0 && (
-                  <p className="muted">同来源下暂无其他组 — 可选择新建分组。</p>
-                )}
+              <div className="move-columns">
+                <section className="move-column">
+                  <h4 className="move-column-title">
+                    全部组 <span className="muted">{(moveTargets ?? []).length}</span>
+                  </h4>
+                  <div className="move-target-picker">
+                    <button
+                      type="button"
+                      className="move-target new-group"
+                      disabled={moveBusy}
+                      onClick={() => void moveConfirmed(null)}
+                      title="为所选图片新建一个独立分组（移出成新组）"
+                    >
+                      <svg viewBox="0 0 12 12" width="10" height="10" aria-hidden="true" focusable="false" className="icon-glyph">
+                        <path
+                          d="M6 1.5v9 M1.5 6h9"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.1"
+                          strokeLinecap="round"
+                        />
+                      </svg>
+                      新建分组
+                    </button>
+                    {(moveTargets ?? []).map((t) => (
+                      <button
+                        type="button"
+                        key={t.group_key}
+                        className="move-target"
+                        disabled={moveBusy}
+                        title={t.prompt_pos.slice(0, 200)}
+                        onClick={() => void moveConfirmed(t.group_key)}
+                      >
+                        <LazyGroupThumb groupKey={t.group_key} level={granularity} reloadToken={groupRevision} />
+                        <span className="group-count-badge">{t.count}</span>
+                        <span className="group-prompt">{t.prompt_pos.slice(0, 120) || '(无 prompt)'}</span>
+                      </button>
+                    ))}
+                    {moveTargets != null && moveTargets.length === 0 && (
+                      <p className="muted">同来源下暂无其他组 — 可选择新建分组。</p>
+                    )}
+                  </div>
+                </section>
+                <section className="move-column">
+                  <h4 className="move-column-title">
+                    可能相关 <span className="muted">{moveSuggestions.length}</span>
+                  </h4>
+                  {moveSuggestions.length === 0 ? (
+                    <p className="muted">没有可推荐的目标组（需要先识图，或选中图与其它组差异过大）。</p>
+                  ) : (
+                    <div className="move-target-picker">
+                      {moveSuggestions.map((s) => (
+                        <button
+                          type="button"
+                          key={s.group_key}
+                          className="move-target"
+                          disabled={moveBusy}
+                          title={`${s.basis === 'vision' ? '视觉相似' : '文本相似'} ${(s.score * 100).toFixed(0)}%`}
+                          onClick={() => void moveConfirmed(s.group_key)}
+                        >
+                          <LazyGroupThumb groupKey={s.group_key} level={granularity} reloadToken={groupRevision} />
+                          <span className="group-count-badge">{s.count}</span>
+                          <span className="group-prompt">{s.prompt_pos.slice(0, 120) || '(无 prompt)'}</span>
+                          <span className="move-score" data-basis={s.basis}>
+                            {(s.score * 100).toFixed(0)}%
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </section>
               </div>
               <div className="row">
                 <button type="button" className="ghost" disabled={moveBusy} onClick={closeMoveDialog}>取消</button>
@@ -995,7 +1160,7 @@ export function GroupList() {
                     animate={{ opacity: 1, y: 0 }}
                     transition={{ delay: 0.05 * i, duration: 0.18 }}
                   >
-                    <LazyGroupThumb groupKey={g.group_key} level={granularity} />
+<LazyGroupThumb groupKey={g.group_key} level={granularity} reloadToken={groupRevision} />
                     <span className="group-count-badge">{g.count}</span>
                     <div className="group-prompt">{groupLabel(g, granularity)}</div>
                   </motion.div>

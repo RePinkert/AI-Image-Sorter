@@ -1,6 +1,14 @@
-import { useEffect, useState } from 'react'
-import { deleteLabel, errorMessage, listLabels, upsertLabel } from '../api'
-import type { LabelRow } from '../types'
+import { useCallback, useEffect, useState } from 'react'
+import { listen } from '@tauri-apps/api/event'
+import { deleteLabel, errorMessage, isWebDev, listLabels, upsertLabel } from '../api'
+import type {
+  L2Mode,
+  LabelRow,
+  SignatureProgressDto,
+  TextCoverageDto,
+  TextStatusDto,
+  VisionStatusDto,
+} from '../types'
 import { useStore } from '../store'
 import { KeymapPanel } from './KeymapPanel'
 import { exportDiagnostics, isTelemetryEnabled, setTelemetryEnabled } from '../telemetry'
@@ -11,12 +19,31 @@ function ClusterSection() {
   const currentSourceId = useStore((s) => s.currentSourceId)
   const l2Threshold = useStore((s) => s.l2Threshold)
   const setL2Threshold = useStore((s) => s.setL2Threshold)
+  const l2Mode = useStore((s) => s.l2Mode)
+  const setL2Mode = useStore((s) => s.setL2Mode)
+  const l2VisualThreshold = useStore((s) => s.l2VisualThreshold)
+  const setL2VisualThreshold = useStore((s) => s.setL2VisualThreshold)
+  const l2SemanticThreshold = useStore((s) => s.l2SemanticThreshold)
+  const setL2SemanticThreshold = useStore((s) => s.setL2SemanticThreshold)
   const setGroups = useStore((s) => s.setGroups)
   const granularity = useStore((s) => s.granularity)
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState<string | null>(null)
 
-  async function apply(threshold: number) {
+  // 三种量纲：文本是 Jaccard，视觉是 CLIP 余弦，语义是 BGE 余弦。
+  // 阈值**分开存** —— 0.75 是 CLIP 的值，绝不可沿用到 BGE（量纲不同）。
+  const semantic = l2Mode === 'semantic'
+  const cosine = l2Mode !== 'text'
+  const threshold = semantic
+    ? l2SemanticThreshold
+    : cosine
+      ? l2VisualThreshold
+      : l2Threshold
+  const min = cosine ? 0.6 : 0.2
+  const max = cosine ? 0.95 : 0.8
+  const step = cosine ? 0.01 : 0.05
+
+  async function apply() {
     if (currentSourceId == null) {
       setMsg('请先在分组列表选择一个数据源')
       return
@@ -25,11 +52,21 @@ function ClusterSection() {
     setMsg(null)
     try {
       const { reclusterSource } = await import('../api')
-      await reclusterSource(currentSourceId, threshold)
+      await reclusterSource(
+        currentSourceId,
+        l2Threshold,
+        l2Mode,
+        l2VisualThreshold,
+        l2SemanticThreshold,
+      )
       const { listGroups } = await import('../api')
       const g = await listGroups(currentSourceId, granularity)
       setGroups(g)
-      setMsg(`已按阈值 ${threshold.toFixed(2)} 重新聚类 L2 组`)
+      setMsg(
+        cosine
+          ? `已按余弦阈值 ${threshold.toFixed(2)} 重新聚类 L2 组`
+          : `已按阈值 ${threshold.toFixed(2)} 重新聚类 L2 组`,
+      )
     } catch (e) {
       setMsg(`重新聚类失败：${errorMessage(e)}`)
     } finally {
@@ -39,29 +76,370 @@ function ClusterSection() {
 
   return (
     <div className="msg">
-      <h3 style={{ marginTop: 0 }}>Prompt 相似度阈值（L2 聚类）</h3>
+      <h3 style={{ marginTop: 0 }}>L2 聚类方式</h3>
       <p className="hint">
-        Jaccard 阈值：AI prompt 通常共享长前缀（质量标签、艺术家名等）而仅在尾部短句上有差异。
-        因此即使视觉输出明显不同，文本 Jaccard 也常高达 0.8+。
-        推荐范围 <strong>0.25 ~ 0.35</strong> 以区分基于 prompt 小改动获得的不同输出。
-        值越低，聚合越松；值越高，要求 prompt 文本越接近才归入同一组。
+        <strong>文本</strong>：按 prompt 的词重合度分组（历史行为）。
+        <strong>视觉</strong>：按图像的实际相似度分组 —— 实测在真实语料上，
+        它与「视觉上真的像」的吻合度 96%，而文本只有 57%，并且追平了手工整理的结果。
+        <strong>语义</strong>：按 prompt 的语义分组（不读图，快得多，但阈值尚未标定）。
       </p>
       <div className="row">
+        <select
+          value={l2Mode}
+          disabled={busy}
+          onChange={(e) => setL2Mode(e.target.value as L2Mode)}
+          aria-label="L2 聚类方式"
+        >
+          <option value="text">文本（词重合）</option>
+          <option value="visual">视觉（图像相似度）</option>
+          <option value="semantic">语义（prompt 语义）</option>
+        </select>
         <input
           type="range"
-          min={0.2}
-          max={0.8}
-          step={0.05}
-          value={l2Threshold}
+          min={min}
+          max={max}
+          step={step}
+          value={threshold}
           disabled={busy}
-          onChange={(e) => setL2Threshold(Number(e.target.value))}
+          onChange={(e) => {
+            const value = Number(e.target.value)
+            if (semantic) setL2SemanticThreshold(value)
+            else if (cosine) setL2VisualThreshold(value)
+            else setL2Threshold(value)
+          }}
         />
         <span style={{ minWidth: 50, color: 'var(--accent)', fontWeight: 700 }}>
-          {l2Threshold.toFixed(2)}
+          {threshold.toFixed(2)}
         </span>
-        <button className="btn-primary" type="button" disabled={busy} onClick={() => void apply(l2Threshold)}>
+        <button className="btn-primary" type="button" disabled={busy} onClick={() => void apply()}>
           应用并重新聚类
         </button>
+      </div>
+      {semantic && (
+        <p className="hint">
+          <b>语义档的余弦阈值尚未标定。</b>0.75 是<b>视觉</b>档的值，两者的量纲不同，
+          绝不可沿用。当前 0.70 是暂定值 —— 阶段七轮 3 会用「合成语料判别力 +
+          你自己的分组反标定」给出建议值，仍需你按「应用并重新聚类」才生效。
+        </p>
+      )}
+      {cosine && !semantic && (
+        <p className="hint">
+          余弦阈值：值越低聚合越松。推荐 <strong>0.75</strong> —— 实测这是与手工整理
+          质量相当、又不会把明显不同的图粘在一起的位置。
+        </p>
+      )}
+      {!cosine && (
+        <p className="hint">
+          Jaccard 阈值：AI prompt 通常共享长前缀（质量标签、艺术家名等）而仅在尾部短句上有差异。
+          因此即使视觉输出明显不同，文本 Jaccard 也常高达 0.8+。
+          推荐范围 <strong>0.25 ~ 0.35</strong>。
+        </p>
+      )}
+      {msg && <p className="hint">{msg}</p>}
+    </div>
+  )
+}
+
+function SignatureSection() {
+  const currentSourceId = useStore((s) => s.currentSourceId)
+  const [status, setStatus] = useState<VisionStatusDto | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [progress, setProgress] = useState<SignatureProgressDto | null>(null)
+  const [msg, setMsg] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (isWebDev()) return
+    let alive = true
+    void (async () => {
+      try {
+        const { visionStatus } = await import('../api')
+        const s = await visionStatus()
+        if (alive) setStatus(s)
+      } catch {
+        // 状态拿不到时保持「未知」，按钮禁用即可
+      }
+    })()
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  // 进度事件：批处理要跑几分钟，必须让用户看得见。
+  useEffect(() => {
+    if (isWebDev()) return
+    let unlisten: (() => void) | undefined
+    void (async () => {
+      const stop = await listen<SignatureProgressDto>('signature-progress', (event) => {
+        setProgress(event.payload)
+      })
+      unlisten = stop
+    })()
+    return () => unlisten?.()
+  }, [])
+
+  async function run() {
+    if (currentSourceId == null) {
+      setMsg('请先在分组列表选择一个数据源')
+      return
+    }
+    setBusy(true)
+    setMsg(null)
+    setProgress(null)
+    try {
+      const { computeSignatures } = await import('../api')
+      const r = await computeSignatures(currentSourceId)
+      const parts = [`新算 ${r.computed} 张`]
+      if (r.skipped > 0) parts.push(`已有 ${r.skipped} 张跳过`)
+      if (r.failed > 0) parts.push(`${r.failed} 张失败`)
+      if (r.cancelled) parts.push('已取消')
+      setMsg(`${parts.join(' · ')}（${r.model_id} · ${r.dim} 维）`)
+    } catch (e) {
+      setMsg(`识图失败：${errorMessage(e)}`)
+    } finally {
+      setBusy(false)
+      setProgress(null)
+    }
+  }
+
+  async function cancel() {
+    try {
+      const { cancelSignatures } = await import('../api')
+      await cancelSignatures()
+    } catch {
+      // 取消失败不打扰用户：批处理自己会结束
+    }
+  }
+
+  const available = status?.available === true
+  const percent = progress && progress.total > 0
+    ? Math.round((progress.done / progress.total) * 100)
+    : 0
+
+  return (
+    <div className="msg">
+      <h3 style={{ marginTop: 0 }}>识图（视觉签名）</h3>
+      <p className="hint">
+        在本机跑视觉模型，给每张图算一个向量。向量用于语义聚类与「可能相关」推荐 ——
+        全程离线，不上传任何图片。CPU 约 3 张/秒，1000 张需要几分钟；已算过的会跳过。
+      </p>
+      {!available && status && (
+        <p className="hint">
+          未找到视觉模型权重，功能不可用。请运行 <code>scripts\download_models.ps1</code> 后重启应用。
+        </p>
+      )}
+      {!available && !status && (
+        <p className="hint">识图在桌面端运行（本页在浏览器里只做预览）。</p>
+      )}
+      <div className="row">
+        <button
+          className="btn-secondary"
+          type="button"
+          disabled={busy || !available || currentSourceId == null}
+          onClick={() => void run()}
+        >
+          {busy ? '识图中…' : '开始识图'}
+        </button>
+        {busy && (
+          <button className="btn-tertiary" type="button" onClick={() => void cancel()}>
+            取消
+          </button>
+        )}
+        {progress && (
+          <span className="muted">
+            {progress.done} / {progress.total}（{percent}%）
+          </span>
+        )}
+      </div>
+      {msg && <p className="hint">{msg}</p>}
+    </div>
+  )
+}
+
+/**
+ * 构建指纹（一行）。
+ *
+ * 为什么只有一行：能力清单是**诊断数据**，不是用户偏好 —— 整块表格塞进
+ * 设置页会变成一坨开发者术语。完整清单（版本 / 构建时刻 / 提交 / 能力标记
+ * 串 / 模型塔就位状态）在**「导出脱敏诊断」**的 JSON 里（`build` 段）。
+ *
+ * 这里留一行的唯一用途：让用户确认「我现在跑的这一份，就是刚审过的那一份」。
+ * 拿不到（浏览器预览模式 / 老后端）就**什么都不显示** —— 静默降级，
+ * 不给用户添一条错误提示。
+ */
+function BuildStamp() {
+  const [line, setLine] = useState<string | null>(null)
+  useEffect(() => {
+    let alive = true
+    void (async () => {
+      try {
+        const { appCapabilities } = await import('../api')
+        const c = await appCapabilities()
+        if (alive && c.version) {
+          setLine(`版本 ${c.version} · 构建 ${c.build_ts}`)
+        }
+      } catch {
+        // 拿不到就不显示（诊断导出里仍然带完整清单）。
+      }
+    })()
+    return () => {
+      alive = false
+    }
+  }, [])
+  if (!line) return null
+  return <p className="hint">{line}</p>
+}
+
+/**
+ * 文本塔（prompt 语义）面板。
+ *
+ * 与「识图」面板的差别：文本塔**不读图**，输入是 prompt 文本 —— 所以快得多
+ * （1000 条 prompt 约十几秒，视觉塔要 5 分钟）。
+ *
+ * 面板要回答三件事：塔在不在（权重 + 分词器都要在）、覆盖率多少、怎么补齐。
+ */
+function TextSignatureSection() {
+  const currentSourceId = useStore((s) => s.currentSourceId)
+  const [status, setStatus] = useState<TextStatusDto | null>(null)
+  const [coverage, setCoverage] = useState<TextCoverageDto | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [progress, setProgress] = useState<SignatureProgressDto | null>(null)
+  const [msg, setMsg] = useState<string | null>(null)
+
+  const refresh = useCallback(async () => {
+    if (currentSourceId == null) {
+      setCoverage(null)
+      return
+    }
+    try {
+      const { textCoverage } = await import('../api')
+      setCoverage(await textCoverage(currentSourceId))
+    } catch {
+      setCoverage(null)
+    }
+  }, [currentSourceId])
+
+  useEffect(() => {
+    if (isWebDev()) return
+    let alive = true
+    void (async () => {
+      try {
+        const { textStatus } = await import('../api')
+        const s = await textStatus()
+        if (alive) setStatus(s)
+      } catch {
+        // 拿不到就保持「未知」，按钮禁用即可。
+      }
+    })()
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  useEffect(() => {
+    void refresh()
+  }, [refresh])
+
+  useEffect(() => {
+    if (isWebDev()) return
+    let alive = true
+    let unlisten: (() => void) | undefined
+    void (async () => {
+      const stop = await listen<SignatureProgressDto>('text-signature-progress', (event) => {
+        if (!alive) return
+        setProgress(event.payload)
+      })
+      unlisten = stop
+    })()
+    return () => {
+      alive = false
+      unlisten?.()
+    }
+  }, [])
+
+  async function run() {
+    if (currentSourceId == null) {
+      setMsg('请先在分组列表选择一个数据源')
+      return
+    }
+    setBusy(true)
+    setMsg(null)
+    setProgress(null)
+    try {
+      const { computeTextSignatures } = await import('../api')
+      const r = await computeTextSignatures(currentSourceId)
+      const parts = [`已算 ${r.computed} 条`]
+      if (r.skipped > 0) parts.push(`跳过 ${r.skipped} 条`)
+      if (r.failed > 0) parts.push(`${r.failed} 条失败`)
+      setMsg(`${parts.join(' · ')}`)
+      await refresh()
+    } catch (e) {
+      setMsg(`文本签名失败：${errorMessage(e)}`)
+    } finally {
+      setBusy(false)
+      setProgress(null)
+    }
+  }
+
+  async function cancel() {
+    try {
+      const { cancelTextSignatures } = await import('../api')
+      await cancelTextSignatures()
+    } catch {
+      // 取消失败不打扰用户：批处理自己会结束
+    }
+  }
+
+  const available = status?.available === true
+  const computed = coverage?.computed ?? 0
+  const total = coverage?.total ?? 0
+  const percent = total > 0 ? Math.round((computed / total) * 100) : 0
+
+  return (
+    <div className="msg">
+      <h3 style={{ marginTop: 0 }}>文本塔（prompt 语义）</h3>
+      <p className="hint">
+        在本机给每条 prompt 算一个语义向量，用于<b>语义档</b>聚类与后续的双塔融合。
+        它<b>不读图</b>，只吃 prompt 文本 —— 所以比识图快得多（1000 条约十几秒）。
+        全程离线，不上传任何文本。
+      </p>
+      {!available && status && (
+        <p className="hint">
+          未找到文本塔资源（需要 text_bge.onnx 与 tokenizer_bge.json，缺任一份都不可用）。
+          请运行 <code>scripts\download_models.ps1</code> 后重启应用。
+        </p>
+      )}
+      {!available && !status && (
+        <p className="hint">文本塔在桌面端运行（本页在浏览器里只做预览）。</p>
+      )}
+      {available && (
+        <p className="hint">
+          模型 <code>{status?.model_id}</code> · 分词器词表 {status?.vocab_size ?? '—'} 项
+        </p>
+      )}
+      <div className="row">
+        <button
+          className="btn-secondary"
+          type="button"
+          disabled={busy || !available || currentSourceId == null}
+          onClick={() => void run()}
+        >
+          {busy ? '计算中…' : '补齐缺失'}
+        </button>
+        {busy && (
+          <button className="btn-tertiary" type="button" onClick={() => void cancel()}>
+            取消
+          </button>
+        )}
+        {total > 0 && (
+          <span className="muted">
+            已算 {computed} / {total} 条（{percent}%）
+          </span>
+        )}
+        {progress && progress.total > 0 && (
+          <span className="muted">
+            {progress.done} / {progress.total}
+          </span>
+        )}
       </div>
       {msg && <p className="hint">{msg}</p>}
     </div>
@@ -210,9 +588,12 @@ export function Settings() {
           启用本地事件记录
         </label>
         <button type="button" onClick={exportDiagnostics}>导出脱敏诊断</button>
+        <BuildStamp />
       </div>
 
       <ClusterSection />
+      <SignatureSection />
+      <TextSignatureSection />
     </div>
   )
 }

@@ -3,21 +3,29 @@ import { confirm, open, save } from '@tauri-apps/plugin-dialog'
 import { trackError } from './telemetry'
 import type {
   ActionResult,
+  AppCapabilitiesDto,
   ArenaHideResult,
   FoundSourceDto,
   Granularity,
   GroupInfo,
   GroupThumbDto,
   ImageRow,
+  L2Mode,
   LabelRow,
   ManualGroupResult,
   ModelDeviationDimension,
+  MoveSuggestion,
+  OutlierInfo,
   PromptRecommendation,
   ScanResult,
+  SignatureResultDto,
   SourceRow,
   SyncAllResult,
+  TextCoverageDto,
+  TextStatusDto,
   UndoActionResult,
   UpdateImagePromptsResult,
+  VisionStatusDto,
   WorkflowTemplateDto,
 } from './types'
 
@@ -158,8 +166,15 @@ async function apiInvoke<T>(operation: string, args?: Record<string, unknown>): 
 }
 
 async function webJson<T>(operation: string, url: string): Promise<T> {
+  // The capture channel (?ph=1) must reach EVERY bridge call, not only the
+  // image URLs: the bridge masks the prompt text on the way out, and a call
+  // that misses the flag would put a real prompt into a screenshot or a probe
+  // report. One place decides it, so no call site can forget.
+  const target = placeholderMode() && !/[?&]ph=/.test(url)
+    ? `${url}${url.includes('?') ? '&' : '?'}ph=1`
+    : url
   return call(operation, async () => {
-    const response = await fetch(url)
+    const response = await fetch(target)
     const text = await response.text()
     let body: unknown = null
     if (text) {
@@ -333,9 +348,21 @@ export async function recommendPrompts(
   return apiInvoke('recommend_prompts', { groupKey, granularity, offset, limit })
 }
 
-export async function reclusterSource(sourceId: number, threshold: number): Promise<void> {
-  if (isWebDev()) return unavailable('浏览器模式暂不支持重新聚类，请使用桌面版')
-  return apiInvoke('recluster_source', { sourceId, threshold })
+export async function reclusterSource(
+  sourceId: number,
+  threshold: number,
+  mode: L2Mode = 'text',
+  visualThreshold = 0.75,
+  semanticThreshold = 0.7,
+): Promise<void> {
+  if (isWebDev()) return unavailable('该模式仅支持桌面端（请使用正式版）')
+  return apiInvoke('recluster_source', {
+    sourceId,
+    threshold,
+    mode,
+    visualThreshold,
+    semanticThreshold,
+  })
 }
 
 /** Wheel-driven L1 (Model偏差) re-clustering: persist the single selected
@@ -356,7 +383,14 @@ export async function mergeGroups(
 }
 
 export async function listMoveTargets(sourceId: number, currentL2: string): Promise<GroupInfo[]> {
-  if (isWebDev()) return unavailable('浏览器模式暂不支持移动分组')
+  if (isWebDev()) {
+    // 只读查询 → dev bridge 能提供，这样「移动至其他组」对话框在浏览器里
+    // 也能被探针驱动（写操作仍然是桌面端专属）。
+    return webJson(
+      'list_move_targets',
+      `/api/move-targets?sourceId=${sourceId}&currentL2=${encodeURIComponent(currentL2)}`,
+    )
+  }
   return apiInvoke('list_move_targets', { sourceId, currentL2 })
 }
 
@@ -518,4 +552,105 @@ export async function getGroupThumbnails(groupKeys: string[], level: Granularity
     return webJson('get_group_thumbnails', `/api/group-thumbnails?keys=${encodeURIComponent(groupKeys.join(','))}&level=${level}`)
   }
   return apiInvoke('get_group_thumbnails', { groupKeys, level })
+}
+
+// ---------------------------------------------------------------------------
+// 识图（阶段六）：本地视觉签名
+// ---------------------------------------------------------------------------
+
+/** 「识图」是否可用（视觉模型权重是否就位）。 */
+export async function visionStatus(): Promise<VisionStatusDto> {
+  if (isWebDev()) return unavailable('识图只在桌面端可用')
+  return apiInvoke('vision_status', {})
+}
+
+/** 给一个源的所有图片算视觉签名。逐批回传进度（signature-progress 事件）。 */
+export async function computeSignatures(sourceId: number, force = false): Promise<SignatureResultDto> {
+  if (isWebDev()) return unavailable('识图只在桌面端可用')
+  return apiInvoke('compute_signatures', { sourceId, force })
+}
+
+/** 取消正在跑的签名批处理。 */
+export async function cancelSignatures(): Promise<boolean> {
+  if (isWebDev()) return unavailable('识图只在桌面端可用')
+  return apiInvoke('cancel_signatures', {})
+}
+
+/**
+ * 「可能相关」推荐：给定选中的图，哪个组最可能该收留它们。
+ * 有视觉签名时按视觉余弦排，没有时退回 prompt 的词 Jaccard。
+ */
+export async function suggestMoveTargets(
+  sourceId: number,
+  imageIds: number[],
+  currentL2: string,
+): Promise<MoveSuggestion[]> {
+  if (isWebDev()) {
+    const ids = imageIds.join(',')
+    return webJson(
+      'suggest_move_targets',
+      `/api/suggest-move-targets?sourceId=${sourceId}&currentL2=${encodeURIComponent(currentL2)}&imageIds=${ids}`,
+    )
+  }
+  return apiInvoke('suggest_move_targets', { sourceId, imageIds, currentL2 })
+}
+
+/** 组内「疑似错分」的图片：组里没有视觉上够格的伙伴的那些。 */
+export async function groupOutliers(
+  groupKey: string,
+  threshold?: number,
+): Promise<OutlierInfo[]> {
+  if (isWebDev()) {
+    const t = threshold ?? 0.75
+    return webJson(
+      'group_outliers',
+      `/api/group-outliers?groupKey=${encodeURIComponent(groupKey)}&threshold=${t}`,
+    )
+  }
+  return apiInvoke('group_outliers', { groupKey, threshold })
+}
+
+/**
+ * 构建能力自述：这个 exe 里实际带了哪些能力。
+ *
+ * 发行版 EXE 是用户主动审查的产物，所以「这一份有什么」必须能被直接看见，
+ * 而不是靠文件大小 / 时间戳去猜。标记串由**实现模块**生成，所以这份清单
+ * 不可能声称一个没实现的能力。
+ */
+export async function appCapabilities(): Promise<AppCapabilitiesDto> {
+  if (isWebDev()) return unavailable('构建能力自述只在桌面端可用')
+  return apiInvoke('app_capabilities', {})
+}
+
+// ---------------------------------------------------------------------------
+// 文本塔（阶段七轮 1）：prompt 语义向量
+// ---------------------------------------------------------------------------
+
+/** 文本塔是否可用（权重与分词器都在才算）。 */
+export async function textStatus(): Promise<TextStatusDto> {
+  if (isWebDev()) return unavailable('文本塔只在桌面端可用')
+  return apiInvoke('text_status', {})
+}
+
+/** 该源的文本塔覆盖率（已算 / 有 prompt 的总数）。 */
+export async function textCoverage(sourceId: number): Promise<TextCoverageDto> {
+  if (isWebDev()) return unavailable('文本塔只在桌面端可用')
+  return apiInvoke('text_coverage', { sourceId })
+}
+
+/**
+ * 给一个源的所有 prompt 算文本签名。
+ *
+ * 与视觉塔不同：输入是 prompt 文本（不读图），所以快得多；批大小恒为 8
+ * （int8 量化权重对批大小敏感，与实验室同口径）。
+ */
+export async function computeTextSignatures(sourceId: number, force = false): Promise<SignatureResultDto> {
+  if (isWebDev()) return unavailable('文本塔只在桌面端可用')
+  return apiInvoke('compute_text_signatures', { sourceId, force })
+}
+
+/** 取消正在跑的文本签名批处理。 */
+export async function cancelTextSignatures(): Promise<boolean> {
+  if (isWebDev()) return unavailable('文本塔只在桌面端可用')
+  return apiInvoke('cancel_text_signatures', {})
 }

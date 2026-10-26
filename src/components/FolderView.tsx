@@ -5,7 +5,9 @@ import {
   errorMessage,
   listGroupImagesAll,
   listMoveTargets,
+  groupOutliers,
   moveImagesToGroup,
+  suggestMoveTargets,
   undoSplit,
   getGroupThumbnails,
   splitImages,
@@ -20,6 +22,7 @@ import { Lightbox } from './Lightbox'
 import { FolderAxisStrip } from './FolderAxisStrip'
 import { PromptRecommendPanel } from './PromptRecommendPanel'
 import { granularityLabel, groupLabel, groupLabelCompact } from '../lib/groupLabel'
+import { setFocusKey } from '../lib/listAnchor'
 import { useViewportWindow } from '../hooks/useViewportWindow'
 import { getTelemetrySessionId, trackAction } from '../telemetry'
 
@@ -43,11 +46,24 @@ export function FolderView() {
   const currentSourceId = useStore((s) => s.currentSourceId)
   const granularity = useStore((s) => s.granularity)
   const bumpDataRevision = useStore((s) => s.bumpDataRevision)
+  const bumpGroupRevision = useStore((s) => s.bumpGroupRevision)
   // The flat list of buckets on the active axis. The four levels are
   // PARALLEL classification axes (not a containment hierarchy), so moving
   // between buckets is lateral: previous / next sibling on this axis.
   const groups = useStore((s) => s.groups)
   const setCurrentGroupKey = useStore((s) => s.setCurrentGroupKey)
+
+  /**
+   * 回到分组列表。
+   *
+   * 记住刚处理的那一组 → 回到列表时**优先定位到它原来所在的那一行**。
+   * 列表没有内部滚动容器、组件一卸载滚动位置就没了，用户在列表下半段
+   * 搬完一组再回来会发现自己被甩回顶部（详见 src/lib/listAnchor.ts）。
+   */
+  const backToGroups = useCallback(() => {
+    if (currentGroupKey) setFocusKey(currentGroupKey)
+    setView('groups')
+  }, [currentGroupKey, setView])
   const [images, setImages] = useState<ImageRow[]>([])
   const [busy, setBusy] = useState<number | null>(null)
   const [lightbox, setLightbox] = useState<ImageRow | null>(null)
@@ -65,7 +81,10 @@ export function FolderView() {
   const [masonry, setMasonry] = useState<{ items: { top: number; left: number; w: number; h: number }[]; totalH: number } | null>(null)
   const [moveTargets, setMoveTargets] = useState<import('../types').GroupInfo[] | null>(null)
   const [moveThumbs, setMoveThumbs] = useState<Record<string, string[]>>({})
+  const [moveSuggestions, setMoveSuggestions] = useState<import('../types').MoveSuggestion[]>([])
   const [moveBusy, setMoveBusy] = useState(false)
+  /** 组内「疑似错分」的图（image_id → 信息）。 */
+  const [outliers, setOutliers] = useState<Record<number, import('../types').OutlierInfo>>({})
 
 
   const loadImages = useCallback(async () => {
@@ -78,6 +97,18 @@ export function FolderView() {
       if (request !== loadRequestRef.current) return
       setImages(rows)
       setLoading(false)
+      // 离群检测：找出「组里没有视觉上够格的伙伴」的图（用户说的
+      // 「大组里那两三张被错误识别出来的」）。失败不影响浏览。
+      if (granularity === 2) {
+        void groupOutliers(currentGroupKey)
+          .then((list) => {
+            if (request !== loadRequestRef.current) return
+            setOutliers(Object.fromEntries(list.map((o) => [o.image_id, o])))
+          })
+          .catch(() => undefined)
+      } else {
+        setOutliers({})
+      }
     } catch (error) {
       if (request !== loadRequestRef.current) return
       setLoadError(errorMessage(error))
@@ -241,6 +272,8 @@ export function FolderView() {
       setImages((arr) =>
         arr.map((x) => (x.id === img.id ? { ...x, hidden: !img.hidden } : x)),
       )
+      // 缩略图只取未屏蔽的图 → 屏蔽之后这一组的缩略图就变了。
+      bumpGroupRevision()
       trackAction('hide', {
         hidden: !img.hidden,
         mode: 'folder',
@@ -252,7 +285,7 @@ export function FolderView() {
     } finally {
       setBusy(null)
     }
-  }, [busy, currentGroupKey])
+  }, [busy, currentGroupKey, bumpGroupRevision])
 
   const trash = useCallback(async (img: ImageRow) => {
     if (busy !== null) return
@@ -262,12 +295,14 @@ export function FolderView() {
     try {
       await trashImageApi(img.id)
       setImages((arr) => arr.filter((x) => x.id !== img.id))
+      // 成员没了 → 缩略图要重取。
+      bumpGroupRevision()
     } catch (e) {
       setActionError(`删除失败：${errorMessage(e)}`)
     } finally {
       setBusy(null)
     }
-  }, [busy])
+  }, [busy, bumpGroupRevision])
 
   const toggleSelect = useCallback((id: number) => {
     setSelected((prev) => {
@@ -312,6 +347,7 @@ export function FolderView() {
       const failedIds = ids.filter((id) => !succeeded.has(id))
       setSelected(new Set(failedIds))
       if (failedIds.length > 0) setActionError(`${failedIds.length} 张删除失败，可重试剩余项目。`)
+      bumpGroupRevision()
     } finally {
       setBusy(null)
     }
@@ -341,6 +377,7 @@ export function FolderView() {
       const failedIds = ids.filter((id) => !succeeded.has(id))
       setSelected(new Set(failedIds))
       if (failedIds.length > 0) setActionError(`${failedIds.length} 张取消屏蔽失败，可重试剩余项目。`)
+      bumpGroupRevision()
     } finally {
       setBusy(null)
     }
@@ -358,6 +395,8 @@ export function FolderView() {
       const r = await splitImages(2, ids)
       setImages((arr) => arr.filter((x) => !selected.has(x.id)))
       setSelected(new Set())
+      // 新分组出现 → 列表要重画，新组的缩略图要取。
+      bumpGroupRevision()
       alert(`已拆出 ${r.moved} 张为新分组`)
     } catch (e) {
       setActionError(`拆组失败：${errorMessage(e)}`)
@@ -366,13 +405,23 @@ export function FolderView() {
     }
   }
 
-  async function openMoveDialog() {
-    if (!currentGroupKey || currentSourceId == null || selected.size === 0) return
+  async function openMoveDialog(ids?: number[]) {
+    if (!currentGroupKey || currentSourceId == null) return
+    // 注意：setSelected 是异步的，闭包里读到的 selected 还是旧值 ——
+    // 所以显式传入要移动的 id（角标入口只有一张图）。
+    const targets = ids ?? Array.from(selected)
+    if (targets.length === 0) return
     try {
-      const targets = await listMoveTargets(currentSourceId, currentGroupKey)
-      setMoveTargets(targets)
-      const thumbs = await getGroupThumbnails(targets.map((g) => g.group_key), 2)
+      const moveList = await listMoveTargets(currentSourceId, currentGroupKey)
+      setMoveTargets(moveList)
+      setMoveSuggestions([])
+      const [thumbs, suggestions] = await Promise.all([
+        getGroupThumbnails(moveList.map((g) => g.group_key), 2),
+        // 「可能相关」：推荐失败不该挡住主流程 —— 全部组那一列照常可用。
+        suggestMoveTargets(currentSourceId, targets, currentGroupKey).catch(() => []),
+      ])
       setMoveThumbs(Object.fromEntries(thumbs.map((x) => [x.group_key, x.thumb_paths])))
+      setMoveSuggestions(suggestions.slice(0, 12))
     } catch (e) { setActionError(`读取目标分组失败：${errorMessage(e)}`) }
   }
 
@@ -382,17 +431,27 @@ export function FolderView() {
     try {
       await undoSplit(currentGroupKey, currentSourceId)
       bumpDataRevision()
-      setView('groups')
+      bumpGroupRevision()
+      backToGroups()
     } catch (e) { setActionError(`撤销拆组失败：${errorMessage(e)}`) }
     finally { setBusy(null) }
   }
 
-  async function moveSelected(target: string) {
-    setMoveBusy(true)
+  /** 点「疑似错分」角标：选中这张图并直接打开移动对话框 ——
+   *  那一列「可能相关」就是答案，用户只需要点一下确认。 */
+  function openOutlierMove(imageId: number) {
+    setSelected(new Set([imageId]))
+    setBatchMode(true)
+    void openMoveDialog([imageId])
+  }
+
+  async function moveSelected(target: string) {    setMoveBusy(true)
     try {
       await moveImagesToGroup(Array.from(selected), target)
       setImages((arr) => arr.filter((img) => !selected.has(img.id)))
       setSelected(new Set()); setMoveTargets(null); bumpDataRevision()
+      // 源组少了一张、目标组多了一张 → 两边的缩略图都要重取。
+      bumpGroupRevision()
     } catch (e) { setActionError(`移动失败：${errorMessage(e)}`) }
     finally { setMoveBusy(false) }
   }
@@ -420,7 +479,8 @@ export function FolderView() {
       const restored = await unmergeGroup(currentGroupKey, currentSourceId)
       alert(`已撤销合并：${restored} 张图片回到原分组`)
       bumpDataRevision()
-      setView('groups')
+      bumpGroupRevision()
+      backToGroups()
     } catch (e) {
       setActionError(`撤销合并失败：${errorMessage(e)}`)
     } finally {
@@ -478,7 +538,7 @@ export function FolderView() {
   return (
     <div className="folder-view">
       <div className="folder-topbar">
-        <button className="btn-tertiary" type="button" onClick={() => setView('groups')}>
+        <button className="btn-tertiary" type="button" onClick={backToGroups}>
           ← 返回分组
         </button>
         <span className="counter">文件夹视角</span>
@@ -609,7 +669,7 @@ export function FolderView() {
               清除筛选
             </button>
           ) : (
-            <button type="button" className="btn-secondary" onClick={() => setView('groups')}>
+            <button type="button" className="btn-secondary" onClick={backToGroups}>
               返回分组
             </button>
           )}
@@ -624,20 +684,22 @@ export function FolderView() {
             const index = hasWindow ? windowed.start + sliceIndex : sliceIndex
             const pos = masonry?.items[index]
             return (
-              <FolderItemCard
-                key={img.id}
-                img={img}
-                pos={pos}
-                batchMode={batchMode}
-                selected={selected.has(img.id)}
-                busy={busy}
-                confirm={confirm}
-                onToggleHidden={toggleHidden}
-                onTrash={trash}
-                onOpen={setLightbox}
-                onToggleSelect={toggleSelect}
-                onConfirmDelete={setConfirm}
-              />
+            <FolderItemCard
+              key={img.id}
+              img={img}
+              pos={pos}
+              batchMode={batchMode}
+              selected={selected.has(img.id)}
+              busy={busy}
+              confirm={confirm}
+              outlier={outliers[img.id]}
+              onToggleHidden={toggleHidden}
+              onTrash={trash}
+              onOpen={setLightbox}
+              onToggleSelect={toggleSelect}
+              onConfirmDelete={setConfirm}
+              onOutlierClick={openOutlierMove}
+            />
             )
           })}
         </div>
@@ -665,15 +727,60 @@ export function FolderView() {
       )}
       {moveTargets && (
         <div className="merge-confirm-overlay" onClick={() => !moveBusy && setMoveTargets(null)}>
-          <div className="merge-confirm" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+          <div className="merge-confirm merge-confirm-wide" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
             <h3>移动 {selected.size} 张图片至其他 Prompt偏差组</h3>
-            {moveTargets.length === 0 ? <p className="muted">当前来源目录下没有其他可用分组。</p> : moveTargets.map((g) => (
-              <button key={g.group_key} className="move-target-card" type="button" disabled={moveBusy} onClick={() => void moveSelected(g.group_key)}>
-                <span className="move-target-thumbs">{(moveThumbs[g.group_key] ?? []).slice(0, 4).map((path) => <img key={path} src={assetUrl(path)} alt="" />)}</span>
-                <span className="move-target-info"><strong>{g.prompt_pos.slice(0, 100) || '(无 prompt)'}</strong><span>{g.count} 张 · {g.checkpoint || '未知模型'} · {g.workflow_name || '未命名工作流'}</span></span>
-              </button>
-            ))}
-            <button type="button" onClick={() => setMoveTargets(null)} disabled={moveBusy}>取消</button>
+            <div className="move-columns">
+              <section className="move-column">
+                <h4 className="move-column-title">
+                  全部组 <span className="muted">{moveTargets.length}</span>
+                </h4>
+                {moveTargets.length === 0 ? (
+                  <p className="muted">当前来源目录下没有其他可用分组。</p>
+                ) : (
+                  <div className="move-target-list">
+                    {moveTargets.map((g) => (
+                      <button key={g.group_key} className="move-target-card" type="button" disabled={moveBusy} onClick={() => void moveSelected(g.group_key)}>
+                        <span className="move-target-thumbs">{(moveThumbs[g.group_key] ?? []).slice(0, 4).map((path) => <img key={path} src={assetUrl(path)} alt="" />)}</span>
+                        <span className="move-target-info"><strong>{g.prompt_pos.slice(0, 100) || '(无 prompt)'}</strong><span>{g.count} 张 · {g.checkpoint || '未知模型'} · {g.workflow_name || '未命名工作流'}</span></span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </section>
+              <section className="move-column">
+                <h4 className="move-column-title">
+                  可能相关 <span className="muted">{moveSuggestions.length}</span>
+                </h4>
+                {moveSuggestions.length === 0 ? (
+                  <p className="muted">没有可推荐的目标组（需要先识图，或选中图与其它组差异过大）。</p>
+                ) : (
+                  <div className="move-target-list">
+                    {moveSuggestions.map((s) => (
+                      <button
+                        key={s.group_key}
+                        className="move-target-card"
+                        type="button"
+                        disabled={moveBusy}
+                        onClick={() => void moveSelected(s.group_key)}
+                        title={`${s.basis === 'vision' ? '视觉相似' : '文本相似'} ${(s.score * 100).toFixed(0)}%`}
+                      >
+                        <span className="move-target-thumbs">{(moveThumbs[s.group_key] ?? []).slice(0, 4).map((path) => <img key={path} src={assetUrl(path)} alt="" />)}</span>
+                        <span className="move-target-info">
+                          <strong>{s.prompt_pos.slice(0, 100) || '(无 prompt)'}</strong>
+                          <span>{s.count} 张</span>
+                        </span>
+                        <span className="move-score" data-basis={s.basis}>
+                          {(s.score * 100).toFixed(0)}%
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </section>
+            </div>
+            <div className="row">
+              <button type="button" onClick={() => setMoveTargets(null)} disabled={moveBusy}>取消</button>
+            </div>
           </div>
         </div>
       )}
@@ -688,11 +795,14 @@ interface FolderItemCardProps {
   selected: boolean
   busy: number | null
   confirm: number | null
+  /** 组内「疑似错分」的信息（没有则不是疑似错分）。 */
+  outlier?: import('../types').OutlierInfo
   onToggleHidden: (img: ImageRow) => void
   onTrash: (img: ImageRow) => void
   onOpen: (img: ImageRow) => void
   onToggleSelect: (id: number) => void
   onConfirmDelete: (id: number | null) => void
+  onOutlierClick: (id: number) => void
 }
 
 // Memoized per card so sorting / filtering / window scrolling only re-render
@@ -706,11 +816,13 @@ const FolderItemCard = memo(function FolderItemCard({
   selected,
   busy,
   confirm,
+  outlier,
   onToggleHidden,
   onTrash,
   onOpen,
   onToggleSelect,
   onConfirmDelete,
+  onOutlierClick,
 }: FolderItemCardProps) {
   const score = img.score ?? 50
   const isConfirmPending = confirm === img.id
@@ -718,6 +830,7 @@ const FolderItemCard = memo(function FolderItemCard({
   return (
     <div
       className={`folder-item ${hidden ? 'blocked' : ''} ${batchMode ? 'batch' : ''} ${selected ? 'selected' : ''}`}
+      data-image-id={img.id}
       style={pos ? { position: 'absolute', top: pos.top, left: pos.left, width: pos.w, height: pos.h, minHeight: 0 } : undefined}
       onClick={batchMode ? () => onToggleSelect(img.id) : undefined}
       role={batchMode ? 'button' : undefined}
@@ -749,6 +862,23 @@ const FolderItemCard = memo(function FolderItemCard({
       <div className="folder-score" style={hidden ? { color: 'var(--muted)' } : undefined}>
         {(Number.isFinite(score) ? score : 50).toFixed(0)}
       </div>
+      {outlier && !batchMode && (
+        <button
+          type="button"
+          className="folder-outlier"
+          title={
+            outlier.best_group_key
+              ? `组内没有视觉上够格的伙伴（最高相似度 ${(outlier.max_similarity * 100).toFixed(0)}%）· 最像的组相似度 ${(outlier.best_score * 100).toFixed(0)}%。点击查看候选组并移动。`
+              : `组内没有视觉上够格的伙伴（最高相似度 ${(outlier.max_similarity * 100).toFixed(0)}%）。`
+          }
+          onClick={(e) => {
+            e.stopPropagation()
+            onOutlierClick(img.id)
+          }}
+        >
+          疑似错分
+        </button>
+      )}
       {!batchMode && (
         <div className="folder-actions">
           <button

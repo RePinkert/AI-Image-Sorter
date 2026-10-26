@@ -1602,6 +1602,77 @@ select {
   padding: 8px;
   text-align: left;
 }
+/* 移动对话框的两列：左「全部组」，右「可能相关」。
+   宽屏才分两列 —— 窄屏上两列会把缩略图压到看不清。 */
+.merge-confirm-wide {
+  max-width: min(1080px, 96vw);
+}
+.move-columns {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+  margin: 12px 0;
+}
+@media (min-width: 900px) {
+  .move-columns {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+.move-column {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.move-column-title {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+}
+.move-target-list {
+  min-width: 0;
+  max-height: 46vh;
+  overflow-y: auto;
+}
+/* 相似度徽章：视觉基准与文本基准量纲不同，靠 data-basis 区分。
+   它是这一列的**主信号**（这个组该不该收留我的图），所以要比次要信息更重。 */
+.move-score {
+  flex: 0 0 auto;
+  align-self: center;
+  padding: 3px 10px;
+  border-radius: var(--r-pill);
+  font-size: 14px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  background: var(--panel-2);
+  color: var(--muted);
+}
+.move-score[data-basis='vision'] {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+/* 「疑似错分」角标：组里没有视觉上够格的伙伴的那些图。
+   它是**提示**不是命令 —— 点击只是打开移动对话框让用户确认。
+   位置：左上（分数下面）。右上被 .folder-actions（屏蔽/删除）占着，
+   正中下被「已屏蔽」标签占着 —— 放左上角才不会互相挡。 */
+.folder-outlier {
+  position: absolute;
+  top: 30px;
+  left: 6px;
+  padding: 1px 8px;
+  border: 0;
+  border-radius: var(--r-pill);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--bad);
+  background: color-mix(in srgb, var(--bad) 18%, transparent);
+  backdrop-filter: blur(2px);
+  cursor: pointer;
+  z-index: 2;
+}
+.folder-outlier:hover {
+  background: color-mix(in srgb, var(--bad) 30%, transparent);
+}
 .move-target-thumbs {
   display: grid;
   grid-template-columns: repeat(2, 42px);
