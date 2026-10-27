@@ -1,0 +1,29 @@
+﻿══ 发行版二进制探针 ══
+[本档] C:\Yet\AI-Image-Sorter\src-tauri\target\release\AI-Image-Sorter.exe
+         大小   34384384 字节
+         SHA256 4A65C344C4CED1761DF65F4F7B5DFCD271B2BEEC2DBFEA8BD23D4C1689F14463
+         修改   2026-10-26 18:17:24
+
+能力标记串（扫到 8 条）
+  · ais.cap.l2.text-jaccard.v1
+  · ais.cap.l2.visual-avg-linkage.v1
+  · ais.cap.library.recover.v1
+  · ais.cap.provenance.build-info.v1
+  · ais.cap.rename.preserve.v1
+  · ais.cap.signature.explicit.v1
+  · ais.cap.tower.text.v1
+  · ais.cap.tower.vision.v1
+
+能力核对（标记串 + 实现特征串，两者都要在场）
+  [OK]   l2.text-jaccard          L2 词 Jaccard 单链（历史行为）
+  [OK]   l2.visual-avg-linkage    L2 视觉塔平均连接
+  [OK]   tower.vision             视觉塔（CLIP ViT-B/32）推理路径
+  [OK]   tower.text               文本塔（BGE-small-zh）推理路径（阶段七轮 1 起接进命令层）
+  [OK]   provenance.build-info    构建能力自述（后端能力清单 + 设置页面板）
+  [OK]   rename.preserve          改名不丢分拣（内容身份认领 + 就地改路径）
+  [OK]   library.recover          库恢复（按内容身份从旧库找回评分/标签/手动分组）
+  [OK]   signature.explicit       签名只按需计算（设置页按钮），同步循环不再偷跑
+  [OK]   signature.explicit.absent 旧机制已不在二进制里
+  [OK]   frontend-embedded        前端资源已嵌入二进制
+
+结论：登记的能力全部就位

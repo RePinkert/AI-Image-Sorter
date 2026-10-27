@@ -97,6 +97,29 @@ $Registry = @(
         Marker  = 'ais.cap.provenance.build-info.v1'
         Literal = '构建能力自述'
         Note    = '构建能力自述（后端能力清单 + 设置页面板）'
+    },
+    @{
+        Id      = 'rename.preserve'
+        Marker  = 'ais.cap.rename.preserve.v1'
+        Literal = '内容键（尺寸+种子+prompt）'
+        Note    = '改名不丢分拣（内容身份认领 + 就地改路径）'
+    },
+    @{
+        Id      = 'library.recover'
+        Marker  = 'ais.cap.library.recover.v1'
+        Literal = '从旧库找回分拣结果'
+        Note    = '库恢复（按内容身份从旧库找回评分/标签/手动分组）'
+    },
+    @{
+        Id      = 'signature.explicit'
+        Marker  = 'ais.cap.signature.explicit.v1'
+        Literal = '签名按需计算（无后台补算）'
+        Note    = '签名只按需计算（设置页按钮），同步循环不再偷跑'
+        # **否定检查**：这段 SQL 只存在于「后台补算签名」的取数函数里
+        # （`Db::images_without_signatures`）。第 30 轮把它连同后台补算
+        # 整段删掉了 —— 它还在二进制里 = 后台补算还在。
+        # 「没有」也得能证明：删掉一段代码同样看不出来。
+        Absent  = 'SELECT i.id, i.abs_path FROM images i'
     }
 )
 
@@ -186,6 +209,18 @@ foreach ($r in $Registry) {
         $fail++
         $why = if (-not $hasMarker) { '缺标记串' } else { '缺实现特征串' }
         Say ("  [FAIL] {0,-24} {1}（{2}）" -f $r.Id, $r.Note, $why) 'Red'
+    }
+    # 否定检查：某些能力是用「**没有**某段代码」来定义的。删掉一段代码
+    # 在二进制里同样看不出来（`opt-level="s" + lto=true` 会剔得干干净净），
+    # 所以「没有」必须单独证明 —— 否则这条能力是**不可证**的。
+    if ($r.Absent) {
+        $stillThere = Test-HasBytes -Bytes $cur.Bytes -Needle $r.Absent
+        if ($stillThere) {
+            $fail++
+            Say ("  [FAIL] {0,-24} {1}（旧机制还在二进制里）" -f $r.Id, $r.Note) 'Red'
+        } else {
+            Say ("  [OK]   {0,-24} 旧机制已不在二进制里" -f "$($r.Id).absent") 'Green'
+        }
     }
 }
 
