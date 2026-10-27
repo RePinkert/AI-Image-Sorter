@@ -12,6 +12,9 @@ AI Image Sorter is a local-first desktop application for organizing and reviewin
 - Cluster prompt-similarity groups by three interchangeable means — word overlap (Jaccard), image embeddings (a CLIP tower), or prompt meaning (a BGE tower) — each with its own threshold, because those are different quantities and the scales are not interchangeable
 - Run both embedding towers in-process (ONNX Runtime, no Python and no external service) over the images you already have
 - Suggest likely destinations when you move a group, and flag images whose group has no visually close companion
+- Keep your review state when a file is renamed: every image carries a content fingerprint, so a renamed file is recognised as the same image and its score, labels and manual group bindings follow it
+- Recover scores, labels and manual groups from a previous library file, matching rows by content identity
+- Compute signatures only when you ask for it: the sync loop reports how many images still lack a vector instead of silently working in the background
 - Describe its own build: the executable carries capability markers for the features it really contains, and the release probe verifies them against the binary
 - Match ComfyUI workflow topology and retain the full generation recipe for each image
 - Review with swipe scoring or Bradley–Terry arena comparisons; custom labels, undo, and a review session that survives a relaunch
@@ -25,9 +28,9 @@ AI Image Sorter is a local-first desktop application for organizing and reviewin
 
 ## Status
 
-`v0.4.0` is the latest release (`v0.1.0` was the first public preview). The core workflow is usable, but compatibility with unusual metadata formats and large libraries is still being expanded. Windows is the primary supported platform.
+`v0.5.0` is the latest release (`v0.1.0` was the first public preview). The core workflow is usable, but compatibility with unusual metadata formats and large libraries is still being expanded. Windows is the primary supported platform.
 
-`v0.4.0` adds the two embedding towers and the semantic L2 modes described above. Word overlap stays the default mode, and the application remains fully usable without the model weights — see [Model weights](#model-weights-for-the-visual-and-semantic-modes).
+`v0.5.0` adds rename-safe rescanning, library recovery, and on-demand signature computation, described above. The two embedding towers and the semantic L2 modes from `v0.4.0` are unchanged. Word overlap stays the default mode, and the application remains fully usable without the model weights — see [Model weights](#model-weights-for-the-visual-and-semantic-modes).
 
 ## Installation
 
