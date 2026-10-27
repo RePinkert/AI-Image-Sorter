@@ -4,10 +4,12 @@ mod clustering;
 mod commands;
 mod comfy_finder;
 mod db;
+mod fingerprint;
 mod grouper;
 mod metadata;
 mod paths;
 mod progress;
+mod reconcile;
 mod scoring;
 mod suggest;
 mod text;
@@ -20,6 +22,105 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 命令行入口：`--recover <旧库路径>` —— 从另一个库文件里把用户的手工
+    // 分拣结果找回来（第 29 轮「库恢复」）。
+    //
+    // 为什么要有命令行这一条路：GUI 里也能做（设置页 → 库恢复），但**批量
+    // 抢救**（用户的库被改名毁过、想一次性找回）用命令行更顺手，也能在
+    // 应用没起来的时候跑。
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--recover") {
+        let old_db = args.get(pos + 1).cloned().unwrap_or_default();
+        if old_db.is_empty() {
+            eprintln!("用法：AI-Image-Sorter.exe --recover <旧库文件路径>");
+            std::process::exit(2);
+        }
+        std::process::exit(run_recover(&old_db));
+    }
+    run_gui();
+}
+
+/// 命令行版库恢复。返回进程退出码。
+///
+/// **报告写进文件**：发行版是 `windows_subsystem = "windows"`（不弹控制台），
+/// 所以 stdout 用户看不见 —— 报告落到数据目录里，路径写进日志。
+fn run_recover(old_db: &str) -> i32 {
+    let dir = paths::data_root_for_cli();
+    let db_path = dir.join("ai-image-sorter.db");
+    let db = match db::open(&db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("打开当前库失败：{e}");
+            return 2;
+        }
+    };
+    let mut report: Vec<String> = Vec::new();
+    fn say(report: &mut Vec<String>, line: String) {
+        println!("{line}");
+        report.push(line);
+    }
+    say(&mut report, format!("当前库：{}", db_path.display()));
+    say(&mut report, format!("旧库：  {old_db}"));
+    let preview = match reconcile::preview(&db, old_db) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("预览失败：{e}");
+            return 2;
+        }
+    };
+    say(&mut report, format!(
+        "旧库共 {} 张，能按内容认领 {} 张（未认领 {} 张）",
+        preview.old_images, preview.matched, preview.unmatched_old
+    ));
+    for (basis, count) in &preview.basis {
+        say(&mut report, format!("  匹配依据 {basis}：{count} 张"));
+    }
+    say(&mut report, format!(
+        "可找回：手动分组 {} 条、标签 {} 个、评分 {} 条（当前库已有而跳过 {} 条）",
+        preview.bindings,
+        preview.labels,
+        preview.scores,
+        preview.skipped_conflict
+    ));
+    let apply = std::env::args().any(|a| a == "--apply");
+    if apply {
+        match reconcile::apply(&db, old_db) {
+            Ok(outcome) => say(&mut report, format!(
+                "已找回：手动分组 {} 条、标签 {} 个、评分 {} 条（认领 {} 张，跳过 {} 条）",
+                outcome.bindings,
+                outcome.labels,
+                outcome.scores,
+                outcome.matched,
+                outcome.skipped_conflict
+            )),
+            Err(e) => {
+                say(&mut report, format!("恢复失败：{e}"));
+                write_recover_report(&dir, &report);
+                return 2;
+            }
+        }
+    } else {
+        say(&mut report, "尚未写入（这是预览）。加 --apply 才会真的写进当前库。".to_string());
+    }
+    let path = write_recover_report(&dir, &report);
+    say(&mut report, format!("报告已写入 {}", path.display()));
+    0
+}
+
+fn write_recover_report(dir: &PathBuf, lines: &[String]) -> PathBuf {
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let path = dir.join(format!("recover-report-{stamp}.txt"));
+    let body = lines.join("\n");
+    // **UTF-8 with BOM**：这份报告是给人在 Windows 上用记事本 / PowerShell
+    // 打开的，没有 BOM 的话中文会变乱码（与 .ps1 同一条纪律）。
+    let mut bytes = vec![0xEFu8, 0xBBu8, 0xBFu8];
+    bytes.extend_from_slice(body.as_bytes());
+    let _ = std::fs::write(&path, &bytes);
+    log::info!("库恢复报告：{} —— {}", path.display(), body.replace('\n', " / "));
+    path
+}
+
+fn run_gui() {
     // Log sink is decided BEFORE the app exists: in portable mode file logs
     // must follow the exe (data/logs), never the OS log dir.
     let log_builder = match paths::log_root_for_portable() {
@@ -150,11 +251,17 @@ pub fn run() {
             commands::cancel_signatures,
             commands::text_status,
             commands::text_coverage,
+            commands::l2_signature_coverage,
             commands::compute_text_signatures,
             commands::cancel_text_signatures,
             commands::suggest_move_targets,
             commands::group_outliers,
             commands::app_capabilities,
+            commands::list_library_candidates,
+            commands::preview_library_recovery,
+            commands::apply_library_recovery,
+            commands::discard_unconfirmed_image,
+            commands::list_unconfirmed_images,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

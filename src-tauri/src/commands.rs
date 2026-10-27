@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 pub struct AppState {
     pub db: Arc<crate::db::Db>,
@@ -75,6 +75,10 @@ pub struct SyncAllResult {
     pub pending: usize,
     pub reclustered: bool,
     pub parse_errors: usize,
+    /// v19：这一轮识别出的改名数量。
+    pub renamed: usize,
+    /// v19：身份无法确认、被保留待确认的旧记录数量。
+    pub unconfirmed: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -131,6 +135,10 @@ pub struct ScanResult {
     pub scanned: usize,
     pub groups: usize,
     pub parse_errors: usize,
+    /// v19：识别出的改名数量（路径变了，行没换 → 评分/标签/分组全保住）。
+    pub renamed: usize,
+    /// v19：身份无法确认、被保留待确认的旧记录数量。
+    pub unconfirmed: usize,
 }
 
 /// Canonicalize a path for stable cross-rescan matching so that the same
@@ -216,6 +224,8 @@ pub async fn add_source_and_scan(
             scanned: stats.found,
             groups: stats.affected.len(),
             parse_errors: stats.parse_errors + backfilled.1,
+            renamed: stats.renamed.len(),
+            unconfirmed: stats.unconfirmed.len(),
         })
     })
     .await
@@ -236,6 +246,27 @@ struct ScanStats {
     /// file would never be scanned (the "1 image not loaded" forever bug).
     newest_mtime: i64,
     affected: HashSet<String>,
+    /// v19：识别出的改名（路径变了，行没换）。
+    renamed: Vec<RenameEvent>,
+    /// v19：身份无法确认、但**带用户状态**因而被保留的旧记录。
+    unconfirmed: Vec<UnconfirmedImage>,
+}
+
+/// 一次改名命中 —— 要把「凭什么认为是同一张图」如实告诉用户。
+#[derive(Debug, Clone, Serialize)]
+pub struct RenameEvent {
+    pub old_path: String,
+    pub new_path: String,
+    /// 判定依据（内容键 / 元数据 / 内容哈希）。
+    pub basis: String,
+}
+
+/// 身份无法确认的旧记录（文件不在原路径，且认不出来）。
+#[derive(Debug, Clone, Serialize)]
+pub struct UnconfirmedImage {
+    pub abs_path: String,
+    pub filename: String,
+    pub reason: String,
 }
 
 /// Idempotent scan of one source folder: keep rows for files still on disk
@@ -247,6 +278,11 @@ struct ScanStats {
 /// differences can never cause a file to be mis-detected as "new" — which
 /// would re-allocate image_id and CASCADE-delete its scores.
 ///
+/// **v19（第 29 轮）· 改名不丢分拣**：盘上路径对不上的旧行**先不删** ——
+/// 先按**内容身份**尝试认领（尺寸+种子+prompt → 元数据 → 内容哈希），
+/// 认领成功就**就地改路径**（image_id 不变 → 评分 / 标签 / 手动分组全部
+/// 跟着走）；认领不出来的、带用户状态的行**保留**并上报，绝不静默删除。
+///
 /// `files` is the caller's one-pass walk result (paths already sorted), so
 /// the changed-source sync path doesn't walk the tree a second time.
 fn scan_source(
@@ -255,13 +291,18 @@ fn scan_source(
     norm_source: &str,
     files: &[PathBuf],
 ) -> Result<ScanStats, String> {
-    let existing = db
-        .list_source_image_paths(source_id)
+    let identity = db
+        .list_source_identity_rows(source_id)
         .map_err(|e| e.to_string())?;
-    let mut existing_map: HashMap<String, i64> = HashMap::new();
-    for (id, p) in &existing {
-        existing_map.insert(normalize_path(&PathBuf::from(p)), *id);
+    let mut existing_map: HashMap<String, crate::db::IdentityRow> = HashMap::new();
+    for row in &identity {
+        existing_map.insert(normalize_path(&PathBuf::from(&row.abs_path)), row.clone());
     }
+    // 带用户状态（评分 / 标签 / 手动分组）的行：改名认领失败时**保留**，
+    // 交给用户确认 —— 宁可多留一行，也不毁掉手工分拣的结果。
+    let user_state = db
+        .images_with_user_state(source_id)
+        .map_err(|e| e.to_string())?;
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -273,6 +314,8 @@ fn scan_source(
     };
 
     let mut on_disk: HashSet<String> = HashSet::new();
+    // 待解析的新文件（路径对不上已有行，且不在稳定性窗口内）。
+    let mut fresh: Vec<PathBuf> = Vec::new();
     for f in files {
         let norm = normalize_path(f);
         on_disk.insert(norm.clone());
@@ -284,15 +327,13 @@ fn scan_source(
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64);
-        if existing_map.contains_key(&norm) {
+        if let Some(row) = existing_map.get(&norm) {
             // Keep the stable image id while refreshing file-level fields that
             // can change outside the app.
             let size = std::fs::metadata(f).map(|m| m.len() as i64).unwrap_or(0);
             let modified_at = file_mtime.unwrap_or(0);
-            if let Some(id) = existing_map.get(&norm) {
-                db.update_file_stats(*id, size, modified_at)
-                    .map_err(|e| e.to_string())?;
-            }
+            db.update_file_stats(row.id, size, modified_at)
+                .map_err(|e| e.to_string())?;
             stats.kept += 1;
             if let Some(m) = file_mtime {
                 if m > stats.newest_mtime {
@@ -310,7 +351,20 @@ fn scan_source(
                 continue;
             }
         }
+        fresh.push(f.clone());
+    }
 
+    // 解析新文件（顺带算内容指纹 —— 改名判定与将来的内容级去重都要它）。
+    struct Parsed {
+        norm: String,
+        filename: String,
+        meta: ImageMeta,
+        size: i64,
+        mtime: i64,
+        fp: String,
+    }
+    let mut parsed: Vec<Parsed> = Vec::new();
+    for f in &fresh {
         let meta = match parse_file(f) {
             Ok(meta) => meta,
             Err(error) => {
@@ -319,44 +373,140 @@ fn scan_source(
                 ImageMeta::default()
             }
         };
-        let dimension = db.get_source_dimension(source_id).unwrap_or_else(|_| crate::grouper::DEFAULT_DIMENSION.into());
-        let keys = compute_group_keys(&meta, norm_source, &dimension);
-        stats.affected.insert(keys.l1.clone());
         let size = std::fs::metadata(f).map(|m| m.len() as i64).unwrap_or(0);
-        if let Some(m) = file_mtime {
-            if m > stats.newest_mtime {
-                stats.newest_mtime = m;
-            }
-        }
-        let seed = meta.samplers.first().map(|s| s.seed).unwrap_or(0);
-        let steps = meta.samplers.first().map(|s| s.steps).unwrap_or(0);
-        let cfg = meta.samplers.first().map(|s| s.cfg).unwrap_or(0.0);
-        // Store the NORMALIZED abs_path so future rescans match this row by
-        // the same normalization function, regardless of how the user
-        // re-picked the source folder.
-        let abs = norm.clone();
-
-        let row = ImageInsert {
-            source_id,
-            rel_path: abs.clone(),
-            abs_path: abs,
+        let mtime = std::fs::metadata(f)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let fp = crate::fingerprint::file_fingerprint(f).unwrap_or_default();
+        parsed.push(Parsed {
+            norm: normalize_path(f),
             filename: f
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string(),
+            meta,
             size,
-            modified_at: file_mtime.unwrap_or(0),
-            width: meta.width as i64,
-            height: meta.height as i64,
-            prompt_pos: meta.prompt_pos.clone(),
-            prompt_neg: meta.prompt_neg.clone(),
-            checkpoint: meta.checkpoint.clone(),
-            loras: serde_json::to_string(&meta.loras).unwrap_or_default(),
-            vae: meta.vae.clone(),
-            text_encoder: meta.text_encoder.clone(),
-            controlnet: meta.controlnet.clone(),
-            samplers: serde_json::to_string(&meta.samplers).unwrap_or_default(),
+            mtime,
+            fp,
+        });
+    }
+
+    // ── 改名识别 ────────────────────────────────────────────────
+    // 旧行 = 库里还有、但路径不在盘上的行。
+    let missing: Vec<&crate::db::IdentityRow> = identity
+        .iter()
+        .filter(|r| !on_disk.contains(&normalize_path(&PathBuf::from(&r.abs_path))))
+        .collect();
+    let olds: Vec<crate::fingerprint::RenameOld> = missing
+        .iter()
+        .map(|r| crate::fingerprint::RenameOld {
+            id: r.id,
+            abs_path: r.abs_path.clone(),
+            size: r.size,
+            seed: r.seed,
+            prompt_pos: r.prompt_pos.clone(),
+            prompt_neg: r.prompt_neg.clone(),
+            meta_sig: r.meta_sig(),
+            content_fp: r.content_fp.clone(),
+        })
+        .collect();
+    let news: Vec<crate::fingerprint::RenameCandidate> = parsed
+        .iter()
+        .map(|p| {
+            let sampler = p.meta.samplers.first();
+            crate::fingerprint::RenameCandidate {
+                size: p.size,
+                seed: sampler.map(|s| s.seed).unwrap_or(0),
+                prompt_pos: p.meta.prompt_pos.clone(),
+                prompt_neg: p.meta.prompt_neg.clone(),
+                meta_sig: crate::fingerprint::meta_signature(
+                    &p.meta.workflow_key,
+                    p.meta.width as i64,
+                    p.meta.height as i64,
+                    sampler.map(|s| s.steps).unwrap_or(0),
+                    sampler.map(|s| s.cfg).unwrap_or(0.0),
+                    &p.meta.recipe_signature(),
+                ),
+                content_fp: p.fp.clone(),
+            }
+        })
+        .collect();
+    let matches = crate::fingerprint::match_renames(&olds, &news);
+
+    let mut matched_new: HashSet<usize> = HashSet::new();
+    let mut preserved: HashSet<i64> = HashSet::new();
+    for m in &matches {
+        let old = &olds[m.old_index];
+        let new = &parsed[m.new_index];
+        // 就地改路径 —— image_id 不变，评分 / 标签 / 手动分组 / 向量全保住。
+        db.rename_image_path(old.id, &new.norm, &new.filename, &new.fp)
+            .map_err(|e| e.to_string())?;
+        matched_new.insert(m.new_index);
+        stats.kept += 1;
+        if new.mtime > stats.newest_mtime {
+            stats.newest_mtime = new.mtime;
+        }
+        stats.renamed.push(RenameEvent {
+            old_path: old.abs_path.clone(),
+            new_path: new.norm.clone(),
+            basis: m.basis.as_str().to_string(),
+        });
+    }
+    // 认领不出来的旧行：带用户状态的**保留**并上报，等用户确认。
+    for (i, o) in olds.iter().enumerate() {
+        if matches.iter().any(|m| m.old_index == i) {
+            continue;
+        }
+        if user_state.contains(&o.id) {
+            preserved.insert(o.id);
+            stats.unconfirmed.push(UnconfirmedImage {
+                abs_path: o.abs_path.clone(),
+                filename: o.abs_path.rsplit('/').next().unwrap_or("").to_string(),
+                reason: "文件已不在原路径，且无法按内容确认身份 —— 记录已保留".to_string(),
+            });
+        }
+    }
+
+    // ── 认领不出来的旧文件 = 真·新图 ──────────────────────────
+    for (i, p) in parsed.iter().enumerate() {
+        if matched_new.contains(&i) {
+            continue;
+        }
+        let dimension = db.get_source_dimension(source_id).unwrap_or_else(|_| crate::grouper::DEFAULT_DIMENSION.into());
+        let keys = compute_group_keys(&p.meta, norm_source, &dimension);
+        stats.affected.insert(keys.l1.clone());
+        if p.mtime > stats.newest_mtime {
+            stats.newest_mtime = p.mtime;
+        }
+        let seed = p.meta.samplers.first().map(|s| s.seed).unwrap_or(0);
+        let steps = p.meta.samplers.first().map(|s| s.steps).unwrap_or(0);
+        let cfg = p.meta.samplers.first().map(|s| s.cfg).unwrap_or(0.0);
+        // Store the NORMALIZED abs_path so future rescans match this row by
+        // the same normalization function, regardless of how the user
+        // re-picked the source folder.
+        let abs = p.norm.clone();
+
+        let row = ImageInsert {
+            source_id,
+            rel_path: abs.clone(),
+            abs_path: abs,
+            filename: p.filename.clone(),
+            size: p.size,
+            modified_at: p.mtime,
+            width: p.meta.width as i64,
+            height: p.meta.height as i64,
+            prompt_pos: p.meta.prompt_pos.clone(),
+            prompt_neg: p.meta.prompt_neg.clone(),
+            checkpoint: p.meta.checkpoint.clone(),
+            loras: serde_json::to_string(&p.meta.loras).unwrap_or_default(),
+            vae: p.meta.vae.clone(),
+            text_encoder: p.meta.text_encoder.clone(),
+            controlnet: p.meta.controlnet.clone(),
+            samplers: serde_json::to_string(&p.meta.samplers).unwrap_or_default(),
             seed,
             steps,
             cfg,
@@ -368,29 +518,67 @@ fn scan_source(
             // of multi-MB PNGs) but is never read anywhere; the column is
             // kept for future content-level dedup but left empty.
             sha256: String::new(),
-            meta_ok: meta.raw_ok,
-            source_kind: format!("{:?}", meta.source_kind).to_lowercase(),
-            diffusion_model: meta.diffusion_model.clone(),
-            model_chain_json: serde_json::to_string(&meta.model_chain)
+            // v19: 内容指纹（改名认领与将来的内容级去重用它）。
+            content_fp: p.fp.clone(),
+            meta_ok: p.meta.raw_ok,
+            source_kind: format!("{:?}", p.meta.source_kind).to_lowercase(),
+            diffusion_model: p.meta.diffusion_model.clone(),
+            model_chain_json: serde_json::to_string(&p.meta.model_chain)
                 .unwrap_or_else(|_| "[]".to_string()),
-            workflow_key: meta.workflow_key.clone(),
-            workflow_graph_json: meta.workflow_graph_json.clone(),
+            workflow_key: p.meta.workflow_key.clone(),
+            workflow_graph_json: p.meta.workflow_graph_json.clone(),
             workflow_template_id: None,
             workflow_match_confidence: None,
-            generation_recipe_json: meta.generation_recipe_json(),
-            recipe_signature: meta.recipe_signature(),
+            generation_recipe_json: p.meta.generation_recipe_json(),
+            recipe_signature: p.meta.recipe_signature(),
             parser_version: crate::metadata::PARSER_VERSION.to_string(),
         };
         db.insert_image(&row).map_err(|e| e.to_string())?;
         stats.added += 1;
     }
-    // Remove rows for files that vanished from disk.
+
+    // Remove rows for files that vanished from disk — except the ones the
+    // user still has state on (they are preserved for confirmation).
     let (removed, deleted_l1) = db
-        .delete_missing_source_images(source_id, &on_disk)
+        .delete_missing_source_images(source_id, &on_disk, &preserved)
         .map_err(|e| e.to_string())?;
     stats.affected.extend(deleted_l1);
     let _ = removed;
     Ok(stats)
+}
+
+/// 补算**内容指纹**（第 29 轮）。
+///
+/// 指纹是「改名认领」的第三级判定依据。它必须在**改名之前**就存在 —— 改名
+/// 之后旧文件已经不在盘上，没法再算它的指纹了。
+///
+/// 代价：把该源所有还没指纹的文件读一遍（实测 957 张 / 1.71 GB ≈ 3.0 s），
+/// **一次性** —— 补齐之后每次扫描都是 0 成本。
+fn backfill_content_fingerprints(
+    db: &crate::db::Db,
+    source_id: i64,
+) -> Result<usize, String> {
+    let rows = db
+        .list_source_identity_rows(source_id)
+        .map_err(|e| e.to_string())?;
+    let mut done = 0usize;
+    for row in rows {
+        if !row.content_fp.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(&row.abs_path);
+        if !path.is_file() {
+            continue;
+        }
+        if let Some(fp) = crate::fingerprint::file_fingerprint(&path) {
+            db.set_content_fp(row.id, &fp).map_err(|e| e.to_string())?;
+            done += 1;
+        }
+    }
+    if done > 0 {
+        log::info!("source {source_id}: 补算内容指纹 {done} 张");
+    }
+    Ok(done)
 }
 
 /// Re-parse rows whose metadata is missing or outdated (mid-write failures
@@ -477,6 +665,7 @@ fn backfill_source(
             generation_recipe_json: meta.generation_recipe_json(),
             recipe_signature: meta.recipe_signature(),
             parser_version: crate::metadata::PARSER_VERSION.to_string(),
+            content_fp: String::new(),
         };
         let new_l1 = db
             .update_reparsed_image(id, &row, source_id)
@@ -553,9 +742,7 @@ pub async fn sync_all(
 ) -> Result<SyncAllResult, String> {
     let db = state.db.clone();
     let handle = app.clone();
-    let vision = state.vision.clone();
-    let text = state.text.clone();
-    tauri::async_runtime::spawn_blocking(move || run_sync(&db, &handle, &vision, &text))
+    tauri::async_runtime::spawn_blocking(move || run_sync(&db, &handle))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -563,14 +750,14 @@ pub async fn sync_all(
 fn run_sync(
     db: &crate::db::Db,
     app: &tauri::AppHandle,
-    vision: &crate::vision::VisionEngine,
-    text: &crate::text::TextEngineSlot,
 ) -> Result<SyncAllResult, String> {
     let sources = db.list_sources().map_err(|e| e.to_string())?;
     let source_total = sources.len();
     let mut total_added = 0usize;
     let mut total_pending = 0usize;
     let mut total_parse_errors = 0usize;
+    let mut total_renamed = 0usize;
+    let mut total_unconfirmed = 0usize;
     let mut any_recluster = false;
     let mut any_changed = false;
 
@@ -652,7 +839,11 @@ fn run_sync(
             total_parse_errors += stats.parse_errors;
             total_added += stats.added;
             total_pending += stats.pending;
+            total_renamed += stats.renamed.len();
+            total_unconfirmed += stats.unconfirmed.len();
             emit("scan", found, processed, added, pending, stats.parse_errors);
+            // 指纹一次性补齐 —— 必须在**下一次改名之前**算好。
+            let _ = backfill_content_fingerprints(db, src.id);
         }
 
         let (backfilled, backfill_parse_errors) = backfill_source(db, src.id, &norm_source)?;
@@ -698,87 +889,23 @@ fn run_sync(
             }
             any_recluster = true;
         }
-        // 语义模式下，新入库的图还没有向量 —— 补算一批（限量，别让同步被
-        // 拖住），补完再重算受影响的桶，否则它们会一直停在 L1 占位组里。
+        // ── v19 / 第 30 轮：这里**不再**偷偷补算签名 ──────────────
         //
-        // ⚠ 口径：槽位与模型必须与档位**一一对应**（`L2Mode::signature_spec`），
-        // **引擎也必须对应**：这里曾经用**视觉引擎**算语义模式的向量却写进
-        // text 槽 —— 错空间。维度一样（视觉塔 512 维 / 文本塔 512 维）、
-        // 条数也对，只有**值**属于另一个空间，肉眼查不出来。
-        if let Some((slot, model_id)) = l2_mode.signature_spec() {
-            match l2_mode {
-                crate::clustering::L2Mode::Semantic => {
-                    // 文本塔：输入是 **prompt 文本**，不读图。
-                    let missing = db
-                        .images_without_text_signatures(src.id, model_id, 64)
-                        .map_err(|e| e.to_string())?;
-                    if !missing.is_empty() {
-                        let items: Vec<(i64, String)> = missing;
-                        let computed = text.with_engine(|engine| {
-                            engine.embed_prompts(&items, &mut |_, _| {}, &|| false)
-                        });
-                        if let Ok(Ok((rows, _failed))) = computed {
-                            if !rows.is_empty() {
-                                let _ = db.upsert_signatures(
-                                    slot,
-                                    model_id,
-                                    &rows
-                                        .iter()
-                                        .map(|(id, vec)| (*id, vec.as_slice()))
-                                        .collect::<Vec<_>>(),
-                                );
-                                let _ = crate::clustering::recluster_l2_vectors(
-                                    db,
-                                    src.id,
-                                    slot,
-                                    model_id,
-                                    mode_threshold,
-                                    None,
-                                );
-                                any_recluster = true;
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    // 视觉塔：输入是**文件路径**。
-                    let missing = db
-                        .images_without_signatures(src.id, slot, model_id, 64)
-                        .map_err(|e| e.to_string())?;
-                    if !missing.is_empty() {
-                        let items: Vec<(i64, PathBuf)> = missing
-                            .into_iter()
-                            .filter(|(_, path)| std::path::Path::new(path).is_file())
-                            .map(|(id, path)| (id, PathBuf::from(path)))
-                            .collect();
-                        if !items.is_empty() {
-                            let computed = vision.embed_batch(&items, &mut |_, _| {}, &|| false);
-                            if let Ok((rows, _failed)) = computed {
-                                if !rows.is_empty() {
-                                    let _ = db.upsert_signatures(
-                                        slot,
-                                        model_id,
-                                        &rows
-                                            .iter()
-                                            .map(|(id, vec)| (*id, vec.as_slice()))
-                                            .collect::<Vec<_>>(),
-                                    );
-                                    let _ = crate::clustering::recluster_l2_vectors(
-                                        db,
-                                        src.id,
-                                        slot,
-                                        model_id,
-                                        mode_threshold,
-                                        None,
-                                    );
-                                    any_recluster = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // 旧版（阶段六~七）在同步循环里顺手给缺向量的图补算签名，每批 64 张，
+        // 算完立刻**全量重聚类**整个库（`recluster_l2_vectors(..., None)`），
+        // 然后回报 `reclustered=true` → 前端把它渲染成「同步完成：已检查 1 个
+        // 目录」，3 秒后消失 → **每 8 秒闪一次**（实测：2026-10-26 18:34 的
+        // 五次 sync 事件与五个 64 张的签名批次一一对应）。
+        //
+        // 三条理由删掉它：
+        // 1. **未经批准就烧 CPU** —— 违反项目自己的口径 #2「代价必须由用户
+        //    批准」。视觉推理约 3 张/秒，957 张要 5 分钟。
+        // 2. **每批都全量重聚类**（1.5~2.5 s）**并作废全站缩略图**。
+        // 3. **它报的是假话** —— 「同步完成」跟「后台在补算向量」毫无关系。
+        //
+        // 现在的口径：缺向量的图**保持原组**（纪律 #6：不做无声的搬动），
+        // 由界面**如实告诉用户**「有 N 张还没有向量，暂未参与聚类」，计算
+        // 只走设置页那个显式按钮（带进度、可取消）。
         if changed || backfilled_count > 0 {
             emit(
                 "scan-done",
@@ -823,6 +950,8 @@ fn run_sync(
         pending: total_pending,
         reclustered: any_recluster,
         parse_errors: total_parse_errors,
+        renamed: total_renamed,
+        unconfirmed: total_unconfirmed,
     })
 }
 
@@ -1179,8 +1308,13 @@ pub fn update_image_prompts(
             workflow_template_id: None, workflow_match_confidence: None,
             generation_recipe_json: meta.generation_recipe_json(), recipe_signature: meta.recipe_signature(),
             parser_version: crate::metadata::PARSER_VERSION.to_string(),
+            content_fp: String::new(),
         };
         state.db.update_reparsed_image(args.image_id, &row, source_id).map_err(|e| e.to_string())?;
+        // 文件内容被改写 → 旧的内容指纹失效了，重新算。
+        if let Some(fp) = crate::fingerprint::file_fingerprint(&path) {
+            let _ = state.db.set_content_fp(args.image_id, &fp);
+        }
         let affected = HashSet::from([old_l1.clone(), keys.l1]);
         crate::clustering::recluster_l2_keys(&state.db, source_id, &affected, threshold).map_err(|e| e.to_string())?;
         Ok(())
@@ -1816,6 +1950,115 @@ pub fn db_path(app: tauri::AppHandle) -> String {
         .to_string()
 }
 
+// ── 库恢复（第 29 轮）──────────────────────────────────────────
+//
+// 「改了名 → 手工分拣结果消失」这件事，**扫描期**只能救回**还没被删**的
+// 那部分（改名不丢分拣）。已经被删掉的那部分，如果**老库文件还在**，就能
+// 从老库里按内容身份找回来 —— 这就是「库恢复」。
+//
+// 用户侧的现实：装了安装版、又跑了便携版，两边各一个库；或者改了应用数据
+// 目录。老的那个库就成了「没人用的副本」，里面还留着分拣结果。
+
+/// 列出**可能**是旧副本的库文件（当前库目录的兄弟文件 + 安装版的同名库）。
+#[tauri::command]
+pub fn list_library_candidates(app: tauri::AppHandle) -> Vec<String> {
+    let current = crate::paths::data_root(&app)
+        .join("ai-image-sorter.db")
+        .to_string_lossy()
+        .to_string();
+    let mut out = crate::reconcile::candidate_libraries(&current);
+    // 安装版的数据目录（便携模式下也可能有 —— 换发行方式时留下的）。
+    if let Ok(dir) = app.path().app_data_dir() {
+        let installed = dir.join("ai-image-sorter.db");
+        let p = installed.to_string_lossy().to_string();
+        if installed.is_file() && !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// 预览「能从这个旧库里找回多少」。
+#[tauri::command]
+pub fn preview_library_recovery(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<crate::reconcile::Preview, String> {
+    crate::reconcile::preview(&state.db, &path)
+}
+
+/// 执行恢复。
+#[tauri::command]
+pub fn apply_library_recovery(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<crate::reconcile::Outcome, String> {
+    crate::reconcile::apply(&state.db, &path)
+}
+
+/// 用户确认「这张图确实被删了」→ 把那条**身份无法确认**的旧记录删掉。
+///
+/// 这是「绝不静默删除」的另一半：先保留、再让用户决定。
+#[tauri::command]
+pub fn discard_unconfirmed_image(
+    image_id: i64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.db.delete_image_row(image_id).map_err(|e| e.to_string())
+}
+
+/// 身份无法确认、被保留待确认的旧记录（第 29 轮）。
+///
+/// 判据：文件已经不在原路径上，**而且**这条记录带用户状态（评分 / 标签 /
+/// 手动分组）。前者是「图没了」，后者是「不能悄悄扔掉」—— 两个都成立才
+/// 进这份名单。
+#[derive(Debug, Clone, Serialize)]
+pub struct UnconfirmedImageDto {
+    pub id: i64,
+    pub abs_path: String,
+    pub filename: String,
+    pub reason: String,
+}
+
+#[tauri::command]
+pub fn list_unconfirmed_images(
+    state: State<'_, AppState>,
+) -> Result<Vec<UnconfirmedImageDto>, String> {
+    let sources = state.db.list_sources().map_err(|e| e.to_string())?;
+    let mut out: Vec<UnconfirmedImageDto> = Vec::new();
+    for src in sources {
+        let rows = state
+            .db
+            .list_source_identity_rows(src.id)
+            .map_err(|e| e.to_string())?;
+        let user_state = state
+            .db
+            .images_with_user_state(src.id)
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            if !user_state.contains(&row.id) {
+                continue;
+            }
+            if PathBuf::from(&row.abs_path).is_file() {
+                continue;
+            }
+            let filename = row
+                .abs_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&row.abs_path)
+                .to_string();
+            out.push(UnconfirmedImageDto {
+                id: row.id,
+                abs_path: row.abs_path.clone(),
+                filename,
+                reason: "文件已不在原路径，且无法按内容确认身份 —— 记录已保留".to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupThumbDto {
     pub group_key: String,
@@ -1939,7 +2182,7 @@ mod e2e_tests {
 
         eprintln!(
             "e2e: total={} empty_ck={} no_key={} with_model={} template_matched={} assigned_keys={} broken_left={}",
-            db.list_source_image_paths(1).map(|v| v.len()).unwrap_or(0) + broken,
+            db.list_source_identity_rows(1).map(|v| v.len()).unwrap_or(0) + broken,
             empty_ck,
             no_key,
             with_model,
@@ -1949,7 +2192,8 @@ mod e2e_tests {
         );
 
         let conn = db.0.lock().unwrap();
-        let groups = {            let mut stmt = conn
+        let groups = {
+            let mut stmt = conn
                 .prepare(
                     "SELECT i.group_key_l1, COUNT(*) c, MIN(wt.name) wname,
                             GROUP_CONCAT(DISTINCT COALESCE(NULLIF(i.diffusion_model,''),'(未知)'))
@@ -2059,6 +2303,113 @@ mod e2e_tests {
             assert!(!pos.is_empty(), "CivitAI image must have a prompt after reparse");
             assert!(*has == 1, "CivitAI image must have samplers after reparse");        }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 把文件的修改时间往回拨 —— 扫描有 10 秒的**稳定性窗口**（正在写的
+    /// 文件先不碰），刚写出来的文件会被推迟一轮。
+    fn age_file(path: &std::path::Path) {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        file.set_times(std::fs::FileTimes::new().set_modified(past))
+            .unwrap();
+    }
+
+    /// 第 29 轮「改名不丢分拣」：**改名不换行**。
+    ///
+    /// 场景：两张图入库 → 用户在应用之外改名 → 再扫一次。
+    /// 期望：**image_id 不变**（评分 / 标签 / 手动分组因此全部保住），
+    /// 且库里不再有「文件已不在」的行。
+    #[test]
+    fn rename_keeps_the_row_and_its_state() {
+        let dir = std::env::temp_dir().join(format!("ais-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 两个**大小不同**的文件 —— 尺寸是内容主键的一部分，
+        // 足以让「这两张是不同的图」这件事被认出来。
+        let a = dir.join("ComfyUI_00001_.png");
+        let b = dir.join("ComfyUI_00002_.png");
+        std::fs::write(&a, vec![7u8; 100]).unwrap();
+        std::fs::write(&b, vec![9u8; 200]).unwrap();
+        age_file(&a);
+        age_file(&b);
+
+        let db_path = dir.join("test.db");
+        let db = crate::db::open(&db_path).unwrap();
+        let source_id = db
+            .upsert_source(&normalize_path(&dir), "local", None)
+            .unwrap();
+        let norm = normalize_path(&dir);
+        let (files, _) = comfy_finder::list_images_with_newest(&dir);
+        let first = scan_source(&db, source_id, &norm, &files).unwrap();
+        assert_eq!(first.added, 2, "首次扫描应入库两张");
+        assert_eq!(first.renamed.len(), 0, "首次扫描不该有改名");
+
+        // 给其中一张记一个「用户状态」—— 评分。
+        let ids: Vec<i64> = db
+            .list_source_identity_rows(source_id)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids.len(), 2);
+        db.set_score(ids[0], 0.75).unwrap();
+
+        // 改名（只改文件名，内容不变）。
+        let renamed_a = dir.join("20260727_00001_.png");
+        std::fs::rename(&a, &renamed_a).unwrap();
+
+        let (files2, _) = comfy_finder::list_images_with_newest(&dir);
+        let second = scan_source(&db, source_id, &norm, &files2).unwrap();
+        assert_eq!(second.renamed.len(), 1, "应识别出一次改名");
+        assert_eq!(second.added, 0, "改名不该被当成新图");
+        assert_eq!(second.unconfirmed.len(), 0, "改名认出来了，不该有待确认");
+
+        // 行数不变、image_id 不变、评分还在。
+        let rows = db.list_source_identity_rows(source_id).unwrap();
+        assert_eq!(rows.len(), 2, "库里的行数不该变（换行 = 丢数据）");
+        assert!(rows.iter().any(|r| r.abs_path.contains("20260727_00001_")));
+        assert_eq!(
+            db.score_of(ids[0]).unwrap(),
+            Some(0.75),
+            "改名的图必须保住它的评分"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 第 29 轮：**身份认不出来时绝不静默删除**。
+    ///
+    /// 场景：一张带评分的图，它的文件被删了（不是改名 —— 认不出来）。
+    /// 期望：这一行**被保留**并进「待确认」名单，绝不悄悄消失。
+    #[test]
+    fn unidentifiable_missing_row_is_preserved_not_deleted() {
+        let dir = std::env::temp_dir().join(format!("ais-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("ComfyUI_00001_.png");
+        std::fs::write(&a, vec![7u8; 100]).unwrap();
+        age_file(&a);
+
+        let db_path = dir.join("test.db");
+        let db = crate::db::open(&db_path).unwrap();
+        let source_id = db.upsert_source(&normalize_path(&dir), "local", None).unwrap();
+        let norm = normalize_path(&dir);
+        let (files, _) = comfy_finder::list_images_with_newest(&dir);
+        scan_source(&db, source_id, &norm, &files).unwrap();
+        let id = db.list_source_identity_rows(source_id).unwrap()[0].id;
+        db.set_score(id, 0.5).unwrap();
+
+        // 文件没了，且没有新文件来认领它。
+        std::fs::remove_file(&a).unwrap();
+        let (files2, _) = comfy_finder::list_images_with_newest(&dir);
+        let second = scan_source(&db, source_id, &norm, &files2).unwrap();
+        assert_eq!(second.unconfirmed.len(), 1, "认不出来就该进待确认名单");
+        let rows = db.list_source_identity_rows(source_id).unwrap();
+        assert_eq!(rows.len(), 1, "带用户状态的行绝不能被静默删除");
+        assert_eq!(db.score_of(id).unwrap(), Some(0.5), "评分必须还在");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2342,7 +2693,8 @@ pub fn suggest_move_targets(
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct VisionStatusDto {    /// 权重是否就位。不就位时前端把「识图」入口标成不可用，而不是让用户
+pub struct VisionStatusDto {
+    /// 权重是否就位。不就位时前端把「识图」入口标成不可用，而不是让用户
     /// 点下去才报错。
     pub available: bool,
     pub model_id: String,
@@ -2590,6 +2942,81 @@ pub async fn compute_text_signatures(
         *guard = None;
     }
     Ok(result)
+}
+
+/// 能力标记串：签名**只按需计算**（第 30 轮）。
+///
+/// 与它成对的是一条**否定**检查：发行版探针要确认「后台补算」那段代码已经
+/// 不在二进制里了（见 `scripts/verify-release-binary.ps1` 的 `Absent`）。
+///
+/// 为什么值得专门证明：这段代码**曾经**存在，而且它的存在**看不出来** ——
+/// 它不会让 exe 变大多少，也不会报错，只是每 8 秒偷偷烧一次 CPU。删掉它
+/// 同样看不出来（`opt-level="s" + lto=true` 会把整段剔干净）。所以「没有」
+/// 也得能证明。
+pub const CAP_SIGNATURE_EXPLICIT: &str = "ais.cap.signature.explicit.v1\0";
+
+/// 该源的**签名覆盖率**（第 30 轮）。
+///
+/// 同步循环不再偷偷补算签名（见 `run_sync` 里的说明），所以「有多少图还没
+/// 向量」必须由界面**如实说出来** —— 缺向量的图保持原组、暂不参与聚类
+/// （纪律 #6：不做无声的搬动）。
+#[derive(Debug, Clone, Serialize)]
+pub struct SignatureCoverageDto {
+    /// 当前 L2 档位（text / visual / semantic）。
+    pub mode: String,
+    /// 该档要读哪个槽位（text 档为 None —— 它用词 Jaccard，不需要向量）。
+    pub slot: Option<String>,
+    pub model_id: Option<String>,
+    /// 分母：会参与聚类的图数。
+    pub total: usize,
+    /// 分子：已经有向量的图数。
+    pub computed: usize,
+}
+
+#[tauri::command]
+pub fn l2_signature_coverage(
+    source_id: i64,
+    state: State<'_, AppState>,
+) -> Result<SignatureCoverageDto, String> {
+    let mode = crate::clustering::L2Mode::parse(
+        &state
+            .db
+            .get_source_l2_mode(source_id)
+            .unwrap_or_else(|_| "text".into()),
+    );
+    let spec = mode.signature_spec();
+    let (total, computed) = match spec {
+        None => {
+            // 文本档用词 Jaccard，不需要向量 → 没有「缺签名」这回事。
+            (0, 0)
+        }
+        Some((slot, model_id)) => {
+            let computed = state
+                .db
+                .signature_image_ids(source_id, slot, model_id)
+                .map_err(|e| e.to_string())?
+                .len();
+            let total = if slot == "text" {
+                state
+                    .db
+                    .count_images_with_prompts(source_id)
+                    .map_err(|e| e.to_string())?
+            } else {
+                state
+                    .db
+                    .count_source_images(source_id)
+                    .map_err(|e| e.to_string())?
+            };
+            (total, computed)
+        }
+    };
+    Ok(SignatureCoverageDto {
+        mode: mode.as_str().to_string(),
+        slot: spec.map(|(slot, _)| slot.to_string()),
+        model_id: spec.map(|(_, model_id)| model_id.to_string()),
+        total,
+        computed,
+    })
 }
 
 /// 一个模型塔的运行时状态。

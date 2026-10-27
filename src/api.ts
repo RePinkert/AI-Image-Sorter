@@ -12,17 +12,21 @@ import type {
   ImageRow,
   L2Mode,
   LabelRow,
+  LibraryRecoveryOutcome,
+  LibraryRecoveryPreview,
   ManualGroupResult,
   ModelDeviationDimension,
   MoveSuggestion,
   OutlierInfo,
   PromptRecommendation,
   ScanResult,
+  SignatureCoverageDto,
   SignatureResultDto,
   SourceRow,
   SyncAllResult,
   TextCoverageDto,
   TextStatusDto,
+  UnconfirmedImage,
   UndoActionResult,
   UpdateImagePromptsResult,
   VisionStatusDto,
@@ -504,6 +508,53 @@ export async function pickFolder(): Promise<string | null> {
   return typeof selected === 'string' ? selected : null
 }
 
+// ── 库恢复 / 改名待确认（第 29 轮）─────────────────────────────
+
+/**
+ * 身份无法确认、被保留待确认的旧记录。
+ *
+ * 这些记录**带用户状态**（评分 / 标签 / 手动分组），所以宁可留着等用户
+ * 决定，也不静默删掉。
+ */
+export async function listUnconfirmedImages(): Promise<UnconfirmedImage[]> {
+  if (isWebDev()) return []
+  return apiInvoke('list_unconfirmed_images')
+}
+
+/** 用户确认「这张图确实被删了」→ 删掉那条旧记录。 */
+export async function discardUnconfirmedImage(imageId: number): Promise<void> {
+  if (isWebDev()) return
+  await apiInvoke('discard_unconfirmed_image', { imageId })
+}
+
+/** 可能存在的旧库副本（当前库目录的兄弟文件 + 安装版的同名库）。 */
+export async function listLibraryCandidates(): Promise<string[]> {
+  if (isWebDev()) return []
+  return apiInvoke('list_library_candidates')
+}
+
+/** 预览「能从这个旧库里找回多少」。 */
+export async function previewLibraryRecovery(path: string): Promise<LibraryRecoveryPreview> {
+  if (isWebDev()) return unavailable('浏览器模式暂不支持库恢复，请使用桌面版')
+  return apiInvoke('preview_library_recovery', { path })
+}
+
+/** 执行恢复。 */
+export async function applyLibraryRecovery(path: string): Promise<LibraryRecoveryOutcome> {
+  if (isWebDev()) return unavailable('浏览器模式暂不支持库恢复，请使用桌面版')
+  return apiInvoke('apply_library_recovery', { path })
+}
+
+/** 让用户自己挑一个库文件。 */
+export async function pickDatabaseFile(): Promise<string | null> {
+  if (isWebDev()) return window.prompt('输入库文件路径')
+  const selected = await open({
+    multiple: false,
+    filters: [{ name: '数据库', extensions: ['db'] }],
+  })
+  return typeof selected === 'string' ? selected : null
+}
+
 export async function pickSavePath(defaultName: string): Promise<string | null> {
   const isJson = defaultName.endsWith('.json')
   const selected = await save({
@@ -636,6 +687,19 @@ export async function textStatus(): Promise<TextStatusDto> {
 export async function textCoverage(sourceId: number): Promise<TextCoverageDto> {
   if (isWebDev()) return unavailable('文本塔只在桌面端可用')
   return apiInvoke('text_coverage', { sourceId })
+}
+
+/**
+ * 当前 L2 档位的**签名覆盖率**（第 30 轮）。
+ *
+ * 同步循环不再偷偷补算签名 —— 缺向量的图保持原组、暂不参与聚类，界面要
+ * 如实说出来（纪律 #6）。
+ */
+export async function l2SignatureCoverage(sourceId: number): Promise<SignatureCoverageDto> {
+  if (isWebDev()) {
+    return webJson('l2_signature_coverage', `/api/l2-signature-coverage?sourceId=${sourceId}`)
+  }
+  return apiInvoke('l2_signature_coverage', { sourceId })
 }
 
 /**

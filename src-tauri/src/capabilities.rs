@@ -121,6 +121,36 @@ pub fn capabilities() -> Vec<Capability> {
         kind: KIND_PROVENANCE,
         axis: "-",
     });
+    // v19（第 29 轮）：改名不丢分拣 + 库恢复。
+    //
+    // 两条标记串都住在**实现它们的模块里**：`fingerprint.rs`（内容身份与
+    // 改名判定）与 `reconcile.rs`（从旧库找回分拣结果）。实现被删 →
+    // 常量消失 → 标记串从二进制里消失 → 探针立刻发现。
+    out.push(Capability {
+        id: "rename.preserve",
+        marker: marker_id(crate::fingerprint::CAP_RENAME_PRESERVE),
+        label: "改名不丢分拣（内容身份认领）",
+        kind: KIND_PROVENANCE,
+        axis: "-",
+    });
+    out.push(Capability {
+        id: "library.recover",
+        marker: marker_id(crate::reconcile::CAP_LIBRARY_RECOVER),
+        label: crate::reconcile::RECOVER_ACTION,
+        kind: KIND_PROVENANCE,
+        axis: "-",
+    });
+    // 第 30 轮：签名**只按需计算**（后台不再偷跑）。
+    //
+    // 这条与「改名不丢分拣」不同：它证明的是**没有**某段代码 ——
+    // 发行版探针的 `Absent` 检查负责（标记串在场 + 旧机制的特征串不在场）。
+    out.push(Capability {
+        id: "signature.explicit",
+        marker: marker_id(crate::commands::CAP_SIGNATURE_EXPLICIT),
+        label: "签名按需计算（无后台补算）",
+        kind: KIND_PROVENANCE,
+        axis: "-",
+    });
     // 每条标记都必须带公共前缀 —— 探针按前缀扫二进制，前缀错了就扫不到。
     debug_assert!(
         out.iter().all(|c| c.marker.starts_with(MARKER_PREFIX)),

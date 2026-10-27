@@ -164,24 +164,251 @@ impl Db {
         Ok(())
     }
 
-    /// Return (image_id, abs_path) for all images currently stored under a
-    /// source. Used by `add_source_and_scan` to do idempotent rescans: we
-    /// keep existing rows verbatim (preserving scores/labels via their
-    /// unchanged FK), only insert brand-new files, and delete rows whose
-    /// abs_path is no longer on disk.
-    pub fn list_source_image_paths(&self, source_id: i64) -> Result<Vec<(i64, String)>> {
+    /// 一行的**内容身份**（第 29 轮「改名不丢分拣」）。
+    ///
+    /// 判定改名要用的字段全在这里：路径、尺寸、种子、正负 prompt、元数据
+    /// 签名、内容指纹。prompt 已经在库里（解析时存的），所以判定不需要
+    /// 再读盘。
+    pub fn list_source_identity_rows(&self, source_id: i64) -> Result<Vec<IdentityRow>> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, abs_path FROM images WHERE source_id=?1 ORDER BY id",
+            "SELECT id, abs_path, size, seed, prompt_pos, prompt_neg,
+                    COALESCE(content_fp, ''), COALESCE(workflow_key, ''),
+                    COALESCE(width, 0), COALESCE(height, 0),
+                    COALESCE(steps, 0), COALESCE(cfg, 0.0),
+                    COALESCE(recipe_signature, '')
+             FROM images WHERE source_id=?1 ORDER BY id",
         )?;
         let rows = stmt.query_map(rusqlite::params![source_id], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            Ok(IdentityRow {
+                id: r.get::<_, i64>(0)?,
+                abs_path: r.get::<_, String>(1)?,
+                size: r.get::<_, i64>(2)?,
+                seed: r.get::<_, i64>(3)?,
+                prompt_pos: r.get::<_, String>(4)?,
+                prompt_neg: r.get::<_, String>(5)?,
+                content_fp: r.get::<_, String>(6)?,
+                workflow_key: r.get::<_, String>(7)?,
+                width: r.get::<_, i64>(8)?,
+                height: r.get::<_, i64>(9)?,
+                steps: r.get::<_, i64>(10)?,
+                cfg: r.get::<_, f64>(11)?,
+                recipe_signature: r.get::<_, String>(12)?,
+            })
         })?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// 就地更新路径 —— **保住 image_id**。
+    ///
+    /// 这是「改名不丢分拣」的全部秘密：路径变了就改路径，**行不换**。
+    /// image_id 不变 → `scores` / `image_labels` / `manual_group_bindings` /
+    /// `image_signatures` 全部原样跟着走。
+    pub fn rename_image_path(
+        &self,
+        id: i64,
+        abs_path: &str,
+        filename: &str,
+        content_fp: &str,
+    ) -> Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE images SET abs_path=?2, rel_path=?2, filename=?3, content_fp=?4 WHERE id=?1",
+            rusqlite::params![id, abs_path, filename, content_fp],
+        )?;
+        Ok(())
+    }
+
+    /// 写内容指纹（补算用）。
+    pub fn set_content_fp(&self, id: i64, fp: &str) -> Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE images SET content_fp=?2 WHERE id=?1",
+            rusqlite::params![id, fp],
+        )?;
+        Ok(())
+    }
+
+    /// 哪些图带**用户状态**（评分 / 标签 / 手动分组）。
+    ///
+    /// 这样的行**绝不静默删除** —— 它们是用户手工分拣的结果。宁可留在
+    /// 库里等确认，也不能在一次改名后凭空消失。
+    pub fn images_with_user_state(&self, source_id: i64) -> Result<std::collections::HashSet<i64>> {
+        let conn = self.0.lock().unwrap();
+        let mut out = std::collections::HashSet::new();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT i.id FROM images i
+             WHERE i.source_id=?1 AND (
+               EXISTS (SELECT 1 FROM scores s WHERE s.image_id=i.id)
+               OR EXISTS (SELECT 1 FROM image_labels l WHERE l.image_id=i.id)
+               OR EXISTS (SELECT 1 FROM manual_group_bindings b WHERE b.image_id=i.id)
+             )",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![source_id], |r| r.get::<_, i64>(0))?;
+        for r in rows {
+            out.insert(r?);
+        }
+        Ok(out)
+    }
+
+    /// 删掉一行**没有**用户状态、且身份无法确认的旧记录。
+    ///
+    /// 只在用户明确确认「这张图确实被删了」之后才走这条路（见「库恢复」）。
+    pub fn delete_image_row(&self, id: i64) -> Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute("DELETE FROM images WHERE id=?1", rusqlite::params![id])?;
+        Ok(())
+    }
+
+    /// 全部源的内容身份行（库恢复用 —— 跨源匹配）。
+    pub fn list_all_identity_rows(&self) -> Result<Vec<IdentityRow>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, abs_path, size, seed, prompt_pos, prompt_neg,
+                    COALESCE(content_fp, ''), COALESCE(workflow_key, ''),
+                    COALESCE(width, 0), COALESCE(height, 0),
+                    COALESCE(steps, 0), COALESCE(cfg, 0.0),
+                    COALESCE(recipe_signature, '')
+             FROM images ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(IdentityRow {
+                id: r.get::<_, i64>(0)?,
+                abs_path: r.get::<_, String>(1)?,
+                size: r.get::<_, i64>(2)?,
+                seed: r.get::<_, i64>(3)?,
+                prompt_pos: r.get::<_, String>(4)?,
+                prompt_neg: r.get::<_, String>(5)?,
+                content_fp: r.get::<_, String>(6)?,
+                workflow_key: r.get::<_, String>(7)?,
+                width: r.get::<_, i64>(8)?,
+                height: r.get::<_, i64>(9)?,
+                steps: r.get::<_, i64>(10)?,
+                cfg: r.get::<_, f64>(11)?,
+                recipe_signature: r.get::<_, String>(12)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 每张图当前的 L2 组键（库恢复的**组键重映射**要用）。
+    pub fn list_image_group_keys(&self) -> Result<Vec<(i64, String)>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, COALESCE(group_key_l2,'') FROM images")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 这张图是否已经有这个**同名**标签（库恢复时「新库优先」）。
+    ///
+    /// `name` 为空 = 「有没有任意标签」。
+    pub fn image_has_label(&self, image_id: i64, name: &str) -> Result<bool> {
+        let conn = self.0.lock().unwrap();
+        if name.is_empty() {
+            Ok(conn
+                .query_row(
+                    "SELECT COUNT(*) FROM image_labels WHERE image_id=?1",
+                    rusqlite::params![image_id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0)
+        } else {
+            Ok(conn
+                .query_row(
+                    "SELECT COUNT(*) FROM image_labels l JOIN labels lb ON lb.id=l.label_id
+                     WHERE l.image_id=?1 AND lb.name=?2",
+                    rusqlite::params![image_id, name],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0)
+        }
+    }
+
+    /// 读一条评分。
+    pub fn score_of(&self, image_id: i64) -> Result<Option<f64>> {
+        let conn = self.0.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT internal_score FROM scores WHERE image_id=?1",
+                rusqlite::params![image_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// 直接写一条评分（库恢复用 —— 没有对应的 review_action 历史）。
+    pub fn set_score(&self, image_id: i64, score: f64) -> Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO scores (image_id, internal_score, updated_at, last_mode)
+             VALUES (?1, ?2, ?3, 'recovered')
+             ON CONFLICT(image_id) DO UPDATE SET internal_score=excluded.internal_score,
+                 updated_at=excluded.updated_at",
+            rusqlite::params![image_id, score, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// 这张图已经有手动分组断言吗（库恢复时**新库的优先**）。
+    pub fn has_binding(&self, image_id: i64) -> Result<bool> {
+        let conn = self.0.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT COUNT(*) FROM manual_group_bindings WHERE level=2 AND image_id=?1",
+                rusqlite::params![image_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0)
+    }
+
+    /// 写一条手动分组断言（**只在新库没有这条断言时**写 —— 新库优先）。
+    pub fn insert_binding_if_absent(
+        &self,
+        level: u8,
+        image_id: i64,
+        group_key: &str,
+        kind: &str,
+        prev_group_key: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.0.lock().unwrap();
+        let n = conn.execute(
+            "INSERT OR IGNORE INTO manual_group_bindings (level, image_id, group_key, kind, created_at, prev_group_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                level as i64,
+                image_id,
+                group_key,
+                kind,
+                Utc::now().to_rfc3339(),
+                prev_group_key.unwrap_or("")
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 直接改某张图的 L2 组键（库恢复时把图归回用户手动指定的组）。
+    pub fn set_image_group_key_l2(&self, image_id: i64, group_key: &str) -> Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE images SET group_key_l2=?2 WHERE id=?1",
+            rusqlite::params![image_id, group_key],
+        )?;
+        Ok(())
     }
 
     /// Delete images under a source whose abs_path is NOT in `keep`. Scores
@@ -191,10 +418,16 @@ impl Db {
     /// same way before comparing so rescan matching is shape-invariant.
     /// Returns `(removed, affected L1 keys)` so callers know which workflow
     /// groups need re-clustering.
+    ///
+    /// **v19（第 29 轮）**：`preserve` 里的行**不删** —— 它们要么被改名
+    /// 识别命中（行已就地改路径，不会走到这里），要么身份无法确认。带
+    /// 用户状态（评分 / 标签 / 手动分组）的行**一律进 `preserve`**：宁可
+    /// 留下待确认，也不静默毁掉用户的手工分拣结果。
     pub fn delete_missing_source_images(
         &self,
         source_id: i64,
         keep: &std::collections::HashSet<String>,
+        preserve: &std::collections::HashSet<i64>,
     ) -> Result<(usize, Vec<String>)> {
         let conn = self.0.lock().unwrap();
         let mut stmt =
@@ -206,7 +439,7 @@ impl Db {
         for r in rows {
             let (id, p, l1) = r?;
             let norm = crate::commands::normalize_path_str(&p);
-            if !keep.contains(&norm) {
+            if !keep.contains(&norm) && !preserve.contains(&id) {
                 to_delete.push((id, l1));
             }
         }
@@ -231,7 +464,7 @@ impl Db {
 mod migrations {
     use super::*;
 
-    pub(crate) const CURRENT_VERSION: i32 = 18;
+    pub(crate) const CURRENT_VERSION: i32 = 19;
 
     pub fn run(conn: &Connection) -> Result<()> {
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -474,6 +707,18 @@ mod migrations {
             conn.execute_batch(
                 "ALTER TABLE sources ADD COLUMN l2_semantic_threshold REAL NOT NULL DEFAULT 0.7;",
             )?;
+        }
+        // v19: 图片的**内容指纹**（第 29 轮「改名不丢分拣」）。
+        //
+        // 为什么需要：图片的身份是**路径**。用户在应用之外改名 → 重扫时旧行
+        // 被删、新行被插 → image_id 变了 → 评分 / 标签 / 手动分组全部消失。
+        // 有了内容指纹，改名就能被认出来并**就地更新路径**（保住 image_id）。
+        //
+        // 指纹算法：xxh3-64（`xxhash-rust` 是既有依赖，不新增依赖 ——
+        // 硬约束 #1）。已有的 `sha256` 列保持为空（留给将来的内容级去重）。
+        let img_cols = image_columns(conn)?;
+        if !img_cols.contains("content_fp") {
+            conn.execute_batch("ALTER TABLE images ADD COLUMN content_fp TEXT;")?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {};", CURRENT_VERSION))?;
         Ok(())
@@ -737,6 +982,9 @@ mod migrations {
                  generation_recipe_json TEXT NOT NULL DEFAULT '{}',
                  recipe_signature TEXT,
                  parser_version TEXT NOT NULL DEFAULT '',
+                 -- v19: 内容指纹（xxh3-64）。改名不丢分拣的依据 ——
+                 -- 与路径无关，认的是内容。
+                 content_fp TEXT,
                  FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_images_l0 ON images(group_key_l0);
@@ -1109,6 +1357,42 @@ pub struct ImageRow {
     pub manually_grouped: Option<String>,
 }
 
+/// 一行的**内容身份**（第 29 轮「改名不丢分拣」）。
+///
+/// 判定改名要用的字段全在这里：路径、尺寸、种子、正负 prompt、元数据
+/// 签名、内容指纹。prompt 已经在库里（解析时存的），所以判定不需要再读盘。
+#[derive(Debug, Clone)]
+pub struct IdentityRow {
+    pub id: i64,
+    pub abs_path: String,
+    pub size: i64,
+    pub seed: i64,
+    pub prompt_pos: String,
+    pub prompt_neg: String,
+    /// 空 = 还没算过指纹。
+    pub content_fp: String,
+    pub workflow_key: String,
+    pub width: i64,
+    pub height: i64,
+    pub steps: i64,
+    pub cfg: f64,
+    pub recipe_signature: String,
+}
+
+impl IdentityRow {
+    /// 元数据签名（主键撞了时的次级判定依据）。
+    pub fn meta_sig(&self) -> String {
+        crate::fingerprint::meta_signature(
+            &self.workflow_key,
+            self.width,
+            self.height,
+            self.steps,
+            self.cfg,
+            &self.recipe_signature,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelFacet {
     pub model: String,
@@ -1318,11 +1602,11 @@ impl Db {
                  diffusion_model, text_encoder, controlnet, model_chain_json,
                  workflow_key, workflow_graph_json,
                  workflow_template_id, workflow_match_confidence,
-                 generation_recipe_json, recipe_signature, parser_version
+                 generation_recipe_json, recipe_signature, parser_version, content_fp
              ) VALUES (
                  ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
                  ?17,?18,?19,?20,?21,?22,?23,?24,?25,
-                 ?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36
+                 ?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37
              )",
             rusqlite::params![
                 row.source_id,
@@ -1361,6 +1645,7 @@ impl Db {
                 row.generation_recipe_json,
                 row.recipe_signature,
                 row.parser_version,
+                row.content_fp,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -1731,6 +2016,17 @@ impl Db {
         Ok(out)
     }
 
+    /// 该源有多少张图（视觉塔的分母 —— 视觉塔对每张图都要算一个向量）。
+    pub fn count_source_images(&self, source_id: i64) -> Result<usize> {
+        let conn = self.0.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM images WHERE source_id=?1",
+            rusqlite::params![source_id],
+            |r| r.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     /// 某个组的成员 id（阶段六的离群检测用）。
     pub fn group_member_ids(&self, group_key: &str) -> Result<Vec<i64>> {
         let conn = self.0.lock().unwrap();
@@ -1779,7 +2075,8 @@ impl Db {
 
     /// 源里所有 level-2 手动绑定（image_id → 绑定的组键）。
     /// 手动 pin 永远优先于自动聚类：合并/拆分/移动过的图不会被重新聚类带走。
-    pub fn manual_l2_bindings(&self, source_id: i64) -> Result<std::collections::HashMap<i64, String>> {        let conn = self.0.lock().unwrap();
+    pub fn manual_l2_bindings(&self, source_id: i64) -> Result<std::collections::HashMap<i64, String>> {
+        let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT b.image_id, b.group_key FROM manual_group_bindings b
              JOIN images i ON i.id=b.image_id
@@ -1792,38 +2089,6 @@ impl Db {
         for row in rows {
             let (id, key) = row?;
             out.insert(id, key);
-        }
-        Ok(out)
-    }
-
-    /// 还没有签名的图（id + 路径），按 id 升序，可限量。
-    ///
-    /// 用途：视觉/语义聚类模式下，新入库的图还没有向量 —— 同步时按批补算，
-    /// 否则这些图会一直停在自己的 L1 占位组里。限量是为了不让同步被
-    /// 一次几千张的补算拖住（补算是分批推进的，每轮同步啃掉一批）。
-    pub fn images_without_signatures(
-        &self,
-        source_id: i64,
-        slot: &str,
-        model_id: &str,
-        limit: usize,
-    ) -> Result<Vec<(i64, String)>> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT i.id, i.abs_path FROM images i
-             WHERE i.source_id=?1
-               AND NOT EXISTS (
-                 SELECT 1 FROM image_signatures s
-                 WHERE s.image_id=i.id AND s.slot=?2 AND s.model_id=?3)
-             ORDER BY i.id LIMIT ?4",
-        )?;
-        let rows = stmt.query_map(
-            rusqlite::params![source_id, slot, model_id, limit as i64],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-        )?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
         }
         Ok(out)
     }
@@ -1847,41 +2112,9 @@ impl Db {
         Ok(out)
     }
 
-    /// 还没有文本签名的图（id + prompt），按 id 升序，可限量。
-    ///
-    /// 与 `images_without_signatures` 的区别：那个给的是**文件路径**（视觉塔
-    /// 要读图），这个给的是 **prompt 文本**（文本塔不读图）。
-    ///
-    /// 维度校验：槽位里的向量必须与 `model_id` 匹配 —— 换模型必须重算，
-    /// 不同模型的向量不在同一空间里，绝不能混着比。
-    pub fn images_without_text_signatures(
-        &self,
-        source_id: i64,
-        model_id: &str,
-        limit: usize,
-    ) -> Result<Vec<(i64, String)>> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT i.id, i.prompt_pos FROM images i
-             WHERE i.source_id=?1 AND i.prompt_pos != ''
-               AND NOT EXISTS (
-                 SELECT 1 FROM image_signatures s
-                 WHERE s.image_id=i.id AND s.slot='text' AND s.model_id=?2)
-             ORDER BY i.id LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(
-            rusqlite::params![source_id, model_id, limit as i64],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-        )?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    }
-
     /// 该源的 L2 聚类方式（阶段六）。
-    pub fn get_source_l2_mode(&self, source_id: i64) -> Result<String> {        let conn = self.0.lock().unwrap();
+    pub fn get_source_l2_mode(&self, source_id: i64) -> Result<String> {
+        let conn = self.0.lock().unwrap();
         let value: Option<String> = conn
             .query_row(
                 "SELECT l2_mode FROM sources WHERE id=?1",
@@ -1926,7 +2159,8 @@ impl Db {
         Ok(count as usize)
     }
 
-    pub fn set_source_l2_mode(&self, source_id: i64, mode: &str) -> Result<()> {        let conn = self.0.lock().unwrap();
+    pub fn set_source_l2_mode(&self, source_id: i64, mode: &str) -> Result<()> {
+        let conn = self.0.lock().unwrap();
         conn.execute(
             "UPDATE sources SET l2_mode=?2 WHERE id=?1",
             rusqlite::params![source_id, mode],
@@ -3683,6 +3917,8 @@ pub struct ImageInsert {
     pub generation_recipe_json: String,
     pub recipe_signature: String,
     pub parser_version: String,
+    /// v19: 内容指纹（xxh3-64 十六进制）。空 = 还没算过。
+    pub content_fp: String,
 }
 
 #[allow(dead_code)]
@@ -3785,6 +4021,7 @@ mod tests {
                 generation_recipe_json: String::new(),
                 recipe_signature: String::new(),
                 parser_version: String::new(),
+                content_fp: String::new(),
             })
             .unwrap()
         };
@@ -3889,6 +4126,7 @@ mod tests {
                 generation_recipe_json: String::new(),
                 recipe_signature: String::new(),
                 parser_version: String::new(),
+                content_fp: String::new(),
             })
             .unwrap()
         };
@@ -3972,6 +4210,7 @@ mod tests {
                 generation_recipe_json: String::new(),
                 recipe_signature: String::new(),
                 parser_version: String::new(),
+                content_fp: String::new(),
             })
             .unwrap()
         };
@@ -4038,6 +4277,7 @@ mod tests {
                 generation_recipe_json: String::new(),
                 recipe_signature: String::new(),
                 parser_version: String::new(),
+                content_fp: String::new(),
             })
             .unwrap()
         };

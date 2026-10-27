@@ -34,6 +34,30 @@ pub fn data_root(app: &tauri::AppHandle) -> PathBuf {
     }
 }
 
+/// 应用标识（与 `tauri.conf.json` 的 `identifier` 一致）。
+///
+/// 命令行入口没有 `AppHandle`，拿不到 `app_data_dir()` —— 只能按标识拼。
+/// 两处必须一致，否则 CLI 会去读另一个库。
+pub const APP_IDENTIFIER: &str = "com.aiimagesorter.app";
+
+/// 命令行入口用的数据根目录（没有 `AppHandle` 时的等价物）。
+pub fn data_root_for_cli() -> PathBuf {
+    if is_portable() {
+        let root = exe_dir()
+            .map(|d| d.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let _ = std::fs::create_dir_all(&root);
+        root
+    } else {
+        let root = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(APP_IDENTIFIER);
+        let _ = std::fs::create_dir_all(&root);
+        root
+    }
+}
+
 pub fn log_root_for_portable() -> Option<PathBuf> {
     is_portable().then(|| {
         let root = exe_dir()

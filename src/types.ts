@@ -98,6 +98,14 @@ export type Granularity = 0 | 1 | 2 | 3
  */
 export type L2Mode = 'text' | 'visual' | 'semantic'
 
+/**
+ * 设置页的分区（第 28 轮的信息架构）。
+ *
+ * 用途：**跨页联动**。别的页面（移动对话框的「模型建议」栏）会声明
+ * 「这些数字依赖哪个设置」，并给一个按钮直接跳到那一节 —— 用它做落点。
+ */
+export type SettingsSection = 'cluster' | 'signatures' | 'labels' | 'export' | 'diagnostics'
+
 export interface ModelFacet {
   model: string
   count: number
@@ -144,6 +152,14 @@ export interface ScanResult {
   scanned: number
   groups: number
   parse_errors: number
+  /**
+   * 识别出的改名数量（第 29 轮「改名不丢分拣」）。
+   *
+   * 路径变了但**行没换** → 评分 / 标签 / 手动分组全部保住。
+   */
+  renamed: number
+  /** 身份无法确认、被保留待确认的旧记录数量。 */
+  unconfirmed: number
 }
 
 export interface SyncProgress {
@@ -164,6 +180,67 @@ export interface SyncAllResult {
   pending: number
   reclustered: boolean
   parse_errors: number
+  /** 这一轮识别出的改名数量。 */
+  renamed: number
+  /** 身份无法确认、被保留待确认的旧记录数量。 */
+  unconfirmed: number
+}
+
+/**
+ * 身份无法确认的旧记录（第 29 轮）。
+ *
+ * 它的文件已经不在原路径上，而且按内容也认不出来 —— 所以**保留**，
+ * 交给用户决定是「它被删了」还是「它只是改了个我认不出的名」。
+ */
+export interface UnconfirmedImage {
+  id: number
+  abs_path: string
+  filename: string
+  reason: string
+}
+
+/**
+ * 签名覆盖率（第 30 轮）。
+ *
+ * 同步循环不再偷偷补算签名 —— 缺向量的图**保持原组、暂不参与聚类**，界面
+ * 必须如实说出来（纪律 #6：不做无声的搬动）。
+ */
+export interface SignatureCoverageDto {
+  /** 当前 L2 档位（text / visual / semantic）。 */
+  mode: string
+  /** 该档读哪个槽位（text 档为 null —— 它用词 Jaccard，不需要向量）。 */
+  slot: string | null
+  model_id: string | null
+  /** 分母：会参与聚类的图数。 */
+  total: number
+  /** 分子：已经有向量的图数。 */
+  computed: number
+}
+
+/** 「库恢复」的预览（第 29 轮）。 */export interface LibraryRecoveryPreview {
+  path: string
+  old_images: number
+  matched: number
+  unmatched_old: number
+  bindings: number
+  labels: number
+  scores: number
+  skipped_conflict: number
+  skipped_unmappable: number
+  /** 匹配依据的分布（内容键 / 元数据 / 内容哈希）。 */
+  basis: [string, number][]
+}
+
+/** 「库恢复」的执行结果。 */
+export interface LibraryRecoveryOutcome {
+  path: string
+  matched: number
+  bindings: number
+  labels: number
+  scores: number
+  skipped_conflict: number
+  skipped_unmappable: number
+  basis: [string, number][]
 }
 
 export interface GroupThumbDto {
