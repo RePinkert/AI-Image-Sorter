@@ -307,6 +307,17 @@ body,
   width: 100%;
 }
 
+/* 页眉：标题 + 右侧动作。
+   第 28 轮的信息架构：进入页与设置页原先只有一句 <h2>，页面里的分区
+   标题和它同级 —— 视觉上分不出「页标题」与「区块标题」。页眉把两者分开。 */
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
 h2 {
   margin-top: 0;
 }
@@ -492,6 +503,168 @@ select {
      min-width:0 会被最长文件名撑破。 */
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+/* 文件夹视图底部的操作提示（第 31 轮：间距走 class）。 */
+.folder-hint {
+  padding: 8px 16px;
+}
+
+/* ---------- 数据源页（进入页）的分区（第 28 轮） ----------
+   旧版三个区块用同一套 .source-list 平铺，读起来是「一堆列表」。
+   现在每个区块有自己的标题与间距：组间 28px，组内 12px（军规 09 亲疏）。 */
+.import-section {
+  margin-top: 28px;
+}
+.import-section-title {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--n-8);
+  /* 区块标题与页标题必须能一眼分开：字重 + 明度，不靠字号堆叠（军规 03）。 */
+  letter-spacing: 0.02em;
+}
+.import-section-toggle {
+  background: transparent;
+  color: var(--accent-300);
+  padding: 0;
+  font-size: 13px;
+  font-weight: 700;
+}
+.import-section-toggle:hover:not(:disabled) {
+  color: var(--n-9);
+}
+.import-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 14px 16px;
+  border-radius: var(--r-card);
+  background: var(--panel-2);
+}
+
+/* 改名识别不出来的旧记录（第 29 轮「改名不丢分拣」）。
+   这是一条**要用户决定**的通知 —— 不是错误，也不是可以忽略的噪音：
+   里面每一条都带着用户的评分 / 标签 / 手动分组。 */
+.import-note {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: var(--r-card);
+  background: var(--panel-2);
+}
+.import-note p {
+  margin: 0 0 8px;
+}
+.unconfirmed-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.unconfirmed-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.unconfirmed-list .path {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+/* 可选中的源行：整行是按钮，选中态用**强调色边框**（军规 16）。
+   旧版「查看分组 / 重新扫描」是两个同形按钮，用户分不清哪个能进主页面；
+   现在整行可选中，全页只有一个主操作「打开分组列表」（军规 06）。 */
+.source-select-list li {
+  border-bottom: 0;
+  padding: 0;
+  gap: 8px;
+}
+.source-item {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  border: 1px solid transparent;
+  border-radius: var(--r-control);
+  background: var(--panel-2);
+  color: var(--n-8);
+  text-align: left;
+  cursor: pointer;
+}
+.source-item:hover:not(:disabled) {
+  background: var(--n-3);
+  color: var(--n-9);
+}
+/* 选中侧显式强调（军规 04）：强调色边框 + 更亮的文字。 */
+.source-item.selected {
+  border-color: var(--accent);
+  color: var(--n-9);
+  font-weight: 700;
+}
+/* 竞争者显式弱化：未选中的行自己声明 color（上面已给 var(--n-8)）。 */
+.source-item:not(.selected) {
+  color: var(--n-7);
+}
+.source-item .path {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+}
+.source-item .origin {
+  color: var(--muted);
+  font-size: 11px;
+  flex: 0 0 auto;
+}
+
+/* ---------- 设置页的分区（第 28 轮） ----------
+   旧版 6 件事平铺在一个 .panel 里、且重要性倒序（标签在第一屏，
+   决定分组结果的「L2 聚类方式」在第三块）。现在按「什么时候会来」
+   分成四区，组间 32px、组内 16px。 */
+.settings-section {
+  margin-top: 32px;
+  padding: 18px 20px;
+  border-radius: var(--r-card);
+  background: var(--panel);
+}
+.settings-section-title {
+  margin: 0 0 4px;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--n-9);
+}
+.settings-section > .hint {
+  margin: 0 0 12px;
+}
+.settings-subsection {
+  margin-top: 16px;
+}
+.settings-subsection-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.settings-subsection-body .hint {
+  margin: 0;
+}
+.settings-subtitle {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--n-8);
+}
+/* 跨页联动落点的高亮：用**边框**而不是背景色块 —— 背景会盖住正文，
+   边框只说「你被送到了这里」（军规 16 强调色边框）。 */
+.settings-focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: var(--r-card);
 }
 
 .msg {
@@ -827,6 +1000,9 @@ select {
   justify-content: center;
   gap: 12px;
 }
+/* ? 31 ???? `border-width: 2px` ?? ?? `button { border: 0 }` ?
+   border-style ??? none???? 2px ??**???????**?
+   ? / ? ?????????????????19???????????? */
 .gesture-row button {
   min-width: 108px;
   padding: 10px 16px;
@@ -835,7 +1011,6 @@ select {
   flex-direction: column;
   align-items: center;
   gap: 2px;
-  border-width: 2px;
 }
 .gesture-row .gesture-center {
   width: 108px;
@@ -849,18 +1024,15 @@ select {
    权重与核心操作完全倒挂。降为辅助级：平时近乎隐身，悬停才显出破坏性语义。 */
 .gesture-left {
   background: var(--bad-100);
-  border-color: color-mix(in srgb, var(--bad-500) 45%, transparent);
   color: var(--bad-500);
 }
 .gesture-right {
   background: var(--good-100);
-  border-color: color-mix(in srgb, var(--good-500) 45%, transparent);
   color: var(--good-500);
 }
 .gesture-up,
 .gesture-down {
   background: transparent;
-  border-color: var(--n-4);
   color: var(--muted);
 }
 .gesture-row button .kbd {
@@ -875,7 +1047,6 @@ select {
 /* ghost 档（待优化 / 跳过）此前完全没有 hover 反馈 —— 游标悬上去毫无响应，
    用户无法确认按钮是活的。悬停时提亮边框与文字，与主档 hover 同构但更弱。 */
 .gesture-row button.ghost:hover:not(:disabled) {
-  border-color: var(--n-6);
   color: var(--n-8);
 }
 .gesture-row button.ghost:hover:not(:disabled) .kbd {
@@ -1478,7 +1649,10 @@ select {
   transition: box-shadow 0.15s;
 }
 .folder-item:hover {
-  border-color: var(--accent);
+  /* 悬停的强调边用 **box-shadow**（规则16：强调色边框）——
+     `border-color` 在规则19 删掉整框发丝边之后已经没有边框可染，
+     那是一条**死声明**（第 31 轮由 R20-border-visible 抓出来）。 */
+  box-shadow: 0 0 0 1px var(--accent-300);
 }
 .folder-item img {
   position: absolute;
@@ -1552,7 +1726,6 @@ select {
 }
 .folder-item.selected .batch-check {
   background: var(--accent);
-  border-color: var(--accent);
 }
 .batch-check {
   position: absolute;
@@ -1628,6 +1801,36 @@ select {
   font-size: 12px;
   font-weight: 700;
   color: var(--muted);
+}
+/* 「依赖：{变量}」声明（第 28 轮 · 跨页 UX 关联）。
+   这一栏的百分比由某个设置决定，而两个量纲（CLIP 余弦 / 词重合度）
+   **不可通约** —— 用户看不见这个差别，徽章就只剩颜色一条通道（军规 15）。
+   声明写在栏头，徽章的颜色随之退化为冗余强化。 */
+.move-dep {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 6px 0 12px;
+  padding: 6px 10px;
+  border-radius: var(--r-control);
+  background: var(--panel-2);
+  font-size: 12px;
+}
+.move-dep-label {
+  color: var(--muted);
+}
+.move-dep-var {
+  color: var(--n-9);
+  font-weight: 700;
+}
+.move-dep-value {
+  color: var(--n-7);
+}
+.move-dep-go {
+  margin-left: auto;
+  padding: 2px 6px;
+  font-size: 12px;
 }
 .move-target-list {
   min-width: 0;
@@ -2008,7 +2211,6 @@ select {
   border-radius: var(--r-control);
   margin-left: 8px;
   color: var(--accent);
-  border-color: var(--border);
   background: transparent;
   white-space: nowrap;
 }
@@ -2079,6 +2281,16 @@ select {
   gap: 12px;
   flex-wrap: wrap;
 }
+/* 第 31 轮：间距走 class，不走行内样式（v4 的 R-ia-inline）。 */
+.keymap-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--n-8);
+}
+.keymap-head-actions {
+  margin: 0;
+}
 .keymap-head .ghost {
   background: transparent;
 }
@@ -2125,7 +2337,8 @@ select {
   min-width: 130px;
 }
 .kb-key.kb-conflict {
-  border-color: var(--bad);
+  /* ?????????inset shadow??? ??????**????**
+     ??? button{border:0}????????? */
   box-shadow: 0 0 0 1px var(--bad) inset;
 }
 .kb-cap {
@@ -2268,11 +2481,11 @@ select {
   display: block;
   margin: auto;
 }
+/* ??????? `button:hover` ??????????19?? */
 .row-action:hover:not(:disabled) {
-  border-color: var(--accent);
+  color: var(--accent);
 }
 .row-action.row-action-danger:hover:not(:disabled) {
-  border-color: var(--bad);
   color: var(--bad);
 }
 .row-action:disabled {
@@ -2375,7 +2588,7 @@ select {
   text-align: left;
 }
 .move-target:hover:not(:disabled) {
-  border-color: var(--accent);
+  color: var(--accent);
 }
 .move-target:disabled {
   opacity: 0.5;

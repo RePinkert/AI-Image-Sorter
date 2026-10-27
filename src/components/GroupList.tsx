@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
   assetUrl,
@@ -6,6 +6,7 @@ import {
   errorMessage,
   getGroupThumbnails,
   hideGroupImages,
+  l2SignatureCoverage,
   listGroupImages,
   listGroups,
   listMoveTargets,
@@ -29,6 +30,7 @@ import {
   MODEL_DEVIATION_DIMENSIONS,
   MODEL_DEVIATION_DIMENSION_LABELS,
 } from '../types'
+import { MoveSuggestionHeader, MoveSuggestionEmpty } from './MoveSuggestionHeader'
 import { useStore } from '../store'
 import { GRANULARITY_LEVELS, groupLabel } from '../lib/groupLabel'
 import {
@@ -248,6 +250,7 @@ function LazyRowImages({
 
 export function GroupList() {
   const setView = useStore((s) => s.setView)
+  const setSettingsFocus = useStore((s) => s.setSettingsFocus)
   const groups = useStore((s) => s.groups)
   const setGroups = useStore((s) => s.setGroups)
   const setCurrentGroupKey = useStore((s) => s.setCurrentGroupKey)
@@ -365,6 +368,28 @@ export function GroupList() {
       if (request === groupRequestRef.current) setLoadingGroups(false)
     }
   }
+
+  /**
+   * 刷新「缺向量」的图数（第 30 轮）。
+   *
+   * 同步循环不再偷偷补算签名 → 缺向量的图保持原组 → 界面要如实说出来。
+   */
+  const refreshCoverage = useCallback(async (sourceId: number | null) => {
+    if (sourceId == null) {
+      setCoverageMissing(0)
+      return
+    }
+    try {
+      const coverage = await l2SignatureCoverage(sourceId)
+      setCoverageMissing(Math.max(0, coverage.total - coverage.computed))
+    } catch {
+      setCoverageMissing(0)
+    }
+  }, [])
+
+  useEffect(() => {
+    void refreshCoverage(currentSourceId)
+  }, [currentSourceId, dataRevision, refreshCoverage])
 
   useEffect(() => {
     if (groups.length === 0 && sources.length > 0) {
@@ -504,6 +529,13 @@ export function GroupList() {
 
   const syncProgress = useStore((s) => s.syncProgress)
   const syncing = syncProgress.active && syncProgress.pending > 0
+  /**
+   * 缺向量的图数（第 30 轮）。
+   *
+   * 同步循环**不再**偷偷补算签名（那是未经批准的持续占用 CPU），所以缺
+   * 向量的图保持原组、暂不参与聚类 —— 界面必须如实说出来（纪律 #6）。
+   */
+  const [coverageMissing, setCoverageMissing] = useState(0)
   const l2ListView = useStore((s) => s.l2ListView)
   const setL2ListView = useStore((s) => s.setL2ListView)
   const listMode = granularity === 2 && l2ListView
@@ -524,6 +556,8 @@ export function GroupList() {
   } | null>(null)
   const [moveTargets, setMoveTargets] = useState<GroupInfo[] | null>(null)
   const [moveSuggestions, setMoveSuggestions] = useState<MoveSuggestion[]>([])
+  /** 推荐是否还在算 —— 「可能相关」一栏算完之前不能说「没有可推荐」。 */
+  const [moveLoading, setMoveLoading] = useState(false)
   const [moveBusy, setMoveBusy] = useState(false)
 
   function selectionOf(key: string): number[] {
@@ -594,10 +628,12 @@ export function GroupList() {
       })
       setMoveTargets(targets)
       setMoveSuggestions([])
-      // 「可能相关」：推荐失败不该挡住主流程。
+      setMoveLoading(true)
+      // 建议可能失败（本地数据不足时）—— 吞掉错误，不让整栏炸掉。
       void suggestMoveTargets(currentSourceId, ids, rowKey)
         .then((list) => setMoveSuggestions(list.slice(0, 12)))
         .catch(() => undefined)
+        .finally(() => setMoveLoading(false))
     } catch (e) {
       setRowActionMsg(`加载迁移目标失败：${errorMessage(e)}`)
     } finally {
@@ -714,7 +750,7 @@ export function GroupList() {
   }
 
   return (
-    <div className="panel">
+    <div className="panel" data-view="groups">
       <h2>分组列表</h2>
       <div className="row">
         <select
@@ -733,8 +769,14 @@ export function GroupList() {
             </option>
           ))}
         </select>
-        <button type="button" className="btn-secondary" onClick={() => setView('import')}>+ 导入新源</button>
-        <button type="button" className="btn-secondary" onClick={() => setView('settings')}>标签设置 / 导出</button>
+        <button
+          type="button"
+          className="btn-secondary"
+          data-nav="import"
+          onClick={() => setView('import')}
+        >
+          + 导入新源
+        </button>
         {granularity === 2 && (
           <button
             type="button"
@@ -758,6 +800,18 @@ export function GroupList() {
             {mergeMode ? '合并分组…' : '合并分组'}
           </button>
         )}
+        {/* 设置是**辅助**动作（军规 06），放在工具栏最右 —— 它通向的那一页
+            主要是配置，不是当前页面的主任务。旧版把它写成「标签设置 / 导出」，
+            说的恰是那一页里最不重要的两项 —— 现在只说「设置」，内容写进 title。 */}
+        <button
+          type="button"
+          className="btn-tertiary"
+          data-nav="settings"
+          title="聚类方式与模型签名 / 标签与手势 / 导出与归档 / 行为记录"
+          onClick={() => setView('settings')}
+        >
+          设置
+        </button>
       </div>
 
       <div className="granularity-bar">
@@ -811,6 +865,21 @@ export function GroupList() {
       )}
       {syncing && (
         <p className="sync-warn">扫描进行中，分组数据可能不完整。</p>
+      )}
+      {coverageMissing > 0 && (
+        <p className="sync-warn" role="status">
+          有 {coverageMissing} 张还没有模型向量，暂未参与聚类（它们保持原组）。
+          <button
+            type="button"
+            className="btn-tertiary"
+            onClick={() => {
+              setSettingsFocus('signatures')
+              setView('settings')
+            }}
+          >
+            去计算
+          </button>
+        </p>
       )}
       {mergeMode && granularity === 2 && (
         <div className="merge-bar">
@@ -1094,11 +1163,14 @@ export function GroupList() {
                   </div>
                 </section>
                 <section className="move-column">
-                  <h4 className="move-column-title">
-                    可能相关 <span className="muted">{moveSuggestions.length}</span>
-                  </h4>
+                  <MoveSuggestionHeader
+                    basis={moveSuggestions[0]?.basis ?? null}
+                    count={moveSuggestions.length}
+                    loading={moveLoading}
+                    onNavigate={closeMoveDialog}
+                  />
                   {moveSuggestions.length === 0 ? (
-                    <p className="muted">没有可推荐的目标组（需要先识图，或选中图与其它组差异过大）。</p>
+                    <MoveSuggestionEmpty basis={moveSuggestions[0]?.basis ?? null} loading={moveLoading} />
                   ) : (
                     <div className="move-target-picker">
                       {moveSuggestions.map((s) => (

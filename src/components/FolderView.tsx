@@ -19,6 +19,7 @@ import type { ImageRow } from '../types'
 import { useStore } from '../store'
 import { matchesBinding } from '../keymap'
 import { Lightbox } from './Lightbox'
+import { MoveSuggestionHeader, MoveSuggestionEmpty } from './MoveSuggestionHeader'
 import { FolderAxisStrip } from './FolderAxisStrip'
 import { PromptRecommendPanel } from './PromptRecommendPanel'
 import { granularityLabel, groupLabel, groupLabelCompact } from '../lib/groupLabel'
@@ -82,6 +83,8 @@ export function FolderView() {
   const [moveTargets, setMoveTargets] = useState<import('../types').GroupInfo[] | null>(null)
   const [moveThumbs, setMoveThumbs] = useState<Record<string, string[]>>({})
   const [moveSuggestions, setMoveSuggestions] = useState<import('../types').MoveSuggestion[]>([])
+  /** 推荐是否还在算 —— 「可能相关」一栏算完之前不能说「没有可推荐」。 */
+  const [moveLoading, setMoveLoading] = useState(false)
   const [moveBusy, setMoveBusy] = useState(false)
   /** 组内「疑似错分」的图（image_id → 信息）。 */
   const [outliers, setOutliers] = useState<Record<number, import('../types').OutlierInfo>>({})
@@ -415,13 +418,19 @@ export function FolderView() {
       const moveList = await listMoveTargets(currentSourceId, currentGroupKey)
       setMoveTargets(moveList)
       setMoveSuggestions([])
-      const [thumbs, suggestions] = await Promise.all([
-        getGroupThumbnails(moveList.map((g) => g.group_key), 2),
-        // 「可能相关」：推荐失败不该挡住主流程 —— 全部组那一列照常可用。
-        suggestMoveTargets(currentSourceId, targets, currentGroupKey).catch(() => []),
-      ])
-      setMoveThumbs(Object.fromEntries(thumbs.map((x) => [x.group_key, x.thumb_paths])))
-      setMoveSuggestions(suggestions.slice(0, 12))
+      setMoveLoading(true)
+      try {
+        const [thumbs, suggestions] = await Promise.all([
+          getGroupThumbnails(moveList.map((g) => g.group_key), 2),
+          // 建议可能失败（本地数据不足时）—— 吞掉错误，不让整栏炸掉。
+          suggestMoveTargets(currentSourceId, targets, currentGroupKey).catch(() => []),
+        ])
+        setMoveThumbs(Object.fromEntries(thumbs.map((x) => [x.group_key, x.thumb_paths])))
+        setMoveSuggestions(suggestions.slice(0, 12))
+      } finally {
+        // 无论成败都得把 loading 放下 —— 否则这一栏会永远显示「正在计算…」。
+        setMoveLoading(false)
+      }
     } catch (e) { setActionError(`读取目标分组失败：${errorMessage(e)}`) }
   }
 
@@ -704,7 +713,7 @@ export function FolderView() {
           })}
         </div>
       )}
-      <p className="muted hint" style={{ padding: '8px 16px' }}>
+      <p className="muted hint folder-hint">
         单击图片放大 · 屏蔽可随时取消 · 删除送入系统回收站可从桌面恢复 · 批量管理支持全选 / 批量删除 / 批量取消屏蔽
       </p>
       {lightbox && (
@@ -748,11 +757,14 @@ export function FolderView() {
                 )}
               </section>
               <section className="move-column">
-                <h4 className="move-column-title">
-                  可能相关 <span className="muted">{moveSuggestions.length}</span>
-                </h4>
+                <MoveSuggestionHeader
+                  basis={moveSuggestions[0]?.basis ?? null}
+                  count={moveSuggestions.length}
+                  loading={moveLoading}
+                  onNavigate={() => setMoveTargets(null)}
+                />
                 {moveSuggestions.length === 0 ? (
-                  <p className="muted">没有可推荐的目标组（需要先识图，或选中图与其它组差异过大）。</p>
+                  <MoveSuggestionEmpty basis={moveSuggestions[0]?.basis ?? null} loading={moveLoading} />
                 ) : (
                   <div className="move-target-list">
                     {moveSuggestions.map((s) => (

@@ -84,11 +84,23 @@ function webBridge() {
         if (!req.url?.startsWith('/api/')) return next()
         if (isTauri(req)) return next()
 
-        const dbPath = path.join(
+        // The dev bridge reads the **real** library, read-only. Which file is
+        // "the real one" depends on how the app was launched: the portable
+        // build (marker next to the exe) keeps its library in `exe/data/`,
+        // the installed build uses the OS app-data dir. Prefer the portable
+        // one when it exists — otherwise the dev preview silently shows a
+        // **stale copy** (that is exactly how the appdata copy became a
+        // months-old orphan during round 29).
+        const portableDb = path.join(
+          process.cwd(),
+          'src-tauri', 'target', 'release', 'data', 'ai-image-sorter.db',
+        )
+        const installedDb = path.join(
           process.env.APPDATA ?? path.join(process.env.USERPROFILE ?? '', 'AppData', 'Roaming'),
           'com.aiimagesorter.app',
           'ai-image-sorter.db',
         )
+        const dbPath = fs.existsSync(portableDb) ? portableDb : installedDb
         const send = (status: number, body: unknown, contentType = 'application/json') => {
           res.statusCode = status
           res.setHeader('Content-Type', contentType)
@@ -167,6 +179,30 @@ function webBridge() {
             send(200, srcRows)
           } else if (url.pathname === '/api/labels') {
             send(200, db.prepare('SELECT id, name, gesture, color FROM labels ORDER BY id').all())
+          } else if (url.pathname === '/api/l2-signature-coverage') {
+            // 第 30 轮：签名覆盖率（同步循环不再偷偷补算 → 缺向量的图保持
+            // 原组 → 界面要如实说出来）。口径与后端 `l2_signature_coverage`
+            // 一致：文本档不需要向量 → slot 为 null。
+            const sourceId = Number(url.searchParams.get('sourceId') ?? 0)
+            const mode = sourceCols.has('l2_mode')
+              ? String((db.prepare('SELECT l2_mode FROM sources WHERE id=?').get(sourceId) as { l2_mode?: string } | undefined)?.l2_mode ?? 'text')
+              : 'text'
+            const spec = mode === 'visual'
+              ? { slot: 'vision', modelId: 'clip-vit-b32-q' }
+              : mode === 'semantic'
+                ? { slot: 'text', modelId: 'bge-small-zh-q' }
+                : null
+            if (!spec || !tableExists('image_signatures')) {
+              send(200, { mode, slot: spec?.slot ?? null, model_id: spec?.modelId ?? null, total: 0, computed: 0 })
+            } else {
+              const total = spec.slot === 'text'
+                ? (db.prepare("SELECT COUNT(*) AS count FROM images WHERE source_id=? AND prompt_pos != ''").get(sourceId) as { count: number }).count
+                : (db.prepare('SELECT COUNT(*) AS count FROM images WHERE source_id=?').get(sourceId) as { count: number }).count
+              const computed = (db.prepare(
+                'SELECT COUNT(*) AS count FROM image_signatures s JOIN images i ON i.id=s.image_id WHERE i.source_id=? AND s.slot=? AND s.model_id=?',
+              ).get(sourceId, spec.slot, spec.modelId) as { count: number }).count
+              send(200, { mode, slot: spec.slot, model_id: spec.modelId, total, computed })
+            }
           } else if (url.pathname === '/api/workflow-templates') {
             if (!tableExists('workflow_templates')) {
               send(200, [])

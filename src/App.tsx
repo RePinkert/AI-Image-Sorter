@@ -146,7 +146,14 @@ export default function App() {
         // refetch so the UI doesn't churn every 8 seconds.
         const pendingChanged = result.pending > 0 && result.pending !== lastPending
         lastPending = result.pending
-        const hadWork = result.added > 0 || pendingChanged || result.reclustered || result.parse_errors > 0
+        // 「改名识别」也算真活干（库里换了路径 → 列表要刷新）。
+        // 「待确认」**不算** —— 那些记录一直都在，每轮都数一遍会让顶栏一直闪。
+        const hadWork =
+          result.added > 0 ||
+          pendingChanged ||
+          result.reclustered ||
+          result.parse_errors > 0 ||
+          result.renamed > 0
         if (hadWork) {
           const sources = await listSources()
           setSources(sources)
@@ -162,6 +169,8 @@ export default function App() {
             pending_count: result.pending,
             parse_error_count: result.parse_errors,
             reclustered: result.reclustered,
+            renamed_count: result.renamed,
+            unconfirmed_count: result.unconfirmed,
             duration_ms: Date.now() - startedAt,
           })
         }
@@ -171,7 +180,21 @@ export default function App() {
           setSyncState('idle', '')
           resetSyncProgress()
         } else {
-          setSyncState('success', `同步完成：已检查 ${result.sources} 个目录${result.added > 0 ? `，新增 ${result.added} 张` : ''}${result.pending > 0 ? `，待扫描 ${result.pending} 张` : ''}${result.parse_errors > 0 ? `，解析失败 ${result.parse_errors} 张` : ''}`)
+          // 说什么，取决于**真的发生了什么**（第 30 轮）。
+          //
+          // 旧版固定带一句「已检查 1 个目录」—— 那不是用户关心的事（他自己
+          // 知道库里有几个目录），而且在什么都没发生的时候也照报。军规 05
+          // 说的就是这种冗余标签：只说变化。
+          const parts: string[] = []
+          if (result.added > 0) parts.push(`新增 ${result.added} 张`)
+          if (result.pending > 0) parts.push(`待扫描 ${result.pending} 张`)
+          if (result.parse_errors > 0) parts.push(`解析失败 ${result.parse_errors} 张`)
+          // 改名识别（第 29 轮）必须**说出来** —— 库变了，用户有权知道。
+          if (result.renamed > 0) {
+            parts.push(`识别出 ${result.renamed} 个改名并已按内容更新记录`)
+          }
+          if (result.unconfirmed > 0) parts.push(`${result.unconfirmed} 条记录待确认`)
+          setSyncState('success', parts.length > 0 ? `同步完成：${parts.join('，')}` : '同步完成')
           // Once nothing is left pending the stale progress would otherwise
           // keep the "还有 X 张未扫描" warning alive forever on no-op polls.
           if (result.pending === 0) resetSyncProgress()

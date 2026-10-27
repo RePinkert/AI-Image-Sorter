@@ -1,9 +1,22 @@
 import { useCallback, useEffect, useState } from 'react'
 import { listen } from '@tauri-apps/api/event'
-import { deleteLabel, errorMessage, isWebDev, listLabels, upsertLabel } from '../api'
+import {
+  applyLibraryRecovery,
+  deleteLabel,
+  errorMessage,
+  isWebDev,
+  listLabels,
+  listLibraryCandidates,
+  pickDatabaseFile,
+  previewLibraryRecovery,
+  upsertLabel,
+} from '../api'
 import type {
   L2Mode,
   LabelRow,
+  LibraryRecoveryOutcome,
+  LibraryRecoveryPreview,
+  SignatureCoverageDto,
   SignatureProgressDto,
   TextCoverageDto,
   TextStatusDto,
@@ -29,6 +42,33 @@ function ClusterSection() {
   const granularity = useStore((s) => s.granularity)
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState<string | null>(null)
+  /**
+   * 当前档位的签名覆盖率（第 30 轮）。
+   *
+   * 同步循环不再偷偷补算签名 → 缺向量的图保持原组 → 覆盖率必须**如实**
+   * 摆在这里（用户才知道「为什么有几张没参与聚类」）。
+   */
+  const [coverage, setCoverage] = useState<SignatureCoverageDto | null>(null)
+
+  useEffect(() => {
+    let alive = true
+    if (currentSourceId == null) {
+      setCoverage(null)
+      return
+    }
+    void (async () => {
+      try {
+        const { l2SignatureCoverage } = await import('../api')
+        const c = await l2SignatureCoverage(currentSourceId)
+        if (alive) setCoverage(c)
+      } catch {
+        if (alive) setCoverage(null)
+      }
+    })()
+    return () => {
+      alive = false
+    }
+  }, [currentSourceId, l2Mode])
 
   // 三种量纲：文本是 Jaccard，视觉是 CLIP 余弦，语义是 BGE 余弦。
   // 阈值**分开存** —— 0.75 是 CLIP 的值，绝不可沿用到 BGE（量纲不同）。
@@ -76,7 +116,7 @@ function ClusterSection() {
 
   return (
     <div className="msg">
-      <h3 style={{ marginTop: 0 }}>L2 聚类方式</h3>
+      <h3 className="settings-subtitle">L2 聚类方式</h3>
       <p className="hint">
         <strong>文本</strong>：按 prompt 的词重合度分组（历史行为）。
         <strong>视觉</strong>：按图像的实际相似度分组 —— 实测在真实语料上，
@@ -120,6 +160,16 @@ function ClusterSection() {
           <b>语义档的余弦阈值尚未标定。</b>0.75 是<b>视觉</b>档的值，两者的量纲不同，
           绝不可沿用。当前 0.70 是暂定值 —— 阶段七轮 3 会用「合成语料判别力 +
           你自己的分组反标定」给出建议值，仍需你按「应用并重新聚类」才生效。
+        </p>
+      )}
+      {coverage && coverage.slot != null && (
+        <p className="hint">
+          本档用<b>{coverage.mode === 'visual' ? '视觉' : '语义'}</b>向量聚类，
+          当前覆盖 <strong>{coverage.computed}</strong> / {coverage.total} 张
+          {coverage.computed < coverage.total && (
+            <> —— 还有 {coverage.total - coverage.computed} 张没有向量，
+            它们<b>保持原组、暂未参与聚类</b>（计算只在你点按钮时发生，不会偷偷跑）。</>
+          )}
         </p>
       )}
       {cosine && !semantic && (
@@ -217,7 +267,7 @@ function SignatureSection() {
 
   return (
     <div className="msg">
-      <h3 style={{ marginTop: 0 }}>识图（视觉签名）</h3>
+      <h3 className="settings-subtitle">识图（视觉签名）</h3>
       <p className="hint">
         在本机跑视觉模型，给每张图算一个向量。向量用于语义聚类与「可能相关」推荐 ——
         全程离线，不上传任何图片。CPU 约 3 张/秒，1000 张需要几分钟；已算过的会跳过。
@@ -396,7 +446,7 @@ function TextSignatureSection() {
 
   return (
     <div className="msg">
-      <h3 style={{ marginTop: 0 }}>文本塔（prompt 语义）</h3>
+      <h3 className="settings-subtitle">文本塔（prompt 语义）</h3>
       <p className="hint">
         在本机给每条 prompt 算一个语义向量，用于<b>语义档</b>聚类与后续的双塔融合。
         它<b>不读图</b>，只吃 prompt 文本 —— 所以比识图快得多（1000 条约十几秒）。
@@ -449,6 +499,8 @@ function TextSignatureSection() {
 export function Settings() {
   const setView = useStore((s) => s.setView)
   const setLabels = useStore((s) => s.setLabels)
+  const settingsFocus = useStore((s) => s.settingsFocus)
+  const setSettingsFocus = useStore((s) => s.setSettingsFocus)
   const [rows, setRows] = useState<LabelRow[]>([])
   const [draft, setDraft] = useState({ name: '', gesture: 'left', color: '#888888' })
   const [showKeymap, setShowKeymap] = useState(false)
@@ -474,6 +526,26 @@ export function Settings() {
   useEffect(() => {
     void refresh()
   }, [])
+
+  /**
+   * 跨页联动落点（第 28 轮）。
+   *
+   * 别的页面（移动对话框的「模型建议」栏）会声明「这列数字依赖哪个设置」，
+   * 并给一个「去调整」按钮 —— 它把 `settingsFocus` 设成目标分区后跳到这里。
+   * 本 effect 负责滚过去并短暂高亮，让用户看见自己「被送到了哪」。
+   *
+   * 高亮用**强调色边框**（军规 16）而不是背景色块 —— 背景色块会盖住
+   * 这一节的正文，边框只提示位置。
+   */
+  useEffect(() => {
+    if (!settingsFocus) return
+    const el = document.querySelector<HTMLElement>(`[data-section="${settingsFocus}"]`)
+    if (!el) return
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    el.classList.add('settings-focus')
+    const timer = window.setTimeout(() => el.classList.remove('settings-focus'), 2600)
+    return () => window.clearTimeout(timer)
+  }, [settingsFocus, loading])
 
   async function add() {
     if (!draft.name.trim()) return
@@ -504,96 +576,283 @@ export function Settings() {
   }
 
   return (
-    <div className="panel">
-      <h2>自定义标签 / 手势映射</h2>
-      <p className="hint">每个手势映射到一个标签。滑动该方向时，图片会被打上对应标签并更新评分。</p>
-      {loading && <p className="muted" role="status">正在加载标签…</p>}
-      {error && <p className="action-error" role="alert">{error}</p>}
-      {!loading && !error && rows.length === 0 && <p className="muted">暂无标签。</p>}
-      <table className="label-table">
-        <thead>
-          <tr>
-            <th>标签</th>
-            <th>手势</th>
-            <th>颜色</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r) => (
-            <tr key={r.id}>
-              <td>{r.name}</td>
-              <td>{r.gesture}</td>
-              <td>
-                <span className="color-dot" style={{ background: r.color ?? '#888' }} />
-              </td>
-              <td>
-                <button className="btn-danger" type="button" disabled={busy} onClick={() => void remove(r.id)}>删除</button>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-
-      <div className="row">
-        <input
-          placeholder="标签名"
-          value={draft.name}
-          onChange={(e) => setDraft({ ...draft, name: e.target.value })}
-        />
-        <select
-          value={draft.gesture}
-          onChange={(e) => setDraft({ ...draft, gesture: e.target.value })}
+    <div className="panel" data-view="settings">
+      <div className="panel-head">
+        <h2>设置</h2>
+        <button
+          className="btn-tertiary"
+          type="button"
+          onClick={() => {
+            setSettingsFocus(null)
+            setView('groups')
+          }}
         >
-          {GESTURES.map((g) => (
-            <option key={g} value={g}>
-              {g}
-            </option>
-          ))}
-        </select>
-        <input
-          type="color"
-          value={draft.color}
-          onChange={(e) => setDraft({ ...draft, color: e.target.value })}
-        />
-        <button className="btn-secondary" type="button" disabled={busy || loading} onClick={() => void add()}>
-          添加
+          返回分组列表
         </button>
       </div>
 
-      <div className="row">
-        <button className="btn-tertiary" type="button" onClick={() => setView('groups')}>
-          返回
-        </button>
-        <button type="button" className={showKeymap ? 'gran-active' : ''} onClick={() => setShowKeymap(!showKeymap)}>
-          {showKeymap ? '收起键位设置' : '键位设置'}
-        </button>
-        <ExportButtons />
-      </div>
+      {/* ---- 分区 1 · 聚类与模型（最重要：它决定分组怎么分） ----
+           阶段七档 2/3/5 的新设置项全部落在这里 —— 这一节必须先有分区，
+           否则新旋钮只会往一个平铺的长列表上继续叠。 */}
+      <section className="settings-section" data-section="cluster">
+        <h3 className="settings-section-title">聚类与模型</h3>
+        <p className="hint">这一节决定「什么算同一组」。改动需要按「应用并重新聚类」才生效。</p>
+        <ClusterSection />
+        <div className="settings-subsection" data-section="signatures">
+          <SignatureSection />
+          <TextSignatureSection />
+        </div>
+      </section>
 
-      {showKeymap && <KeymapPanel />}
+      {/* ---- 分区 2 · 标签与手势（配一次就不动） ---- */}
+      <section className="settings-section" data-section="labels">
+        <h3 className="settings-section-title">标签与手势</h3>
+        <p className="hint">每个手势映射到一个标签。滑动该方向时，图片会被打上对应标签并更新评分。</p>
+        {loading && <p className="muted" role="status">正在加载标签…</p>}
+        {error && <p className="action-error" role="alert">{error}</p>}
+        {!loading && !error && rows.length === 0 && (
+          <p className="muted">还没有标签。在下面加一个，例如「差」对应向左滑。</p>
+        )}
+        <table className="label-table">
+          <thead>
+            <tr>
+              <th>标签</th>
+              <th>手势</th>
+              <th>颜色</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.id}>
+                <td>{r.name}</td>
+                <td>{r.gesture}</td>
+                <td>
+                  <span className="color-dot" style={{ background: r.color ?? '#888' }} />
+                </td>
+                <td>
+                  <button className="btn-danger" type="button" disabled={busy} onClick={() => void remove(r.id)}>删除</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
 
-      <div className="msg settings-telemetry">
-        <h3 style={{ marginTop: 0 }}>本地行为记录</h3>
-        <label className="check">
+        <div className="row">
           <input
-            type="checkbox"
-            checked={telemetryEnabled}
-            onChange={(event) => {
-              const enabled = event.target.checked
-              setTelemetryEnabledState(enabled)
-              setTelemetryEnabled(enabled)
-            }}
+            placeholder="标签名"
+            value={draft.name}
+            onChange={(e) => setDraft({ ...draft, name: e.target.value })}
           />
-          启用本地事件记录
-        </label>
-        <button type="button" onClick={exportDiagnostics}>导出脱敏诊断</button>
-        <BuildStamp />
-      </div>
+          <select
+            value={draft.gesture}
+            onChange={(e) => setDraft({ ...draft, gesture: e.target.value })}
+          >
+            {GESTURES.map((g) => (
+              <option key={g} value={g}>
+                {g}
+              </option>
+            ))}
+          </select>
+          <input
+            type="color"
+            value={draft.color}
+            onChange={(e) => setDraft({ ...draft, color: e.target.value })}
+          />
+          <button className="btn-secondary" type="button" disabled={busy || loading} onClick={() => void add()}>
+            添加
+          </button>
+        </div>
 
-      <ClusterSection />
-      <SignatureSection />
-      <TextSignatureSection />
+        <div className="row">
+          <button type="button" className="btn-tertiary" onClick={() => setShowKeymap(!showKeymap)}>
+            {showKeymap ? '收起键位设置' : '键位设置'}
+          </button>
+        </div>
+
+        {showKeymap && <KeymapPanel />}
+      </section>
+
+      {/* ---- 分区 3 · 导出与归档 ---- */}
+      <section className="settings-section" data-section="export">
+        <h3 className="settings-section-title">导出与归档</h3>
+        <p className="hint">把分组结果导出成表格，或把高分图复制到一个文件夹。</p>
+        <div className="row">
+          <ExportButtons />
+        </div>
+        <div className="msg settings-subsection" data-section="recovery">
+          <h3 className="settings-subtitle">库恢复</h3>
+          <LibraryRecovery />
+        </div>
+      </section>
+
+      {/* ---- 分区 4 · 行为记录与构建 ---- */}
+      <section className="settings-section" data-section="diagnostics">
+        <h3 className="settings-section-title">行为记录与构建</h3>
+        <div className="msg settings-telemetry">
+          <h3 className="settings-subtitle">本地行为记录</h3>
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={telemetryEnabled}
+              onChange={(event) => {
+                const enabled = event.target.checked
+                setTelemetryEnabledState(enabled)
+                setTelemetryEnabled(enabled)
+              }}
+            />
+            启用本地事件记录
+          </label>
+          <button type="button" onClick={exportDiagnostics}>导出脱敏诊断</button>
+          <BuildStamp />
+        </div>
+      </section>
+    </div>
+  )
+}
+
+/**
+ * 库恢复（第 29 轮）。
+ *
+ * ## 它解决什么
+ *
+ * 图片在库里的身份是**路径**。用户在应用之外改名 → 扫描时旧行被删、新行
+ * 被插 → `image_id` 变了 → 评分 / 标签 / 手动分组全部消失。
+ *
+ * 扫描期的「改名不丢分拣」能救回**还没被删**的那部分；已经被删掉的呢？
+ * **旧库文件往往还在** —— 换了发行方式（安装版 → 便携版）、换了应用数据
+ * 目录之后，老的库就成了「没人用的副本」，里面还留着分拣结果。
+ *
+ * 这里的能力：拿旧库按**内容身份**（尺寸+种子+prompt → 元数据 → 内容
+ * 哈希）认领回当前库，把手工分拣结果搬回来，并如实报告搬回来多少。
+ *
+ * 口径：**当前库已有的优先** —— 冲突时不动当前库的值（用户后做的决定
+ * 算数）。
+ */
+function LibraryRecovery() {
+  const [candidates, setCandidates] = useState<string[]>([])
+  const [chosen, setChosen] = useState<string>('')
+  const [preview, setPreview] = useState<LibraryRecoveryPreview | null>(null)
+  const [outcome, setOutcome] = useState<LibraryRecoveryOutcome | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  async function findCandidates() {
+    setBusy(true)
+    setError('')
+    setOutcome(null)
+    setPreview(null)
+    try {
+      const rows = await listLibraryCandidates()
+      setCandidates(rows)
+      setChosen(rows[0] ?? '')
+      if (rows.length === 0) setError('没有找到旧库文件。可以自己选一个库文件。')
+    } catch (cause) {
+      setError(`查找旧库失败：${errorMessage(cause)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function runPreview() {
+    if (!chosen) return
+    setBusy(true)
+    setError('')
+    setOutcome(null)
+    try {
+      setPreview(await previewLibraryRecovery(chosen))
+    } catch (cause) {
+      setError(`预览失败：${errorMessage(cause)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function runApply() {
+    if (!chosen) return
+    setBusy(true)
+    setError('')
+    try {
+      const result = await applyLibraryRecovery(chosen)
+      setOutcome(result)
+      setPreview(null)
+    } catch (cause) {
+      setError(`找回失败：${errorMessage(cause)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="settings-subsection-body">
+      <p className="hint">
+        如果你在应用之外改过文件名，手工分组可能已经对不上了。旧库还在的话，
+        可以按图片内容（尺寸、种子、prompt）把分拣结果找回来。
+      </p>
+      <div className="row">
+        <button type="button" className="btn-secondary" disabled={busy} onClick={() => void findCandidates()}>
+          查找旧库
+        </button>
+        <button
+          type="button"
+          className="btn-tertiary"
+          disabled={busy}
+          onClick={async () => {
+            const picked = await pickDatabaseFile()
+            if (!picked) return
+            setCandidates([picked])
+            setChosen(picked)
+            setPreview(null)
+            setOutcome(null)
+          }}
+        >
+          手动选择库文件
+        </button>
+      </div>
+      {candidates.length > 0 && (
+        <div className="row">
+          <select value={chosen} onChange={(e) => { setChosen(e.target.value); setPreview(null); setOutcome(null) }}>
+            {candidates.map((path) => (
+              <option key={path} value={path}>{path}</option>
+            ))}
+          </select>
+          <button type="button" className="btn-secondary" disabled={busy || !chosen} onClick={() => void runPreview()}>
+            预览
+          </button>
+          {preview && (
+            <button type="button" className="btn-secondary" disabled={busy} onClick={() => void runApply()}>
+              找回
+            </button>
+          )}
+        </div>
+      )}
+      {preview && (
+        <div className="msg" role="status">
+          <p>
+            旧库 {preview.old_images} 张，能按内容认领 {preview.matched} 张。
+            可找回：手动分组 {preview.bindings} 条、标签 {preview.labels} 个、评分 {preview.scores} 条。
+          </p>
+          <p className="muted">
+            匹配依据：
+            {preview.basis.map(([name, count]) => `${name} ${count} 张`).join(' · ') || '无'}
+            {preview.skipped_conflict > 0 ? ` · 当前库已有而跳过 ${preview.skipped_conflict} 条` : ''}
+            {preview.skipped_unmappable > 0 ? ` · 组对不上而跳过 ${preview.skipped_unmappable} 条` : ''}
+          </p>
+        </div>
+      )}
+      {outcome && (
+        <div className="msg" role="status">
+          <p>
+            已找回：手动分组 {outcome.bindings} 条、标签 {outcome.labels} 个、评分 {outcome.scores} 条
+            （认领 {outcome.matched} 张）。
+          </p>
+          <p className="muted">
+            匹配依据：{outcome.basis.map(([name, count]) => `${name} ${count} 张`).join(' · ') || '无'}
+            {outcome.skipped_conflict > 0 ? ` · 当前库已有而跳过 ${outcome.skipped_conflict} 条` : ''}
+          </p>
+        </div>
+      )}
+      {error && <span className="sync-error" role="alert">{error}</span>}
     </div>
   )
 }

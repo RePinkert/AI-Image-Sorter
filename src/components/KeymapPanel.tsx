@@ -143,8 +143,8 @@ export function KeymapPanel() {
   return (
     <div className="keymap-panel">
       <div className="keymap-head">
-        <h3 style={{ margin: 0 }}>键位设置（可视化）</h3>
-        <div className="row" style={{ margin: 0 }}>
+        <h3 className="keymap-title">键位设置（可视化）</h3>
+        <div className="row keymap-head-actions">
           <button type="button" className="ghost" onClick={resetKeybindings} title="恢复所有按键为默认值">
             恢复默认
           </button>

@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import type { GroupInfo, Granularity, L2Mode, LabelRow, SourceRow, SyncProgress } from './types'
+import type { GroupInfo, Granularity, L2Mode, LabelRow, SettingsSection, SourceRow, SyncProgress } from './types'
 import { DEFAULT_KEYMAP, type Binding, type Keymap } from './keymap'
 import { invalidateGroupCaches } from './lib/groupCache'
 
@@ -110,6 +110,13 @@ interface AppState {
    *  off instantly if it regresses. */
   l2ListView: boolean
   setL2ListView: (on: boolean) => void
+  /** 跨页联动：设置页要聚焦到哪一节。
+   *
+   *  从别的页面跳过来时带上（移动对话框的「模型建议」栏会声明
+   *  「这列数字依赖 L2 聚类方式」并给一个「去调整」按钮）。null = 不聚焦。
+   *  **不持久化** —— 它是一次性的落点，不是偏好。 */
+  settingsFocus: SettingsSection | null
+  setSettingsFocus: (s: SettingsSection | null) => void
   setView: (v: View) => void
   setSources: (s: SourceRow[]) => void
   setCurrentSourceId: (id: number | null) => void
@@ -161,6 +168,8 @@ export const useStore = create<AppState>()(
       groupRevision: 0,
       l2ListView: false,
       setL2ListView: (on) => set({ l2ListView: on }),
+      settingsFocus: null,
+      setSettingsFocus: (s) => set({ settingsFocus: s }),
       setView: (v) => set((s) => ({
         view: v,
         reviewSession: v === 'swipe' || v === 'arena'
