@@ -80,7 +80,7 @@ export function describeDep(basis: SuggestBasis | null, l2Mode: string): DepInfo
  * 旧版是一句固定文案：「没有可推荐的目标组（需要先识图，或选中图与其它组
  * 差异过大）。」—— 它把**两种完全不同的原因**混成一句，而且常常是错的：
  * 那一栏为空多数时候是「**还在算**」，不是「没识图」。
- * 空状态说错原因 = 把用户送去错误的修复路径（军规 20：空状态要给出行动）。
+ * 空状态说错原因 = 把用户送去错误的修复路径（空状态要给出行动）。
  */
 export function describeEmpty(basis: SuggestBasis | null, l2Mode: string): string {
   if (basis === null) {

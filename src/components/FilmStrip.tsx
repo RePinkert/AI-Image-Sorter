@@ -11,7 +11,7 @@ import { Thumb } from './Thumb'
 //      the app serves. So the strip must not eagerly load hundreds of
 //      originals: only a window around the active image is mounted, and the
 //      browser's own lazy loading defers the rest.
-//   2. The strip must never overlap the zoomed image (军规 17 / the
+//   2. The strip must never overlap the zoomed image (the
 //      "unobstructed image" contract), so it lives BELOW the stage, not
 //      floating on top of it.
 interface FilmStripProps {

@@ -55,7 +55,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # ort = ONNX Runtime 的 Rust 绑定，进程内推理，不依赖 Python / ComfyUI。
 # download-binaries 在构建期拉取 ORT 运行时；copy-dylibs 负责 Windows 的 DLL。
 # 先例：LAP（julyx10/lap）用同一套组合把 CLIP / InsightFace 的 ONNX 模型
-# 随安装包分发。硬约束 #4 的唯一例外已在 ui-program.md 预登记。
+# 随安装包分发。本项目的唯一例外：模型权重随包分发，任何人都能用，且不依赖 Python。
 ort = { version = "=2.0.0-rc.10", default-features = false, features = [
     "std",
     "ndarray",
@@ -66,8 +66,8 @@ ndarray = "0.16"
 
 # 阶段七：手写 WordPiece 分词器（文本塔）只需要 Unicode 通用类别表。
 # unicode_categories = 纯查表 crate，零依赖，1.2 万行类别表。
-# 这是硬约束 #4 的第二次动用，理由与 ort 同源（模型随包分发、任何人可用、
-# 不依赖 Python），已在 ui-program.md 预登记。
+# 这是本项目依赖原则的第二次动用，理由与 ort 同源（模型随包分发、任何人可用、
+# 不依赖 Python）。
 unicode_categories = "0.1"
 
 # Misc

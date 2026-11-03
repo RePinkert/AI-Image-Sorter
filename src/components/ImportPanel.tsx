@@ -25,8 +25,8 @@ import { track } from '../telemetry'
  *
  * 旧版把两件事**平铺在同一行的两个同形按钮**里（「查看分组」/「重新扫描」），
  * 没有 class、没有分级 —— 于是「点哪个能进主页面」这件事，
- * 只有天天用的人靠肌肉记忆知道。这正是军规 06（按钮按主次分级）
- * 与军规 04（弱化凸显）要治的病。
+ * 只有天天用的人靠肌肉记忆知道。这正是「按钮按主次分级」
+ * 与「弱化凸显」要治的病。
  *
  * ## 现在的结构
  *
@@ -171,7 +171,7 @@ export function ImportPanel() {
         {!loading && !hasRegistered && (
           <div className="import-empty">
             <p className="muted">还没有任何数据源。先在下面「添加来源」里扫描一个 ComfyUI 输出目录。</p>
-            {/* 军规 20：空状态必须给出路 —— 告诉用户「什么都没有」之后，
+            {/* 空状态必须给出路 —— 告诉用户「什么都没有」之后，
                 得有一个按钮能让他往前走一步。 */}
             <button type="button" className="btn-secondary" disabled={busy} onClick={() => void manualPick()}>
               手动选择文件夹

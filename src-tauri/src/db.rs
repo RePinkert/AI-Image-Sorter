@@ -672,12 +672,12 @@ mod migrations {
         // v18: 语义档（BGE）的阈值**单独存**。
         //
         // 为什么必须分开：`l2_visual_threshold` 的 0.75 是 **CLIP 的值**
-        // （实测标定出来的，见 ui-log.md 0b-2）。BGE 余弦的分布与 CLIP 不同，
+        // （实测标定出来的）。BGE 余弦的分布与 CLIP 不同，
         // 沿用 0.75 就是拿另一个空间的刻度去卡这个空间 —— 分组会莫名其妙。
         //
         // 默认值 0.70 是**暂定值，未标定**（阶段七轮 3 走双源标定：A 轨合成
         // 语料判别力 + 用户自己的聚类反标定）。标定完成前语义档**不得设为
-        // 默认档**（ui-program.md 阶段七「已定问题」第 3 条）。
+        // 默认档**。
         if !src_cols.contains("l2_semantic_threshold") {
             conn.execute_batch(
                 "ALTER TABLE sources ADD COLUMN l2_semantic_threshold REAL NOT NULL DEFAULT 0.7;",
@@ -690,7 +690,8 @@ mod migrations {
         // 有了内容指纹，改名就能被认出来并**就地更新路径**（保住 image_id）。
         //
         // 指纹算法：xxh3-64（`xxhash-rust` 是既有依赖，不新增依赖 ——
-        // 硬约束 #1）。已有的 `sha256` 列保持为空（留给将来的内容级去重）。
+        // 本项目不引入新的运行期/构建期依赖）。已有的 `sha256` 列保持为空
+        // （留给将来的内容级去重）。
         let img_cols = image_columns(conn)?;
         if !img_cols.contains("content_fp") {
             conn.execute_batch("ALTER TABLE images ADD COLUMN content_fp TEXT;")?;

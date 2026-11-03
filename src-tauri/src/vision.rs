@@ -4,9 +4,9 @@
 //! 「可能相关」推荐使用。推理完全在本进程内（ONNX Runtime），不依赖
 //! Python、不依赖 ComfyUI、不联网。
 //!
-//! 与实验室（`tools/l2lab/embed.py`）的关系：两者跑**同一批 ONNX 权重**
-//! 与**同一套预处理**，因此产出的向量必须一致 —— 这是 Round 1 的口径闸门
-//! （见 ui-program.md）。为此这里的重采样刻意实现成 PIL 兼容的带抗锯齿
+//! 与外部参考实现的关系：两者跑**同一批 ONNX 权重**
+//! 与**同一套预处理**，因此产出的向量必须一致 —— 这正是这道闸门要守的东西。
+//! 为此这里的重采样刻意实现成 PIL 兼容的带抗锯齿
 //! 双三次，而不是直接用 `image::imageops::resize`（后者在下采样时不做抗
 //! 锯齿，与 PIL 的 BICUBIC 不同，两条流水线的向量会对不上）。
 
@@ -441,7 +441,7 @@ mod tests {
         let reference_path = lab.join("vision.json");
         let pathmap_path = lab.join("pathmap.json");
         if !reference_path.is_file() || !pathmap_path.is_file() {
-            eprintln!("跳过：没有实验室参考向量（先跑 tools/l2lab/embed.py）");
+            eprintln!("跳过：没有参考向量可比对（该文件不随仓库分发）");
             return;
         }
         let reference: serde_json::Value =
@@ -532,7 +532,7 @@ mod tests {
         let ref_path = lab.join("resize_ref.bin");
         let pathmap_path = lab.join("pathmap.json");
         if !ref_path.is_file() || !pathmap_path.is_file() {
-            eprintln!("跳过：没有 PIL 重采样参考（先跑 tools/l2lab/dump_resize_ref.py）");
+            eprintln!("跳过：没有 PIL 重采样参考（该文件不随仓库分发）");
             return;
         }
         let pathmap: serde_json::Value =
@@ -733,8 +733,7 @@ mod tests {
     /// 诊断：张量的字节级校验和（与 Python 侧同算法）。
     ///
     /// 不是闸门（两边有 4 个像素差 1，校验和必然不同），是**定位工具**：
-    /// 校验和一致 = 预处理逐位相同；不一致时用 `tools/l2lab/diag_resize.py`
-    /// 逐像素定位差异。
+    /// 校验和一致 = 预处理逐位相同；不一致时逐像素定位差异。
     #[test]
     fn diag_tensor_checksum() {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

@@ -7,18 +7,18 @@
 //! ## 为什么分词器要手写
 //!
 //! HF `tokenizers` 有 Rust 版，但拖进来就是 tokenizers + onnx + protobuf
-//! 一整条链（几百个 crate），与本项目「不引入新的运行/构建依赖」的硬约束 #4
+//! 一整条链（几百个 crate），与本项目「不引入新的运行/构建依赖」的原则
 //! 直接冲突。这里的分词器只依赖 `unicode_categories`（纯查表，零依赖），
 //! 语义**照抄** HF `tokenizers` 0.23.3 的 BertNormalizer / BertPreTokenizer /
 //! WordPiece —— 已逐字比对源码（`normalizers/bert.rs`、`pre_tokenizers/bert.rs`、
 //! `models/wordpiece/mod.rs`），不是凭记忆。分词闸门保证「逐条相等」。
 //!
-//! ## 口径闸门（ui-program.md 阶段七「文本塔」）
+//! ## 口径闸门
 //!
 //! | 闸门 | 比什么 | 阈值 |
 //! |---|---|---|
 //! | 分词闸门 | Rust token id vs Python `tokenizers` 0.23.3 | **逐条相等** |
-//! | 向量闸门 | Rust 向量 vs `tools/l2lab/out/text.json` | 余弦 > 0.97 |
+//! | 向量闸门 | Rust 向量 vs 参考向量文件 | 余弦 > 0.97 |
 //!
 //! ## 已知的数值敏感性（不是 bug，是 int8 量化的固有性质）
 //!
@@ -668,7 +668,7 @@ mod tests {
         manifest_dir().join("..").join("tools").join("l2lab")
     }
 
-    /// FNV-1a 64 位校验和（与 `tools/l2lab/dump_text_tokens.py` 同算法）。
+    /// FNV-1a 64 位校验和（生成基准的工具用的是同一个算法）。
     fn fnv1a64(data: &[u8]) -> String {
         let mut hash: u64 = 0xcbf29ce484222325;
         for byte in data {
@@ -695,7 +695,7 @@ mod tests {
         dot / (na.sqrt() * nb.sqrt())
     }
 
-    /// 真实库的位置（与 `tools/l2lab/embed.py` 同一处）。
+    /// 真实库的位置（应用数据目录下的主库）。
     fn real_db_path() -> PathBuf {
         let app_data = std::env::var("APPDATA")
             .map(PathBuf::from)
@@ -815,8 +815,8 @@ mod tests {
     /// **分词闸门**：Rust 的 token id 必须与 Python `tokenizers` 0.23.3
     /// **逐条相等**。
     ///
-    /// 基准是 `tools/l2lab/fixtures/text_tokens.json`（**合成语料**，可提交，
-    /// 任何人都能跑这道闸门）。真实 prompt 是用户私密内容，不能进仓库。
+    /// 基准是一份**合成语料**的分词基准（真实 prompt 是用户私密内容，
+    /// 不能进仓库）。缺基准时跳过。
     #[test]
     fn tokenizer_matches_python_reference() {
         let tokenizer_path = product_tokenizer_path();
@@ -826,7 +826,7 @@ mod tests {
         }
         let fixture_path = lab_dir().join("fixtures").join("text_tokens.json");
         if !fixture_path.is_file() {
-            eprintln!("跳过：没有分词基准（先跑 tools/l2lab/dump_text_tokens.py）");
+            eprintln!("跳过：没有分词基准（该文件不随仓库分发）");
             return;
         }
         let fixture: serde_json::Value =
@@ -841,7 +841,7 @@ mod tests {
         let got_hash = fnv1a64(&std::fs::read(&tokenizer_path).unwrap());
         assert_eq!(
             got_hash, want_hash,
-            "产品侧的分词器文件与生成基准时用的不是同一份（重跑 tools/l2lab/dump_text_tokens.py）"
+            "产品侧的分词器文件与生成基准时用的不是同一份（需重新生成基准）"
         );
 
         let tokenizer = WordPieceTokenizer::from_file(&tokenizer_path).expect("载入分词器失败");
@@ -890,8 +890,8 @@ mod tests {
 
     /// **向量闸门**：Rust 的 BGE 向量必须与实验室参考（`out/text.json`）一致。
     ///
-    /// 基准是 `tools/l2lab/out/text.json`（真库 prompt 算出来的向量，
-    /// 该目录已 gitignore —— 向量可逆，绝不能进仓库）。缺基准时跳过。
+    /// 基准是一份由真库 prompt 算出来的参考向量（**不入库**：向量可逆，
+    /// 绝不能进仓库）。缺基准时跳过。
     ///
     /// 关键：**按参考文件的 id 顺序复刻实验室的批次构成**（每 8 条一组、
     /// padding 宽度取批内最长）。不这么做的话，余弦会被 int8 量化的
@@ -906,7 +906,7 @@ mod tests {
         }
         let reference_path = lab_dir().join("out").join("text.json");
         if !reference_path.is_file() {
-            eprintln!("跳过：没有实验室参考向量（先跑 tools/l2lab/embed.py --mode text）");
+            eprintln!("跳过：没有参考向量可比对（该文件不随仓库分发）");
             return;
         }
         let reference: serde_json::Value =
@@ -984,7 +984,7 @@ mod tests {
             let head: Vec<String> = drifted.iter().take(10).map(|i| i.to_string()).collect();
             eprintln!("  余弦偏低的 id（最多列 10 个）: {}", head.join(", "));
         }
-        // 阈值（比 ui-program.md 的 0.97 更严一档，理由见下）：
+        // 阈值（比 0.97 更严一档，理由见下）：
         //  · 最小余弦 > 0.97 —— 口径书定的阈值，兜住「管线写错」这种灾难；
         //  · **中位数 > 0.999** —— 这才是真正有判别力的那一档。
         // 实测：批次构成复刻到位且参考是新的时，中位数 = 1.00000000；
@@ -997,14 +997,12 @@ mod tests {
         assert!(
             min_cos > 0.97,
             "向量闸门失败：最小余弦 {min_cos}（图 {worst_id}）。\
-             若库里的 prompt 在参考生成之后被改过，先重生成参考：\
-             tools/l2lab/.venv/Scripts/python.exe tools/l2lab/embed.py --mode text --out tools/l2lab/out/text.json"
+             若库里的 prompt 在参考生成之后被改过，先重新生成参考向量再跑这道闸门。"
         );
         assert!(
             median > 0.999,
             "向量闸门失败：中位余弦只有 {median} —— 管线有问题（而不是个别行漂移）。\
-             参考可能陈旧，先重生成参考：\
-             tools/l2lab/.venv/Scripts/python.exe tools/l2lab/embed.py --mode text --out tools/l2lab/out/text.json"
+             参考可能陈旧，先重新生成参考向量再跑这道闸门。"
         );
     }
 }

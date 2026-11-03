@@ -186,8 +186,7 @@ export default function App() {
           // 说什么，取决于**真的发生了什么**（第 30 轮）。
           //
           // 旧版固定带一句「已检查 1 个目录」—— 那不是用户关心的事（他自己
-          // 知道库里有几个目录），而且在什么都没发生的时候也照报。军规 05
-          // 说的就是这种冗余标签：只说变化。
+          // 知道库里有几个目录），而且在什么都没发生的时候也照报 —— 说的就是这种冗余标签：只说变化。
           const parts: string[] = []
           if (result.added > 0) parts.push(`新增 ${result.added} 张`)
           if (result.pending > 0) parts.push(`待扫描 ${result.pending} 张`)
