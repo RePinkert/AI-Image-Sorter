@@ -1,8 +1,8 @@
 ﻿══ 发行版二进制探针 ══
 [本档] C:\Yet\AI-Image-Sorter\src-tauri\target\release\AI-Image-Sorter.exe
          大小   34383360 字节
-         SHA256 1367387E56E3C047D664A18B01D8F3803E24B03FE05D3F6D15B10D6D3D98B28F
-         修改   2026-11-03 10:25:43
+         SHA256 11CC8425BC9E06B504E1148989EAFF9D7B3FF50580E5DFDB650C38B1924FD906
+         修改   2026-11-03 10:41:36
 
 能力标记串（扫到 9 条）
   · ais.cap.l2.text-jaccard.v1
