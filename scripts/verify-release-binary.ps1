@@ -120,6 +120,12 @@ $Registry = @(
         # 整段删掉了 —— 它还在二进制里 = 后台补算还在。
         # 「没有」也得能证明：删掉一段代码同样看不出来。
         Absent  = 'SELECT i.id, i.abs_path FROM images i'
+    },
+    @{
+        Id      = 'missing.autoclean'
+        Marker  = 'ais.cap.missing.autoclean.v1'
+        Literal = '条文件已不在原路径的记录'
+        Note    = '文件被删看得见并自动清理（实时判缺失 + 扫描时自动清掉真删了的记录）'
     }
 )
 

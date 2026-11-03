@@ -148,12 +148,15 @@ export default function App() {
         lastPending = result.pending
         // 「改名识别」也算真活干（库里换了路径 → 列表要刷新）。
         // 「待确认」**不算** —— 那些记录一直都在，每轮都数一遍会让顶栏一直闪。
+        // 「自动清理」（文件被删）**算** —— 库里少了几张图，列表要刷新，
+        // 而且用户有权知道哪几条被清掉了。
         const hadWork =
           result.added > 0 ||
           pendingChanged ||
           result.reclustered ||
           result.parse_errors > 0 ||
-          result.renamed > 0
+          result.renamed > 0 ||
+          result.removed > 0
         if (hadWork) {
           const sources = await listSources()
           setSources(sources)
@@ -170,7 +173,7 @@ export default function App() {
             parse_error_count: result.parse_errors,
             reclustered: result.reclustered,
             renamed_count: result.renamed,
-            unconfirmed_count: result.unconfirmed,
+            removed_count: result.removed,
             duration_ms: Date.now() - startedAt,
           })
         }
@@ -193,7 +196,11 @@ export default function App() {
           if (result.renamed > 0) {
             parts.push(`识别出 ${result.renamed} 个改名并已按内容更新记录`)
           }
-          if (result.unconfirmed > 0) parts.push(`${result.unconfirmed} 条记录待确认`)
+          // 文件被删 → 自动清理（第 33 轮）。**提醒**一下就行 ——
+          // 用户自己删的文件，不该还要他逐条确认。
+          if (result.removed > 0) {
+            parts.push(`已自动清理 ${result.removed} 条记录（文件已不在原路径）`)
+          }
           setSyncState('success', parts.length > 0 ? `同步完成：${parts.join('，')}` : '同步完成')
           // Once nothing is left pending the stale progress would otherwise
           // keep the "还有 X 张未扫描" warning alive forever on no-op polls.

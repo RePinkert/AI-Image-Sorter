@@ -5,6 +5,7 @@ import type {
   ActionResult,
   AppCapabilitiesDto,
   ArenaHideResult,
+  ArenaVoteResult,
   FoundSourceDto,
   Granularity,
   GroupInfo,
@@ -26,7 +27,6 @@ import type {
   SyncAllResult,
   TextCoverageDto,
   TextStatusDto,
-  UnconfirmedImage,
   UndoActionResult,
   UpdateImagePromptsResult,
   VisionStatusDto,
@@ -470,7 +470,7 @@ export async function arenaVote(
   right: number,
   winnerIsLeft: boolean,
   context: ActionContext = {},
-): Promise<[number, number]> {
+): Promise<ArenaVoteResult> {
   if (isWebDev()) return unavailable('浏览器模式暂不支持擂台评分写入，请使用桌面版')
   return apiInvoke('arena_vote', {
     args: {
@@ -508,24 +508,7 @@ export async function pickFolder(): Promise<string | null> {
   return typeof selected === 'string' ? selected : null
 }
 
-// ── 库恢复 / 改名待确认（第 29 轮）─────────────────────────────
-
-/**
- * 身份无法确认、被保留待确认的旧记录。
- *
- * 这些记录**带用户状态**（评分 / 标签 / 手动分组），所以宁可留着等用户
- * 决定，也不静默删掉。
- */
-export async function listUnconfirmedImages(): Promise<UnconfirmedImage[]> {
-  if (isWebDev()) return []
-  return apiInvoke('list_unconfirmed_images')
-}
-
-/** 用户确认「这张图确实被删了」→ 删掉那条旧记录。 */
-export async function discardUnconfirmedImage(imageId: number): Promise<void> {
-  if (isWebDev()) return
-  await apiInvoke('discard_unconfirmed_image', { imageId })
-}
+// ── 库恢复（第 29 轮）────────────────────────────────────────────
 
 /** 可能存在的旧库副本（当前库目录的兄弟文件 + 安装版的同名库）。 */
 export async function listLibraryCandidates(): Promise<string[]> {

@@ -44,6 +44,11 @@ interface Props {
   /** Called when the user pages to another image. The owner swaps the
    *  current image; the viewer resets itself to "fit" afterwards. */
   onNavigate?: (index: number) => void
+  /** 图片身份（用于删除等动作）。文件夹视角下与 meta 相同；擂台 / 滑卡
+   *  只传它，不传 meta —— 免得多出一条元数据侧栏。 */
+  target?: ImageRow
+  /** 用户按 Delete（或点 HUD 的删除）时回调。图片进系统回收站。 */
+  onDelete?: (image: ImageRow) => void
 }
 
 const MIN_SCALE = 0.1
@@ -63,11 +68,14 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v))
 }
 
-export function Lightbox({ src, onClose, meta, onMetaUpdated, siblings, index, onNavigate }: Props) {
+export function Lightbox({ src, onClose, meta, onMetaUpdated, siblings, index, onNavigate, target, onDelete }: Props) {
   const [view, setView] = useState<View>({ scale: 1, x: 0, y: 0 })
   const [mode, setMode] = useState<ZoomMode>('fit')
   const [stageSize, setStageSize] = useState({ w: 0, h: 0 })
   const [natural, setNatural] = useState({ w: 0, h: 0 })
+  // 文件已不在盘上（第 33 轮）：<img> 加载失败 → 换成一句人话，
+  // 而不是让查看器停在一块纯黑上。
+  const [broken, setBroken] = useState(false)
   const [metaOpen, setMetaOpen] = useState(false)
   const [fullscreen, setFullscreen] = useState(false)
   const [dragging, setDragging] = useState(false)
@@ -106,6 +114,9 @@ export function Lightbox({ src, onClose, meta, onMetaUpdated, siblings, index, o
   const actualBinding = keybindings.viewerActual
   const fullscreenBinding = keybindings.viewerFullscreen
   const metaBinding = keybindings.viewerMeta
+  const deleteBinding = keybindings.viewerDelete
+  // 动作用的图片身份：文件夹视角传的是 meta，其余场景传 target。
+  const actionTarget = target ?? meta
 
   const applyView = useCallback((next: View) => {
     viewRef.current = next
@@ -196,6 +207,7 @@ export function Lightbox({ src, onClose, meta, onMetaUpdated, siblings, index, o
   // 1:1 for a frame before snapping to fit.
   useEffect(() => {
     setMode('fit')
+    setBroken(false)
     const stage = stageRefValue.current
     const nat = naturalRef.current
     if (stage.w && stage.h && nat.w && nat.h) {
@@ -397,6 +409,11 @@ export function Lightbox({ src, onClose, meta, onMetaUpdated, siblings, index, o
         onClose()
         return
       }
+      if (onDelete && actionTarget && matchesBinding(deleteBinding, e)) {
+        e.preventDefault()
+        onDelete(actionTarget)
+        return
+      }
       if (siblings && onNavigate && index != null) {
         if (matchesBinding(prevBinding, e)) {
           e.preventDefault()
@@ -441,7 +458,7 @@ export function Lightbox({ src, onClose, meta, onMetaUpdated, siblings, index, o
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [closeBinding, prevBinding, nextBinding, zoomInBinding, zoomOutBinding, fitBinding, actualBinding, fullscreenBinding, metaBinding, siblings, onNavigate, index, onClose, zoomBy, toggleFullscreen])
+  }, [closeBinding, deleteBinding, prevBinding, nextBinding, zoomInBinding, zoomOutBinding, fitBinding, actualBinding, fullscreenBinding, metaBinding, siblings, onNavigate, index, onClose, onDelete, actionTarget, zoomBy, toggleFullscreen])
 
   // The hint fades out once the user has actually used the viewer.
   useEffect(() => {
@@ -489,20 +506,25 @@ export function Lightbox({ src, onClose, meta, onMetaUpdated, siblings, index, o
               transform: `translate3d(${view.x - natural.w / 2}px, ${view.y - natural.h / 2}px, 0) scale(${view.scale})`,
             }}
           >
-            <img
-              ref={imgRef}
-              src={src}
-              alt={meta?.filename ?? 'preview'}
-              draggable={false}
-              onLoad={(e) => {
-                const el = e.currentTarget
-                if (el.naturalWidth && el.naturalHeight) {
-                  const next = { w: el.naturalWidth, h: el.naturalHeight }
-                  naturalRef.current = next
-                  setNatural(next)
-                }
-              }}
-            />
+            {broken ? (
+              <div className="thumb-missing">文件已不在原路径</div>
+            ) : (
+              <img
+                ref={imgRef}
+                src={src}
+                alt={meta?.filename ?? 'preview'}
+                draggable={false}
+                onError={() => setBroken(true)}
+                onLoad={(e) => {
+                  const el = e.currentTarget
+                  if (el.naturalWidth && el.naturalHeight) {
+                    const next = { w: el.naturalWidth, h: el.naturalHeight }
+                    naturalRef.current = next
+                    setNatural(next)
+                  }
+                }}
+              />
+            )}
           </div>
 
           <div className="viewer-status" aria-live="polite">
@@ -563,6 +585,17 @@ export function Lightbox({ src, onClose, meta, onMetaUpdated, siblings, index, o
                 {fullscreen ? '退出全屏' : '全屏'}
               </button>
             )}
+            {onDelete && actionTarget && (
+              <button
+                type="button"
+                className="btn-tertiary btn-danger"
+                onClick={(e) => { e.stopPropagation(); onDelete(actionTarget) }}
+                title="删除（Delete）—— 送入系统回收站，可从桌面恢复"
+                aria-label="删除这张图片"
+              >
+                删除
+              </button>
+            )}
             <button type="button" className="btn-tertiary" onClick={(e) => { e.stopPropagation(); onClose() }} title="关闭（Esc）">
               关闭
             </button>
@@ -571,6 +604,7 @@ export function Lightbox({ src, onClose, meta, onMetaUpdated, siblings, index, o
           {hintVisible && (
             <p className="muted hint lb-hint">
               单击图片切换 适应窗口/1:1 · 滚轮以光标为锚缩放 · 拖动平移 · ←/→ 换图 · F 全屏 · M 元数据 · Esc 关闭
+              {onDelete && actionTarget ? <span className="lb-hint-nowrap"> · Delete 删除</span> : null}
             </p>
           )}
         </div>

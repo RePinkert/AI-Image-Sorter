@@ -8,6 +8,7 @@ import {
   listGroupImages,
   listLabels,
   toggleHiddenAction,
+  trashImage,
   undoReviewAction,
 } from '../api'
 import type { ImageRow } from '../types'
@@ -17,6 +18,7 @@ import { getTelemetrySessionId, trackAction } from '../telemetry'
 import { Lightbox } from './Lightbox'
 import { Popover } from './Popover'
 import { ImageMetaPopover } from './ImageMetaPopover'
+import { Thumb } from './Thumb'
 
 const GESTURES = ['left', 'right', 'up', 'down'] as const
 type Gesture = (typeof GESTURES)[number]
@@ -75,8 +77,10 @@ export function SwipeDeck() {
   const [busy, setBusy] = useState(false)
   const [exitVec, setExitVec] = useState<{ x: number; y: number } | null>(null)
   const [flash, setFlash] = useState<{ g: Gesture; n: number } | null>(null)
-  const [lightbox, setLightbox] = useState<string | null>(null)
+  const [lightbox, setLightbox] = useState<ImageRow | null>(null)
   const [popoverOpen, setPopoverOpen] = useState(false)
+  const [notice, setNotice] = useState('')
+  const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const hiddenPendingRef = useRef<number | null>(null)
   const loadRequestRef = useRef(0)
   const actionRequestRef = useRef(0)
@@ -84,6 +88,17 @@ export function SwipeDeck() {
   const reloadAfterActionRef = useRef(false)
   const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const startedAtRef = useRef(new Date().toISOString())
+
+  /** 一次性反馈行（删除等动作的结果）—— 没有确认框，就得有回执。 */
+  const showNotice = useCallback((text: string) => {
+    setNotice(text)
+    if (noticeTimer.current) clearTimeout(noticeTimer.current)
+    noticeTimer.current = setTimeout(() => setNotice(''), 4000)
+  }, [])
+
+  useEffect(() => () => {
+    if (noticeTimer.current) clearTimeout(noticeTimer.current)
+  }, [])
 
   const load = useCallback(async () => {
     if (currentGroupKey == null) return
@@ -302,6 +317,43 @@ export function SwipeDeck() {
     }
   }, [busy, currentGroupKey, exitVec, granularity, updateReviewSession])
 
+  /** 查看器里按 Delete：图片进系统回收站（可从桌面恢复）。不做二次确认。 */
+  const deleteImage = useCallback(async (image: ImageRow) => {
+    if (busy || exitVec) return
+    const request = ++actionRequestRef.current
+    actionInFlightRef.current = true
+    setBusy(true)
+    setActionError('')
+    setRetryAction(null)
+    try {
+      await trashImage(image.id)
+      if (request !== actionRequestRef.current) return
+      const nextImages = images.filter((item) => item.id !== image.id)
+      setImages(nextImages)
+      setScores((value) => {
+        const nextScores = { ...value }
+        delete nextScores[image.id]
+        return nextScores
+      })
+      const session = useStore.getState().reviewSession
+      updateReviewSession({
+        swipeOrder: nextImages.map((item) => item.id),
+        // 撤销栈里提到这张图的记录一并作废。
+        swipeUndoStack: (session.swipeUndoStack ?? []).filter((entry) => entry.imageId !== image.id),
+      })
+      setLightbox(null)
+      showNotice(`已送入回收站：${image.filename}`)
+      trackAction('image_delete', { mode: 'swipe', image_id: image.id })
+      actionInFlightRef.current = false
+      setBusy(false)
+    } catch (error) {
+      if (request !== actionRequestRef.current) return
+      actionInFlightRef.current = false
+      setBusy(false)
+      setActionError(`删除失败：${errorMessage(error)}`)
+    }
+  }, [busy, exitVec, images, updateReviewSession])
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (lightbox || popoverOpen) return
@@ -419,9 +471,10 @@ export function SwipeDeck() {
           </button>
         </div>
       )}
+      {notice && <div className="notice-line" role="status">{notice}</div>}
 
       <div className="deck">
-        {next && <motion.div className="card card-under" key={next.id}><img src={assetUrl(next.abs_path)} alt={next.filename} draggable={false} /></motion.div>}
+        {next && <motion.div className="card card-under" key={next.id}><Thumb src={assetUrl(next.abs_path)} alt={next.filename} fileMissing={next.file_missing} draggable={false} /></motion.div>}
         <motion.div
           className="card"
           key={current.id}
@@ -455,7 +508,13 @@ export function SwipeDeck() {
             }
           }}
         >
-          <img src={assetUrl(current.abs_path)} alt={current.filename} draggable={false} onClick={() => setLightbox(current.abs_path)} />
+          <Thumb
+            src={assetUrl(current.abs_path)}
+            alt={current.filename}
+            fileMissing={current.file_missing}
+            draggable={false}
+            onClick={() => setLightbox(current)}
+          />
           <Popover
             open={popoverOpen}
             onOpenChange={setPopoverOpen}
@@ -494,7 +553,14 @@ export function SwipeDeck() {
         {bindingDisplay(keybindings.swipeHide)} 屏蔽当前卡 ·{' '}
         {bindingDisplay(keybindings.swipeRewind)} 撤销上一步 · 单击图片放大 · "更多"查看 Prompt / 屏蔽
       </p>
-      {lightbox && <Lightbox src={assetUrl(lightbox)} onClose={() => setLightbox(null)} />}
+      {lightbox && (
+        <Lightbox
+          src={assetUrl(lightbox.abs_path)}
+          target={lightbox}
+          onDelete={(image) => void deleteImage(image)}
+          onClose={() => setLightbox(null)}
+        />
+      )}
     </div>
   )
 }

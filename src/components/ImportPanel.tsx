@@ -1,17 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   addSourceAndScan,
-  discardUnconfirmedImage,
   errorMessage,
   findComfySources,
   findWorkflowTemplates,
   listGroups,
   listSources,
-  listUnconfirmedImages,
   pickFolder,
   refreshWorkflowTemplates,
 } from '../api'
-import type { FoundSourceDto, ScanResult, UnconfirmedImage, WorkflowTemplateDto } from '../types'
+import type { FoundSourceDto, ScanResult, WorkflowTemplateDto } from '../types'
 import { useStore } from '../store'
 import { track } from '../telemetry'
 
@@ -55,26 +53,7 @@ export function ImportPanel() {
   const [showWorkflows, setShowWorkflows] = useState(false)
   /** 用户挑中的源。主操作「打开分组列表」作用于它。 */
   const [pickedSourceId, setPickedSourceId] = useState<number | null>(null)
-  /**
-   * 身份无法确认、被保留待确认的旧记录（第 29 轮）。
-   *
-   * 这些记录带用户状态（评分 / 标签 / 手动分组）—— 宁可留着让用户决定，
-   * 也不在一次改名后凭空消失。
-   */
-  const [unconfirmed, setUnconfirmed] = useState<UnconfirmedImage[]>([])
   const requestRef = useRef(0)
-
-  const refreshUnconfirmed = useCallback(async () => {
-    try {
-      setUnconfirmed(await listUnconfirmedImages())
-    } catch {
-      setUnconfirmed([])
-    }
-  }, [])
-
-  useEffect(() => {
-    void refreshUnconfirmed()
-  }, [dataRevision, refreshUnconfirmed])
 
   useEffect(() => {
     const request = ++requestRef.current
@@ -125,12 +104,12 @@ export function ImportPanel() {
       // 改名识别：路径变了但**行没换** → 评分 / 标签 / 手动分组全保住。
       // 这件事必须**说出来** —— 用户有权知道库是怎么变的。
       const renamed = res.renamed > 0 ? `，识别出 ${res.renamed} 个文件被改名并已按内容更新记录` : ''
-      const unconfirmed = res.unconfirmed > 0 ? `，${res.unconfirmed} 个记录无法确认身份已保留待确认` : ''
+      // 文件被删 → 自动清理（第 33 轮）。提醒一下即可。
+      const removed = res.removed > 0 ? `，已自动清理 ${res.removed} 条记录（文件已不在原路径）` : ''
       // 扫描完**不自动跳走**：扫描是「备料」，进入工作台是「打开」。
       // 两条路各自的按钮只有一条，模型才清楚。
-      setMsg(`已扫描 ${res.scanned} 张图，分成 ${res.groups} 组${renamed}${unconfirmed}${failed}。按「打开分组列表」继续。`)
+      setMsg(`已扫描 ${res.scanned} 张图，分成 ${res.groups} 组${renamed}${removed}${failed}。按「打开分组列表」继续。`)
       setMsgKind('info')
-      void refreshUnconfirmed()
       track('sync', {
         success: true,
         source_count: 1,
@@ -243,31 +222,6 @@ export function ImportPanel() {
               </button>
               {picked == null && <span className="muted">先选一个源</span>}
             </div>
-            {unconfirmed.length > 0 && (
-              <div className="import-note" role="status">
-                <p>
-                  有 {unconfirmed.length} 条记录的文件已不在原路径，且无法按内容确认身份 ——
-                  记录已保留（评分、标签、手动分组都没丢）。确认文件确实被删了，再清理掉。
-                </p>
-                <ul className="unconfirmed-list">
-                  {unconfirmed.map((row) => (
-                    <li key={row.id}>
-                      <span className="path" title={row.abs_path}>{row.filename}</span>
-                      <button
-                        type="button"
-                        className="btn-tertiary"
-                        onClick={async () => {
-                          await discardUnconfirmedImage(row.id)
-                          await refreshUnconfirmed()
-                        }}
-                      >
-                        确认已删除
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
           </>
         )}
       </section>

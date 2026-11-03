@@ -5,7 +5,9 @@ export type TelemetryEventName =
   | 'view_exit'
   | 'swipe_commit'
   | 'arena_vote_commit'
+  | 'arena_back'
   | 'hide'
+  | 'image_delete'
   | 'prompt_recommend_open'
   | 'prompt_recommend_copy'
   | 'prompt_recommend_error'
@@ -40,7 +42,9 @@ const allowedFields: Record<TelemetryEventName, ReadonlySet<string>> = {
   view_exit: new Set(['view', 'duration_ms']),
   swipe_commit: new Set(['gesture', 'has_label', 'duration_ms', 'image_id']),
   arena_vote_commit: new Set(['side', 'duration_ms', 'left_id', 'right_id']),
+  arena_back: new Set(['kind']),
   hide: new Set(['hidden', 'mode', 'duration_ms', 'image_id']),
+  image_delete: new Set(['mode', 'image_id']),
   prompt_recommend_open: new Set(['granularity', 'group_id']),
   prompt_recommend_copy: new Set(['success', 'group_id']),
   prompt_recommend_error: new Set(['error_code', 'retryable', 'group_id']),
@@ -55,6 +59,7 @@ const enumValues: Record<string, ReadonlySet<string>> = {
   mode: new Set(['swipe', 'arena', 'folder', 'groups', 'import', 'settings', 'unknown']),
   gesture: new Set(['left', 'right', 'up', 'down']),
   side: new Set(['left', 'right']),
+  kind: new Set(['vote', 'hide', 'skip']),
   source: new Set(['window_error', 'unhandled_rejection', 'error_boundary']),
   operation: new Set([
     'find_comfy_sources', 'find_workflow_templates', 'refresh_workflow_templates', 'sync_all',
@@ -193,7 +198,7 @@ export function trackView(view: string, phase: 'enter' | 'exit', durationMs?: nu
 }
 
 export function trackAction(
-  event: 'swipe_commit' | 'arena_vote_commit' | 'hide',
+  event: 'swipe_commit' | 'arena_vote_commit' | 'arena_back' | 'hide' | 'image_delete',
   payload: TelemetryPayload,
 ) {
   track(event, payload)

@@ -151,6 +151,17 @@ pub fn capabilities() -> Vec<Capability> {
         kind: KIND_PROVENANCE,
         axis: "-",
     });
+    // 第 33 轮：文件被删**看得见 + 自动清理**。
+    //
+    // 标记串住在实现它的模块里（`commands.rs`）：实现被删 → 常量消失 →
+    // 标记串从二进制里消失 → 探针立刻发现。
+    out.push(Capability {
+        id: "missing.autoclean",
+        marker: marker_id(crate::commands::CAP_MISSING_AUTOCLEAN),
+        label: "缺失自动清理（文件被删看得见并自动清理）",
+        kind: KIND_PROVENANCE,
+        axis: "-",
+    });
     // 每条标记都必须带公共前缀 —— 探针按前缀扫二进制，前缀错了就扫不到。
     debug_assert!(
         out.iter().all(|c| c.marker.starts_with(MARKER_PREFIX)),

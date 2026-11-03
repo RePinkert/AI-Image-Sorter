@@ -236,33 +236,6 @@ impl Db {
     /// 哪些图带**用户状态**（评分 / 标签 / 手动分组）。
     ///
     /// 这样的行**绝不静默删除** —— 它们是用户手工分拣的结果。宁可留在
-    /// 库里等确认，也不能在一次改名后凭空消失。
-    pub fn images_with_user_state(&self, source_id: i64) -> Result<std::collections::HashSet<i64>> {
-        let conn = self.0.lock().unwrap();
-        let mut out = std::collections::HashSet::new();
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT i.id FROM images i
-             WHERE i.source_id=?1 AND (
-               EXISTS (SELECT 1 FROM scores s WHERE s.image_id=i.id)
-               OR EXISTS (SELECT 1 FROM image_labels l WHERE l.image_id=i.id)
-               OR EXISTS (SELECT 1 FROM manual_group_bindings b WHERE b.image_id=i.id)
-             )",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![source_id], |r| r.get::<_, i64>(0))?;
-        for r in rows {
-            out.insert(r?);
-        }
-        Ok(out)
-    }
-
-    /// 删掉一行**没有**用户状态、且身份无法确认的旧记录。
-    ///
-    /// 只在用户明确确认「这张图确实被删了」之后才走这条路（见「库恢复」）。
-    pub fn delete_image_row(&self, id: i64) -> Result<()> {
-        let conn = self.0.lock().unwrap();
-        conn.execute("DELETE FROM images WHERE id=?1", rusqlite::params![id])?;
-        Ok(())
-    }
 
     /// 全部源的内容身份行（库恢复用 —— 跨源匹配）。
     pub fn list_all_identity_rows(&self) -> Result<Vec<IdentityRow>> {
@@ -427,7 +400,6 @@ impl Db {
         &self,
         source_id: i64,
         keep: &std::collections::HashSet<String>,
-        preserve: &std::collections::HashSet<i64>,
     ) -> Result<(usize, Vec<String>)> {
         let conn = self.0.lock().unwrap();
         let mut stmt =
@@ -439,7 +411,7 @@ impl Db {
         for r in rows {
             let (id, p, l1) = r?;
             let norm = crate::commands::normalize_path_str(&p);
-            if !keep.contains(&norm) && !preserve.contains(&id) {
+            if !keep.contains(&norm) {
                 to_delete.push((id, l1));
             }
         }
@@ -447,6 +419,9 @@ impl Db {
         let mut removed = 0usize;
         let mut affected = Vec::new();
         for (id, l1) in &to_delete {
+            // `scores` 没有外键 —— 删图时必须显式删评分，否则会留下一条
+            // 指向不存在图片的孤儿评分（库里越攒越多）。
+            conn.execute("DELETE FROM scores WHERE image_id=?1", rusqlite::params![id])?;
             removed += conn.execute(
                 "DELETE FROM images WHERE id=?1",
                 rusqlite::params![id],
@@ -1355,6 +1330,12 @@ pub struct ImageRow {
     /// When the image is pinned to a manual L2 group override, the binding
     /// kind ('merge' | 'split'); None when it follows auto-clustering.
     pub manually_grouped: Option<String>,
+    /// The file behind this row is **gone from disk** (第 33 轮「缺失可见」).
+    ///
+    /// 判据是**实时** stat，不是库里的标记 —— 用户在应用之外删掉文件后，
+    /// 下一次列清单就能看见，不必等下一轮扫描。前端据此把「黑色占位符」
+    /// 换成显式的「已删除」状态。
+    pub file_missing: bool,
 }
 
 /// 一行的**内容身份**（第 29 轮「改名不丢分拣」）。
@@ -1499,6 +1480,16 @@ pub struct UndoActionResult {
     pub label_id: Option<i64>,
     pub gesture: Option<String>,
     pub committed_at: String,
+}
+
+/// Result of an arena vote. The action id is part of the payload on
+/// purpose: "回到上一组并回滚分数" needs the id of the vote to undo,
+/// and the id only exists in the review action row.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArenaVoteResult {
+    pub action_id: String,
+    pub left_score: f64,
+    pub right_score: f64,
 }
 
 /// Result of an arena hide: the victim is hidden with score 0, the survivor
@@ -2017,6 +2008,13 @@ impl Db {
     }
 
     /// 该源有多少张图（视觉塔的分母 —— 视觉塔对每张图都要算一个向量）。
+    ///
+    /// 第 33 轮：同步循环也用它与「盘上文件数」比 —— 不等 = 库里多了行
+    /// （文件被删了）或少了行（新文件 / 还没解析的文件）→ 这个源要重扫。
+    ///
+    /// 为什么不用存下来的 watermark：删除会被**上一轮扫描**吸收掉
+    /// （那一轮把行留下了，watermark 却记成了盘上文件数）→ 两者重新
+    /// 相等 → 之后永远判「没变」→ 被删的文件再也清不掉。
     pub fn count_source_images(&self, source_id: i64) -> Result<usize> {
         let conn = self.0.lock().unwrap();
         let count: i64 = conn.query_row(
@@ -2538,10 +2536,14 @@ impl Db {
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params![param], |r| {
+            let abs_path: String = r.get(2)?;
+            // 实时 stat：文件在不在盘上，与库里记的 mtime 无关。列清单是
+            // 用户唯一会盯着看的入口，缺失必须在这里就说清楚（第 33 轮）。
+            let file_missing = !std::path::Path::new(&abs_path).is_file();
             Ok(ImageRow {
                 id: r.get(0)?,
                 source_id: r.get(1)?,
-                abs_path: r.get(2)?,
+                abs_path,
                 filename: r.get(3)?,
                 width: r.get(4)?,
                 height: r.get(5)?,
@@ -2563,6 +2565,7 @@ impl Db {
                 diffusion_model: r.get::<_, Option<String>>(19)?.unwrap_or_default(),
                 workflow_name: r.get(20)?,
                 manually_grouped: r.get(21)?,
+                file_missing,
             })
         })?;
         let mut out: Vec<ImageRow> = Vec::new();
@@ -2616,15 +2619,15 @@ impl Db {
         Ok(res)
     }
 
-    /// Delete an image row by id. Scores / labels cascade-delete via the
-    /// image_id FK ON DELETE CASCADE. Used after the underlying file has
-    /// been moved to the OS recycle bin (trash_image).
-    pub fn delete_image_by_id(&self, image_id: i64) -> Result<()> {
+    /// Delete an image row **and** everything that hangs off it.
+    ///
+    /// `scores` 没有外键（见 schema），所以标签 / 手动分组靠
+    /// `ON DELETE CASCADE` 掉了，评分不会 —— 这里显式补上，否则删掉的行
+    /// 会留下一条指向不存在图片的评分（库里越攒越多）。
+    pub fn delete_image_and_state(&self, image_id: i64) -> Result<()> {
         let conn = self.0.lock().unwrap();
-        conn.execute(
-            "DELETE FROM images WHERE id=?1",
-            rusqlite::params![image_id],
-        )?;
+        conn.execute("DELETE FROM scores WHERE image_id=?1", rusqlite::params![image_id])?;
+        conn.execute("DELETE FROM images WHERE id=?1", rusqlite::params![image_id])?;
         Ok(())
     }
 
@@ -2955,7 +2958,7 @@ impl Db {
         session_id: Option<&str>,
         started_at: Option<&str>,
         context_signature: Option<&str>,
-    ) -> Result<(f64, f64)> {
+    ) -> Result<ArenaVoteResult> {
         validate_token("group_key", group_key, 256, true)?;
         if let Some(session_id) = session_id {
             validate_token("session_id", session_id, 128, false)?;
@@ -2978,8 +2981,13 @@ impl Db {
                 return Err(anyhow::anyhow!("image row not found"));
             }
         }
-        let left_score = current_score_tx(&tx, left)?.unwrap_or(crate::scoring::BASE_SCORE);
-        let right_score = current_score_tx(&tx, right)?.unwrap_or(crate::scoring::BASE_SCORE);
+        // The snapshot must carry the scores from **before** the vote:
+        // "回到上一组并回滚分数" reads them back from here, and there is
+        // nowhere else to get them (the score row only holds the new value).
+        let left_prev = current_score_tx(&tx, left)?;
+        let right_prev = current_score_tx(&tx, right)?;
+        let left_score = left_prev.unwrap_or(crate::scoring::BASE_SCORE);
+        let right_score = right_prev.unwrap_or(crate::scoring::BASE_SCORE);
         let (new_left, new_right) =
             crate::scoring::apply_arena(left_score, right_score, winner_is_left);
         insert_score_tx(&tx, left, new_left, "arena")?;
@@ -3001,6 +3009,12 @@ impl Db {
             "left_score": new_left,
             "right_score": new_right,
             "winner": winner,
+            "left_id": left,
+            "right_id": right,
+            "left_prev_score": left_prev,
+            "right_prev_score": right_prev,
+            "had_left_prev_score": left_prev.is_some(),
+            "had_right_prev_score": right_prev.is_some(),
         })
         .to_string();
         insert_review_action(
@@ -3020,7 +3034,11 @@ impl Db {
             &result_json,
         )?;
         tx.commit()?;
-        Ok((new_left, new_right))
+        Ok(ArenaVoteResult {
+            action_id,
+            left_score: new_left,
+            right_score: new_right,
+        })
     }
 
     pub fn toggle_hidden_atomic(
@@ -3211,25 +3229,54 @@ impl Db {
         let committed_at = Utc::now().to_rfc3339();
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction()?;
-        let (mode, image_id, gesture, group_key, result_json): (
+        let (mode, image_id, gesture, group_key, result_json, action_committed_at): (
             String,
             Option<i64>,
             Option<String>,
             Option<String>,
             String,
+            String,
         ) = tx
             .query_row(
-                "SELECT mode, image_id, gesture, group_key, result_json
+                "SELECT mode, image_id, gesture, group_key, result_json, committed_at
                  FROM review_actions WHERE action_id=?1",
                 rusqlite::params![action_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .optional()?
             .ok_or_else(|| anyhow::anyhow!("review action not found"))?;
-        if !matches!(mode.as_str(), "swipe" | "hide" | "arena_hide") {
+        if !matches!(mode.as_str(), "swipe" | "hide" | "arena_hide" | "arena") {
             return Err(anyhow::anyhow!("review action is not reversible"));
         }
-        let image_id = image_id.ok_or_else(|| anyhow::anyhow!("review action has no image"))?;
+        // An arena vote moves BOTH sides and therefore has no single
+        // image_id — the pair is resolved from the snapshot instead.
+        let arena_snapshot: Option<serde_json::Value> = if mode == "arena" {
+            Some(
+                serde_json::from_str(&result_json)
+                    .map_err(|_| anyhow::anyhow!("review action snapshot is invalid"))?,
+            )
+        } else {
+            None
+        };
+        let arena_left = arena_snapshot
+            .as_ref()
+            .and_then(|snap| snap.get("left_id"))
+            .and_then(|value| value.as_i64());
+        let arena_right = arena_snapshot
+            .as_ref()
+            .and_then(|snap| snap.get("right_id"))
+            .and_then(|value| value.as_i64());
+        let arena_winner = arena_snapshot
+            .as_ref()
+            .and_then(|snap| snap.get("winner"))
+            .and_then(|value| value.as_i64());
+        let image_id = match mode.as_str() {
+            "arena" => arena_winner
+                .or(arena_left)
+                .or(arena_right)
+                .ok_or_else(|| anyhow::anyhow!("arena vote has no image"))?,
+            _ => image_id.ok_or_else(|| anyhow::anyhow!("review action has no image"))?,
+        };
         let existing_undo: Option<(String, String, String)> = tx
             .query_row(
                 "SELECT action_id, committed_at, result_json FROM review_actions
@@ -3339,6 +3386,93 @@ impl Db {
                 image_id: victim_id,
                 restored_score: if had_victim { victim_prev } else { None },
                 hidden: victim_prev_hidden,
+                label_id: None,
+                gesture,
+                committed_at,
+            });
+        }
+        // An arena vote moved BOTH scores. Undo puts both back and drops the
+        // compare_pairs row the vote created — otherwise the same comparison
+        // stays in the history as if it had never been rolled back.
+        if mode == "arena" {
+            let snap = arena_snapshot
+                .ok_or_else(|| anyhow::anyhow!("arena vote snapshot is missing"))?;
+            let left_id = snap
+                .get("left_id")
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| anyhow::anyhow!("arena vote snapshot has no left image"))?;
+            let right_id = snap
+                .get("right_id")
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| anyhow::anyhow!("arena vote snapshot has no right image"))?;
+            let had_left = snap
+                .get("had_left_prev_score")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let had_right = snap
+                .get("had_right_prev_score")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let left_prev = snap.get("left_prev_score").and_then(|value| value.as_f64());
+            let right_prev = snap.get("right_prev_score").and_then(|value| value.as_f64());
+            if had_left {
+                let score = left_prev
+                    .ok_or_else(|| anyhow::anyhow!("arena vote left previous score is missing"))?;
+                insert_score_tx(&tx, left_id, score, "undo")?;
+            } else {
+                tx.execute(
+                    "DELETE FROM scores WHERE image_id=?1",
+                    rusqlite::params![left_id],
+                )?;
+            }
+            if had_right {
+                let score = right_prev
+                    .ok_or_else(|| anyhow::anyhow!("arena vote right previous score is missing"))?;
+                insert_score_tx(&tx, right_id, score, "undo")?;
+            } else {
+                tx.execute(
+                    "DELETE FROM scores WHERE image_id=?1",
+                    rusqlite::params![right_id],
+                )?;
+            }
+            // The comparison this vote recorded is no longer true.
+            tx.execute(
+                "DELETE FROM compare_pairs
+                 WHERE group_key=?1 AND left_img=?2 AND right_img=?3 AND created_at=?4",
+                rusqlite::params![group_key, left_id, right_id, action_committed_at],
+            )?;
+            let undo_result = serde_json::json!({
+                "restored_score": left_prev,
+                "had_previous_score": had_left,
+                "hidden": false,
+                "label_id": null,
+                "restored_left_score": left_prev,
+                "restored_right_score": right_prev,
+            })
+            .to_string();
+            tx.execute(
+                "INSERT INTO review_actions (
+                     action_id, session_id, mode, image_id, gesture, group_key,
+                     committed_at, result_json, undo_of_action_id
+                 ) VALUES (?1,?2,'undo',?3,?4,?5,?6,?7,?8)",
+                rusqlite::params![
+                    undo_action_id,
+                    session_id,
+                    arena_winner.unwrap_or(left_id),
+                    gesture,
+                    group_key,
+                    committed_at,
+                    undo_result,
+                    action_id,
+                ],
+            )?;
+            tx.commit()?;
+            return Ok(UndoActionResult {
+                action_id: undo_action_id,
+                undone_action_id: action_id.to_string(),
+                image_id: arena_winner.unwrap_or(left_id),
+                restored_score: left_prev,
+                hidden: false,
                 label_id: None,
                 gesture,
                 committed_at,
@@ -4082,6 +4216,94 @@ mod tests {
         assert!((b_score - 40.0).abs() < 1e-9, "victim score restored, got {b_score}");
 
         let undo2 = db.undo_review_action(&hide.action_id, None).unwrap();
+        assert_eq!(undo2.action_id, undo.action_id, "double undo is idempotent");
+    }
+
+    #[test]
+    fn arena_vote_undo_restores_both_scores_and_drops_the_comparison() {
+        let db = open(std::path::Path::new(":memory:")).unwrap();
+        let src = db.upsert_source("C:\\imgs", "folder", None).unwrap();
+        let make = |n: i64, prompt: &str, key: &str| {
+            db.insert_image(&ImageInsert {
+                source_id: src,
+                rel_path: format!("{n}.png"),
+                abs_path: format!("C:\\imgs\\{n}.png"),
+                filename: format!("{n}.png"),
+                size: 100,
+                modified_at: 0,
+                width: 512,
+                height: 512,
+                prompt_pos: prompt.to_string(),
+                prompt_neg: String::new(),
+                checkpoint: "model".into(),
+                loras: String::new(),
+                vae: String::new(),
+                samplers: String::new(),
+                seed: n,
+                steps: 20,
+                cfg: 7.0,
+                group_key_l0: "l0".into(),
+                group_key_l1: "l1".into(),
+                group_key_l2: key.to_string(),
+                group_key_l3: format!("l3-{n}"),
+                sha256: format!("sha{n}"),
+                meta_ok: true,
+                source_kind: "folder".into(),
+                diffusion_model: String::new(),
+                text_encoder: String::new(),
+                controlnet: String::new(),
+                model_chain_json: String::new(),
+                workflow_key: String::new(),
+                workflow_graph_json: String::new(),
+                workflow_template_id: None,
+                workflow_match_confidence: None,
+                generation_recipe_json: String::new(),
+                recipe_signature: String::new(),
+                parser_version: String::new(),
+                content_fp: String::new(),
+            })
+            .unwrap()
+        };
+        let a = make(1, "prompt a", "keyA");
+        let b = make(2, "prompt b", "keyB");
+
+        // 投票前双方**没有分数行** —— 回滚必须把它们删回去，而不是写一个
+        // 猜出来的值（快照里的 had_*_prev_score 就是为此存在的）。
+        let vote = db.arena_vote_atomic("g1", a, b, true, None, None, None).unwrap();
+        let conn = db.0.lock().unwrap();
+        let (a_score, b_score): (f64, f64) = conn
+            .query_row(
+                "SELECT (SELECT internal_score FROM scores WHERE image_id=?1),
+                        (SELECT internal_score FROM scores WHERE image_id=?2)",
+                rusqlite::params![a, b],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let pairs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM compare_pairs", [], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+        assert!(a_score > 50.0 && b_score < 50.0, "winner gains, loser drops");
+        assert_eq!(pairs, 1, "the vote is recorded as one comparison");
+
+        let undo = db.undo_review_action(&vote.action_id, None).unwrap();
+        assert_eq!(undo.undone_action_id, vote.action_id);
+        let conn = db.0.lock().unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM scores WHERE image_id IN (?1, ?2)",
+                rusqlite::params![a, b],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let pairs_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM compare_pairs", [], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+        assert_eq!(rows, 0, "both score rows are gone again, got {rows}");
+        assert_eq!(pairs_after, 0, "the rolled-back comparison is gone");
+
+        let undo2 = db.undo_review_action(&vote.action_id, None).unwrap();
         assert_eq!(undo2.action_id, undo.action_id, "double undo is idempotent");
     }
 

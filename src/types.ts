@@ -77,6 +77,11 @@ export interface ImageRow {
   /** When the image is pinned to a manual L2 group override, the binding
    *  kind ('merge' | 'split'); null when it follows auto-clustering. */
   manually_grouped?: string | null
+  /** The file behind this row is gone from disk (第 33 轮「缺失可见」).
+   *  Judged live (stat), not from a stored flag — so deleting a file
+   *  outside the app shows up on the next list, without waiting for a
+   *  rescan. The row itself is kept (user state must not vanish silently). */
+  file_missing?: boolean
 }
 
 export interface UpdateImagePromptsResult {
@@ -158,8 +163,13 @@ export interface ScanResult {
    * 路径变了但**行没换** → 评分 / 标签 / 手动分组全部保住。
    */
   renamed: number
-  /** 身份无法确认、被保留待确认的旧记录数量。 */
-  unconfirmed: number
+  /**
+   * 文件已被删除、**自动清理**掉的记录数量（第 33 轮）。
+   *
+   * 用户在应用之外删掉了文件 → 同步时自动把那一行连同评分 / 标签 /
+   * 手动分组清掉。只需要**提醒**一下，不需要用户逐条确认。
+   */
+  removed: number
 }
 
 export interface SyncProgress {
@@ -182,8 +192,8 @@ export interface SyncAllResult {
   parse_errors: number
   /** 这一轮识别出的改名数量。 */
   renamed: number
-  /** 身份无法确认、被保留待确认的旧记录数量。 */
-  unconfirmed: number
+  /** 文件已被删除、**自动清理**掉的记录数量（第 33 轮）。 */
+  removed: number
 }
 
 /**
@@ -192,12 +202,6 @@ export interface SyncAllResult {
  * 它的文件已经不在原路径上，而且按内容也认不出来 —— 所以**保留**，
  * 交给用户决定是「它被删了」还是「它只是改了个我认不出的名」。
  */
-export interface UnconfirmedImage {
-  id: number
-  abs_path: string
-  filename: string
-  reason: string
-}
 
 /**
  * 签名覆盖率（第 30 轮）。
@@ -407,6 +411,14 @@ export interface UndoActionResult {
   label_id: number | null
   gesture: string | null
   committed_at: string
+}
+
+/** 擂台一次投票的结果。action_id 是「回到上一组并回滚分数」的凭据 ——
+ *  分数的旧值存在这一行的快照里，撤销时按它还原。 */
+export interface ArenaVoteResult {
+  action_id: string
+  left_score: number
+  right_score: number
 }
 
 export interface ManualGroupResult {

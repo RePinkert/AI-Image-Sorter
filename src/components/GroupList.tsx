@@ -31,6 +31,7 @@ import {
   MODEL_DEVIATION_DIMENSION_LABELS,
 } from '../types'
 import { MoveSuggestionHeader, MoveSuggestionEmpty } from './MoveSuggestionHeader'
+import { Thumb } from './Thumb'
 import { useStore } from '../store'
 import { GRANULARITY_LEVELS, groupLabel } from '../lib/groupLabel'
 import {
@@ -127,7 +128,7 @@ function LazyGroupThumb({
       {paths.length > 0 ? (
         <div className={`group-thumb-grid count-${Math.min(paths.length, 4)}`}>
           {paths.map((path, index) => (
-            <img key={`${path}-${index}`} src={assetUrl(path)} alt="" draggable={false} loading="lazy" decoding="async" />
+            <Thumb key={`${path}-${index}`} src={assetUrl(path)} alt="" draggable={false} loading="lazy" decoding="async" />
           ))}
         </div>
       ) : <div className="thumb-placeholder" />}
@@ -233,10 +234,11 @@ function LazyRowImages({
           title={`${img.filename}${img.hidden ? '（已屏蔽）' : ''} — 点击选择`}
           onClick={() => onToggleSelect(img.id)}
         >
-          <img
+          <Thumb
             className={img.hidden ? 'row-img hidden-img' : 'row-img'}
             src={assetUrl(img.abs_path)}
             alt={img.filename}
+            fileMissing={img.file_missing}
             draggable={false}
             loading="lazy"
             decoding="async"

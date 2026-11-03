@@ -31,6 +31,8 @@ export interface Keymap {
   /** 查看器：原生全屏 / 元数据侧栏 */
   viewerFullscreen: Binding
   viewerMeta: Binding
+  /** 查看器：删除当前图（送系统回收站，可从桌面恢复） */
+  viewerDelete: Binding
   /** 文件夹视角：在当前分类轴上翻到上一组 / 下一组 */
   folderPrevGroup: Binding
   folderNextGroup: Binding
@@ -61,6 +63,7 @@ export const DEFAULT_KEYMAP: Keymap = {
   viewerActual: '1',
   viewerFullscreen: 'f',
   viewerMeta: 'm',
+  viewerDelete: 'Delete',
   folderPrevGroup: 'ArrowLeft',
   folderNextGroup: 'ArrowRight',
 }
@@ -86,7 +89,10 @@ export const KEYMAP_ACTIONS: KeymapAction[] = [
   { key: 'arenaArmHide', label: '擂台 · 屏蔽提示（按住）', short: '屏蔽提示', group: 'arena' },
   { key: 'arenaHideLeft', label: '擂台 · 屏蔽左卡', short: '屏蔽左', group: 'arena' },
   { key: 'arenaHideRight', label: '擂台 · 屏蔽右卡', short: '屏蔽右', group: 'arena' },
-  { key: 'arenaUndoHide', label: '擂台 · 撤销屏蔽', short: '撤销屏蔽', group: 'arena' },
+  // 字段名沿用旧称（arenaUndoHide），但语义已变：Backspace 现在是
+  // 「回到上一组」—— 上一组可能是投票 / 屏蔽 / 跳过，并按动作类型回滚。
+  // 字段名不改是为了不废掉用户已保存的键位。
+  { key: 'arenaUndoHide', label: '擂台 · 回到上一组（分数一并回滚）', short: '回上组', group: 'arena' },
   { key: 'closeLightbox', label: '通用 · 关闭灯箱', short: '关灯箱', group: 'global' },
   { key: 'viewerPrev', label: '查看器 · 上一张', short: '上张', group: 'viewer' },
   { key: 'viewerNext', label: '查看器 · 下一张', short: '下张', group: 'viewer' },
@@ -96,6 +102,7 @@ export const KEYMAP_ACTIONS: KeymapAction[] = [
   { key: 'viewerActual', label: '查看器 · 实际像素', short: '1:1', group: 'viewer' },
   { key: 'viewerFullscreen', label: '查看器 · 全屏', short: '全屏', group: 'viewer' },
   { key: 'viewerMeta', label: '查看器 · 元数据侧栏', short: '元数据', group: 'viewer' },
+  { key: 'viewerDelete', label: '查看器 · 删除（送回收站）', short: '删除', group: 'viewer' },
   { key: 'folderPrevGroup', label: '文件夹视角 · 上一组', short: '上组', group: 'global' },
   { key: 'folderNextGroup', label: '文件夹视角 · 下一组', short: '下组', group: 'global' },
 ]
@@ -212,7 +219,7 @@ export const MODIFIER_LABEL: Record<string, string> = {
 // Each row is a list of key ids; the visual keyboard keys use these ids.
 export const KEYBOARD_ROWS: string[][] = [
   ['Escape', 'F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12'],
-  ['`', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 'Backspace'],
+  ['`', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 'Backspace', 'Delete'],
   ['Tab', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\\'],
   ['CapsLock', 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', "'", 'Enter'],
   ['Shift', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 'Shift'],
@@ -236,13 +243,14 @@ export function keyCap(key: string): string {
     Meta: 'Win',
     CapsLock: 'Caps',
     Escape: 'Esc',
+    Delete: 'Del',
   }
   if (key in caps) return caps[key]
   return key.length === 1 ? key.toUpperCase() : key
 }
 
 export function keyIsWide(key: string): boolean {
-  return ['Backspace', 'Tab', 'CapsLock', 'Enter', 'Shift', 'Control', 'Meta', 'Alt', ' '].includes(key)
+  return ['Backspace', 'Delete', 'Tab', 'CapsLock', 'Enter', 'Shift', 'Control', 'Meta', 'Alt', ' '].includes(key)
 }
 
 export function keyIsSpace(key: string): boolean {

@@ -32,11 +32,29 @@ export interface ReviewSession {
     kind: 'swipe' | 'hide'
   }>
   arenaPair: [number, number] | null
-  arenaLastHideActionId: string | null
-  arenaLastHiddenImageId: number | null
-  /** The pair that was on screen when the last arena hide happened — undo
-   *  restores exactly this pair so the user lands back where they were. */
-  arenaLastHidePair: [number, number] | null
+  /**
+   * 擂台的操作历史 —— 「回到上一组」的依据。
+   *
+   * 为什么是**栈**而不是「上一次屏蔽」那一个槽：Backspace 的直觉含义是
+   * 「撤销我刚做的那一步」，而刚做的那一步可能是投票、屏蔽或跳过。
+   * 只记屏蔽时，投票之后按 Backspace 会跳到**很久以前**的某一对 ——
+   * 那正是本轮修掉的毛病。
+   *
+   * 生命周期：只在**本次进入擂台模式**期间有效 —— 下次进入擂台即清空
+   * （见 Arena 组件的挂载副作用）。快照留在应用状态里，不进数据库结构。
+   */
+  arenaHistory: ArenaHistoryEntry[]
+}
+
+/** 擂台上的一次操作。actionId 指向后端的 review action：
+ *  投票与屏蔽都能按它回滚分数（屏蔽还会把图放回队列）。 */
+export interface ArenaHistoryEntry {
+  kind: 'vote' | 'hide' | 'skip'
+  /** 当时屏上的那一对。回到上一组 = 把这一对放回屏上。 */
+  pair: [number, number]
+  /** 后端 action id；「跳过」没有动作，为 null。 */
+  actionId: string | null
+  winnerIsLeft?: boolean
 }
 
 const EMPTY_REVIEW_SESSION: ReviewSession = {
@@ -47,9 +65,7 @@ const EMPTY_REVIEW_SESSION: ReviewSession = {
   swipeCursor: 0,
   swipeUndoStack: [],
   arenaPair: null,
-  arenaLastHideActionId: null,
-  arenaLastHiddenImageId: null,
-  arenaLastHidePair: null,
+  arenaHistory: [],
 }
 
 export const IDLE_SYNC_PROGRESS: SyncProgressState = {
@@ -242,6 +258,35 @@ export const useStore = create<AppState>()(
         reviewSession: s.reviewSession,
         l2ListView: s.l2ListView,
       }),
+      // **持久化的形状会变，而默认合并是浅的。**
+      //
+      // zustand 的默认 merge = `{...currentState, ...persistedState}` ——
+      // 它把 `reviewSession` / `keybindings` 当成**一个整体字段**覆盖。
+      // 于是：只要我们给这两个对象**加了一个字段**（本轮加了
+      // `reviewSession.arenaHistory` 与 `keybindings.viewerDelete`），
+      // 旧用户磁盘上的那份就会**整体替换**新的 —— 新字段直接是
+      // `undefined`。
+      //
+      // 后果分两种：
+      //  · `undefined` 被当数组用 → 渲染时抛错 → 整个界面进错误边界
+      //    （实测：旧状态进擂台 → 「界面发生错误」）；
+      //  · `undefined` 被当绑定用 → `matchesBinding` 返回 false → 键位
+      //    **静默失效**（用户以为 Delete 坏了）。
+      //
+      // 所以这里自己合并：**逐字段**补齐默认，缺的填默认、多余的丢掉。
+      merge: (persisted, current) => {
+        const saved = (persisted ?? {}) as Partial<AppState>
+        const next: AppState = { ...current, ...saved }
+        next.reviewSession = {
+          ...EMPTY_REVIEW_SESSION,
+          ...(saved.reviewSession ?? {}),
+        }
+        if (!Array.isArray(next.reviewSession.arenaHistory)) {
+          next.reviewSession.arenaHistory = []
+        }
+        next.keybindings = { ...DEFAULT_KEYMAP, ...(saved.keybindings ?? {}) }
+        return next
+      },
     },
   ),
 )

@@ -19,6 +19,7 @@ import type { ImageRow } from '../types'
 import { useStore } from '../store'
 import { matchesBinding } from '../keymap'
 import { Lightbox } from './Lightbox'
+import { Thumb } from './Thumb'
 import { MoveSuggestionHeader, MoveSuggestionEmpty } from './MoveSuggestionHeader'
 import { FolderAxisStrip } from './FolderAxisStrip'
 import { PromptRecommendPanel } from './PromptRecommendPanel'
@@ -296,10 +297,29 @@ export function FolderView() {
     setActionError('')
     setConfirm(null)
     try {
+      // 文件已经不在盘上时，后端只删记录（没有东西可送回收站）。
       await trashImageApi(img.id)
       setImages((arr) => arr.filter((x) => x.id !== img.id))
       // 成员没了 → 缩略图要重取。
       bumpGroupRevision()
+    } catch (e) {
+      setActionError(`删除失败：${errorMessage(e)}`)
+    } finally {
+      setBusy(null)
+    }
+  }, [busy, bumpGroupRevision])
+
+  /** 查看器里按 Delete：图片进系统回收站（可从桌面恢复）。不做二次确认。 */
+  const trashFromViewer = useCallback(async (image: ImageRow) => {
+    if (busy !== null) return
+    setBusy(image.id)
+    setActionError('')
+    try {
+      await trashImageApi(image.id)
+      setImages((arr) => arr.filter((x) => x.id !== image.id))
+      bumpGroupRevision()
+      setLightbox(null)
+      trackAction('image_delete', { mode: 'folder', image_id: image.id })
     } catch (e) {
       setActionError(`删除失败：${errorMessage(e)}`)
     } finally {
@@ -720,6 +740,8 @@ export function FolderView() {
         <Lightbox
           src={assetUrl(lightbox.abs_path)}
           meta={lightbox}
+          target={lightbox}
+          onDelete={(image) => void trashFromViewer(image)}
           siblings={visible}
           index={lightboxIndex}
           onNavigate={(i) => {
@@ -749,7 +771,7 @@ export function FolderView() {
                   <div className="move-target-list">
                     {moveTargets.map((g) => (
                       <button key={g.group_key} className="move-target-card" type="button" disabled={moveBusy} onClick={() => void moveSelected(g.group_key)}>
-                        <span className="move-target-thumbs">{(moveThumbs[g.group_key] ?? []).slice(0, 4).map((path) => <img key={path} src={assetUrl(path)} alt="" />)}</span>
+                        <span className="move-target-thumbs">{(moveThumbs[g.group_key] ?? []).slice(0, 4).map((path) => <Thumb key={path} src={assetUrl(path)} alt="" />)}</span>
                         <span className="move-target-info"><strong>{g.prompt_pos.slice(0, 100) || '(无 prompt)'}</strong><span>{g.count} 张 · {g.checkpoint || '未知模型'} · {g.workflow_name || '未命名工作流'}</span></span>
                       </button>
                     ))}
@@ -776,7 +798,7 @@ export function FolderView() {
                         onClick={() => void moveSelected(s.group_key)}
                         title={`${s.basis === 'vision' ? '视觉相似' : '文本相似'} ${(s.score * 100).toFixed(0)}%`}
                       >
-                        <span className="move-target-thumbs">{(moveThumbs[s.group_key] ?? []).slice(0, 4).map((path) => <img key={path} src={assetUrl(path)} alt="" />)}</span>
+                        <span className="move-target-thumbs">{(moveThumbs[s.group_key] ?? []).slice(0, 4).map((path) => <Thumb key={path} src={assetUrl(path)} alt="" />)}</span>
                         <span className="move-target-info">
                           <strong>{s.prompt_pos.slice(0, 100) || '(无 prompt)'}</strong>
                           <span>{s.count} 张</span>
@@ -863,9 +885,11 @@ const FolderItemCard = memo(function FolderItemCard({
           onClick={(e) => e.stopPropagation()}
         />
       )}
-      <img
+      <Thumb
         src={assetUrl(img.abs_path)}
         alt={img.filename}
+        fileMissing={img.file_missing}
+        missingLabel="文件已删除"
         loading="lazy"
         decoding="async"
         onClick={batchMode ? undefined : () => onOpen(img)}
@@ -905,7 +929,11 @@ const FolderItemCard = memo(function FolderItemCard({
             type="button"
             onClick={(e) => { e.stopPropagation(); isConfirmPending ? onTrash(img) : onConfirmDelete(img.id) }}
             disabled={busy !== null}
-            title="送入系统回收站"
+            title={
+              img.file_missing
+                ? '文件已不在原路径 —— 这条记录会被清掉'
+                : '送入系统回收站'
+            }
             style={{ borderColor: 'var(--bad)' }}
           >
             {isConfirmPending ? '确认删除' : '删除'}

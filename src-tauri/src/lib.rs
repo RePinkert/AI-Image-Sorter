@@ -260,8 +260,7 @@ fn run_gui() {
             commands::list_library_candidates,
             commands::preview_library_recovery,
             commands::apply_library_recovery,
-            commands::discard_unconfirmed_image,
-            commands::list_unconfirmed_images,
+            commands::trash_image,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

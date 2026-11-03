@@ -1,15 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { arenaHide, arenaVote, assetUrl, errorMessage, listGroupImages, undoReviewAction } from '../api'
+import { arenaHide, arenaVote, assetUrl, errorMessage, listGroupImages, trashImage, undoReviewAction } from '../api'
 import type { ImageRow } from '../types'
 import { useStore } from '../store'
+import type { ArenaHistoryEntry } from '../store'
 import { bindingDisplay, matchesBinding } from '../keymap'
 import { getTelemetrySessionId, trackAction } from '../telemetry'
 import { Lightbox } from './Lightbox'
 import { Popover } from './Popover'
 import { ImageMetaPopover } from './ImageMetaPopover'
+import { Thumb } from './Thumb'
 import { pairKey, pickArenaPair } from '../lib/arenaPair'
 
 const RECENT_BASE_LIMIT = 20
+/** 操作历史的长度上限 —— 快照只在本进入擂台期间有效，不该无限长。 */
+const HISTORY_LIMIT = 50
 
 function isEditableTarget(target: EventTarget | null) {
   return target instanceof HTMLElement && (
@@ -21,7 +25,7 @@ function isEditableTarget(target: EventTarget | null) {
 type RetryAction =
   | { kind: 'vote'; winnerIsLeft: boolean }
   | { kind: 'hide'; image: ImageRow }
-  | { kind: 'undo' }
+  | { kind: 'back' }
 
 export function Arena() {
   const setView = useStore((s) => s.setView)
@@ -39,11 +43,13 @@ export function Arena() {
   const [actionError, setActionError] = useState('')
   const [retryAction, setRetryAction] = useState<RetryAction | null>(null)
   const [busy, setBusy] = useState(false)
-  const [lightbox, setLightbox] = useState<string | null>(null)
+  const [lightbox, setLightbox] = useState<ImageRow | null>(null)
   const [fly, setFly] = useState<'left' | 'right' | null>(null)
   const [leftPopoverOpen, setLeftPopoverOpen] = useState(false)
   const [rightPopoverOpen, setRightPopoverOpen] = useState(false)
   const [pendingHide, setPendingHide] = useState(false)
+  const [notice, setNotice] = useState('')
+  const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const recent = useRef<Set<string>>(new Set())
   const lastShownRound = useRef<Record<number, number>>({})
   const roundCounter = useRef(0)
@@ -94,6 +100,24 @@ export function Arena() {
     startedAtRef.current = new Date().toISOString()
     updateReviewSession({ arenaPair: [nextLeft.id, nextRight.id] })
   }, [updateReviewSession, markShown])
+
+  /** 记一步操作 —— Backspace 的依据。栈，不是「最后一次屏蔽」那一个槽。 */
+  const pushHistory = useCallback((entry: ArenaHistoryEntry) => {
+    const session = useStore.getState().reviewSession
+    const next = [...(session.arenaHistory ?? []), entry].slice(-HISTORY_LIMIT)
+    updateReviewSession({ arenaHistory: next })
+  }, [updateReviewSession])
+
+  /** 一次性反馈行（删除等动作的结果）—— 没有确认框，就得有回执。 */
+  const showNotice = useCallback((text: string) => {
+    setNotice(text)
+    if (noticeTimer.current) clearTimeout(noticeTimer.current)
+    noticeTimer.current = setTimeout(() => setNotice(''), 4000)
+  }, [])
+
+  useEffect(() => () => {
+    if (noticeTimer.current) clearTimeout(noticeTimer.current)
+  }, [])
 
   const load = useCallback(async () => {
     if (currentGroupKey == null) return
@@ -147,6 +171,12 @@ export function Arena() {
     }
   }, [load])
 
+  // 操作历史只在**本次进入擂台模式**期间有效：下次进入擂台即清空。
+  // 快照因此不会在应用状态里越积越长（也不进数据库结构）。
+  useEffect(() => {
+    updateReviewSession({ arenaHistory: [] })
+  }, [updateReviewSession])
+
   async function vote(winnerIsLeft: boolean) {
     if (!left || !right || !currentGroupKey || busy) return
     const request = ++actionRequestRef.current
@@ -158,7 +188,7 @@ export function Arena() {
     setActionError('')
     setRetryAction(null)
     try {
-      const [newLeft, newRight] = await arenaVote(
+      const result = await arenaVote(
         currentGroupKey,
         pairLeft.id,
         pairRight.id,
@@ -170,8 +200,15 @@ export function Arena() {
         },
       )
       if (request !== actionRequestRef.current) return
-      const nextScores = { ...scores, [pairLeft.id]: newLeft, [pairRight.id]: newRight }
+      const nextScores = { ...scores, [pairLeft.id]: result.left_score, [pairRight.id]: result.right_score }
       setScores(nextScores)
+      // 这一票记进历史：Backspace 能回到这一组，并把双方分数还原。
+      pushHistory({
+        kind: 'vote',
+        pair: [pairLeft.id, pairRight.id],
+        actionId: result.action_id,
+        winnerIsLeft,
+      })
       trackAction('arena_vote_commit', {
         side: winnerIsLeft ? 'left' : 'right',
         duration_ms: Date.now() - startedMs,
@@ -229,10 +266,11 @@ export function Arena() {
         [image.id]: result.victim_score,
         [survivor.id]: result.survivor_score,
       }
-      updateReviewSession({
-        arenaLastHideActionId: result.action_id,
-        arenaLastHiddenImageId: image.id,
-        arenaLastHidePair: [left.id, right.id],
+      // 屏蔽同样记进历史：Backspace 回到这一组时撤销屏蔽（图放回队列）。
+      pushHistory({
+        kind: 'hide',
+        pair: [left.id, right.id],
+        actionId: result.action_id,
       })
       setImages(nextImages)
       setScores(nextScores)
@@ -258,20 +296,29 @@ export function Arena() {
     }
   }
 
-  async function undoLastHide() {
+  /**
+   * Backspace = 回到上一组。
+   *
+   * 「上一组」是**用户真正操作过的那一组**（投票 / 屏蔽 / 跳过），而不是
+   * 「上一次屏蔽的那一组」—— 后者会把用户甩到几轮之前（本轮修掉的毛病）。
+   * 回到时按动作类型回滚：投票回滚双方分数；屏蔽撤销屏蔽并把图放回队列。
+   */
+  const goBack = useCallback(async () => {
     const session = useStore.getState().reviewSession
-    const actionId = session.arenaLastHideActionId
-    const hiddenImageId = session.arenaLastHiddenImageId
-    const restorePair = session.arenaLastHidePair
-    if (!actionId || hiddenImageId == null || busy || currentGroupKey == null) return
+    const stack = session.arenaHistory ?? []
+    const entry = stack[stack.length - 1]
+    if (!entry || busy || currentGroupKey == null) return
+    updateReviewSession({ arenaHistory: stack.slice(0, -1) })
     const request = ++actionRequestRef.current
     actionInFlightRef.current = true
     setBusy(true)
     setActionError('')
     setRetryAction(null)
     try {
-      await undoReviewAction(actionId, getTelemetrySessionId())
-      if (request !== actionRequestRef.current) return
+      if (entry.actionId) {
+        // 投票与屏蔽都由后端按快照还原分数；屏蔽还会把图放回队列。
+        await undoReviewAction(entry.actionId, getTelemetrySessionId())
+      }
       const nextImages = await listGroupImages(currentGroupKey, granularity)
       if (request !== actionRequestRef.current) return
       const nextScores: Record<number, number> = {}
@@ -280,27 +327,76 @@ export function Arena() {
       })
       setImages(nextImages)
       setScores(nextScores)
-      updateReviewSession({
-        arenaLastHideActionId: null,
-        arenaLastHiddenImageId: null,
-        arenaLastHidePair: null,
-      })
-      trackAction('hide', { hidden: false, mode: 'arena', image_id: hiddenImageId })
-      if (restorePair) {
-        // Undo must land back on the EXACT pair that was on screen when the
-        // hide happened — not a random next pair — so the user can redo.
-        const restoredLeft = nextImages.find((image) => image.id === restorePair[0])
-        const restoredRight = nextImages.find((image) => image.id === restorePair[1])
-        if (restoredLeft && restoredRight && restoredLeft.id !== restoredRight.id) {
-          setLeft(restoredLeft)
-          setRight(restoredRight)
-          markShown(restoredLeft, restoredRight)
-          startedAtRef.current = new Date().toISOString()
-          updateReviewSession({ arenaPair: [restoredLeft.id, restoredRight.id] })
-        } else {
-          selectPair(nextImages, nextScores)
-        }
+      const restoredLeft = nextImages.find((image) => image.id === entry.pair[0])
+      const restoredRight = nextImages.find((image) => image.id === entry.pair[1])
+      if (restoredLeft && restoredRight && restoredLeft.id !== restoredRight.id) {
+        setLeft(restoredLeft)
+        setRight(restoredRight)
+        markShown(restoredLeft, restoredRight)
+        startedAtRef.current = new Date().toISOString()
+        updateReviewSession({ arenaPair: [restoredLeft.id, restoredRight.id] })
       } else {
+        selectPair(nextImages, nextScores)
+      }
+      trackAction('arena_back', { kind: entry.kind })
+      actionInFlightRef.current = false
+      setBusy(false)
+      if (reloadAfterActionRef.current) {
+        reloadAfterActionRef.current = false
+        void load()
+      }
+    } catch (error) {
+      if (request !== actionRequestRef.current) return
+      actionInFlightRef.current = false
+      setBusy(false)
+      setRetryAction({ kind: 'back' })
+      setActionError(errorMessage(error))
+      // 失败就把这一条**放回**栈里 —— 否则用户的「上一步」凭空消失，
+      // 而「重试」会退回到更早的那一步（错的）。
+      const current = useStore.getState().reviewSession
+      updateReviewSession({
+        arenaHistory: [...(current.arenaHistory ?? []), entry].slice(-HISTORY_LIMIT),
+      })
+    }
+  }, [busy, currentGroupKey, granularity, load, markShown, selectPair, updateReviewSession])
+
+  /** 跳过这一对 —— 也算一步操作，Backspace 能回到它（不改分）。 */
+  const skipPair = useCallback(() => {
+    if (!left || !right) return
+    pushHistory({ kind: 'skip', pair: [left.id, right.id], actionId: null })
+    selectPair(images, scores)
+  }, [images, left, pushHistory, right, scores, selectPair])
+
+  /**
+   * 查看器里按 Delete：图片进系统回收站（可从桌面恢复）。
+   * 不做二次确认 —— 用户按的就是「删除」，回收站本身就是后悔药。
+   */
+  const deleteImage = useCallback(async (image: ImageRow) => {
+    if (busy) return
+    const request = ++actionRequestRef.current
+    actionInFlightRef.current = true
+    setBusy(true)
+    setActionError('')
+    setRetryAction(null)
+    try {
+      await trashImage(image.id)
+      if (request !== actionRequestRef.current) return
+      const nextImages = images.filter((item) => item.id !== image.id)
+      const nextScores = { ...scores }
+      delete nextScores[image.id]
+      setImages(nextImages)
+      setScores(nextScores)
+      // 历史里涉及这张图的记录一并作废：那一对已经不存在了。
+      const session = useStore.getState().reviewSession
+      updateReviewSession({
+        arenaHistory: (session.arenaHistory ?? []).filter(
+          (item) => item.pair[0] !== image.id && item.pair[1] !== image.id,
+        ),
+      })
+      setLightbox(null)
+      showNotice(`已送入回收站：${image.filename}`)
+      trackAction('image_delete', { mode: 'arena', image_id: image.id })
+      if (!left || !right || left.id === image.id || right.id === image.id) {
         selectPair(nextImages, nextScores)
       }
       actionInFlightRef.current = false
@@ -313,16 +409,15 @@ export function Arena() {
       if (request !== actionRequestRef.current) return
       actionInFlightRef.current = false
       setBusy(false)
-      setRetryAction({ kind: 'undo' })
       setActionError(errorMessage(error))
     }
-  }
+  }, [busy, images, left, load, right, scores, selectPair, showNotice, updateReviewSession])
 
   function retry() {
     if (!retryAction) return
     if (retryAction.kind === 'vote') void vote(retryAction.winnerIsLeft)
     else if (retryAction.kind === 'hide') void hideCard(retryAction.image)
-    else void undoLastHide()
+    else void goBack()
   }
 
   useEffect(() => {
@@ -350,10 +445,10 @@ export function Arena() {
         void vote(false)
       } else if (matchesBinding(keybindings.arenaSkip, event)) {
         event.preventDefault()
-        if (!busy) selectPair(images, scores)
+        if (!busy) skipPair()
       } else if (matchesBinding(keybindings.arenaUndoHide, event)) {
         event.preventDefault()
-        void undoLastHide()
+        void goBack()
       }
     }
     const onKeyUp = (event: KeyboardEvent) => {
@@ -369,10 +464,13 @@ export function Arena() {
       window.removeEventListener('blur', clearPendingHide)
       document.removeEventListener('visibilitychange', onVisibility)
     }
-  }, [busy, images, keybindings, left, leftPopoverOpen, lightbox, right, rightPopoverOpen, scores, selectPair])
+  }, [busy, goBack, images, keybindings, left, leftPopoverOpen, lightbox, right, rightPopoverOpen, scores, skipPair])
 
   const leftScore = left ? scores[left.id] ?? 50 : 0
   const rightScore = right ? scores[right.id] ?? 50 : 0
+  // 防御：持久化里的 reviewSession 可能是**旧形状**（没有 arenaHistory）。
+  const history = reviewSession.arenaHistory ?? []
+  const lastHistory = history[history.length - 1] ?? null
 
   if (currentGroupKey == null) {
     return <StatePanel message="未选择分组。" actionLabel="返回分组" onAction={() => setView('groups')} />
@@ -391,7 +489,7 @@ export function Arena() {
         <button type="button" onClick={() => setView('swipe')}>← 返回滑卡</button>
         <span className="counter">擂台模式</span>
         <button type="button" onClick={() => setView('folder')}>文件夹视角</button>
-        <button type="button" onClick={() => selectPair(images, scores)} disabled={busy}>下一对</button>
+        <button type="button" onClick={skipPair} disabled={busy}>下一对</button>
       </div>
       {actionError && (
         <div className="action-error" role="alert">
@@ -399,73 +497,100 @@ export function Arena() {
           <button type="button" disabled={busy} onClick={retry}>重试</button>
         </div>
       )}
+      {notice && <div className="notice-line" role="status">{notice}</div>}
       {pendingHide && (
         <div className="arena-pending-hint">
           待屏蔽：按住 Shift，{bindingDisplay(keybindings.arenaHideLeft)} 屏蔽左卡 ·{' '}
           {bindingDisplay(keybindings.arenaHideRight)} 屏蔽右卡 · 松开 Shift 取消
         </div>
       )}
-      {reviewSession.arenaLastHideActionId && (
+      {lastHistory && (
         <div className="arena-undo-bar" role="status">
-          <span>已屏蔽一张图片（幸存方已按胜者计分）</span>
-          <button type="button" disabled={busy} onClick={() => void undoLastHide()}>
-            {bindingDisplay(keybindings.arenaUndoHide)} 撤销并回到上一对
+          <span>{backHint(lastHistory)}</span>
+          <button type="button" disabled={busy} onClick={() => void goBack()}>
+            {bindingDisplay(keybindings.arenaUndoHide)} 回到上一组
           </button>
         </div>
       )}
       <div className="arena-stage">
         <div
           className={`arena-card ${pendingHide ? 'arena-pending' : ''} ${fly === 'left' ? 'fly-left' : ''} ${fly === 'right' ? 'fly-right' : ''}`}
-          role="button"
-          tabIndex={0}
-          aria-label={pendingHide ? '屏蔽左侧图片' : '选择左侧图片胜出'}
-          onClick={() => pendingHide ? void hideCard(left) : void vote(true)}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter' || event.key === ' ') {
-              event.preventDefault()
-              pendingHide ? void hideCard(left) : void vote(true)
-            }
-          }}
+          role="group"
+          aria-label={pendingHide ? '屏蔽左侧图片' : '左侧图片'}
         >
-          <img src={assetUrl(left.abs_path)} alt={left.filename} draggable={false} onClick={(event) => { event.stopPropagation(); setLightbox(left.abs_path) }} />
+          <Thumb
+            src={assetUrl(left.abs_path)}
+            alt={left.filename}
+            fileMissing={left.file_missing}
+            draggable={false}
+            onClick={() => setLightbox(left)}
+          />
           <Popover open={leftPopoverOpen} onOpenChange={setLeftPopoverOpen} trigger={<button type="button" className="more-btn">更多 ▾</button>}>
             <ImageMetaPopover img={left} comparePrompt={bothOpen ? right.prompt_pos : undefined} diffColor="left" onHide={hideCard} />
           </Popover>
           <div className="arena-score">{leftScore.toFixed(1)}</div>
-          <div className="arena-label">{pendingHide ? '← 屏蔽此卡' : '点击/← 胜出'}</div>
+          <button
+            type="button"
+            className="arena-vote-btn"
+            disabled={busy}
+            onClick={() => (pendingHide ? void hideCard(left) : void vote(true))}
+            aria-label={pendingHide ? '屏蔽这张图片' : '选这张图片胜出'}
+          >
+            {pendingHide ? '屏蔽此卡（←）' : '选它胜出（←）'}
+          </button>
         </div>
         <div className="arena-vs">VS</div>
         <div
           className={`arena-card ${pendingHide ? 'arena-pending' : ''} ${fly === 'right' ? 'fly-left' : ''} ${fly === 'left' ? 'fly-right' : ''}`}
-          role="button"
-          tabIndex={0}
-          aria-label={pendingHide ? '屏蔽右侧图片' : '选择右侧图片胜出'}
-          onClick={() => pendingHide ? void hideCard(right) : void vote(false)}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter' || event.key === ' ') {
-              event.preventDefault()
-              pendingHide ? void hideCard(right) : void vote(false)
-            }
-          }}
+          role="group"
+          aria-label={pendingHide ? '屏蔽右侧图片' : '右侧图片'}
         >
-          <img src={assetUrl(right.abs_path)} alt={right.filename} draggable={false} onClick={(event) => { event.stopPropagation(); setLightbox(right.abs_path) }} />
+          <Thumb
+            src={assetUrl(right.abs_path)}
+            alt={right.filename}
+            fileMissing={right.file_missing}
+            draggable={false}
+            onClick={() => setLightbox(right)}
+          />
           <Popover open={rightPopoverOpen} onOpenChange={setRightPopoverOpen} trigger={<button type="button" className="more-btn">更多 ▾</button>}>
             <ImageMetaPopover img={right} comparePrompt={bothOpen ? left.prompt_pos : undefined} diffColor="right" onHide={hideCard} />
           </Popover>
           <div className="arena-score">{rightScore.toFixed(1)}</div>
-          <div className="arena-label">{pendingHide ? '→ 屏蔽此卡' : '点击/→ 胜出'}</div>
+          <button
+            type="button"
+            className="arena-vote-btn"
+            disabled={busy}
+            onClick={() => (pendingHide ? void hideCard(right) : void vote(false))}
+            aria-label={pendingHide ? '屏蔽这张图片' : '选这张图片胜出'}
+          >
+            {pendingHide ? '屏蔽此卡（→）' : '选它胜出（→）'}
+          </button>
         </div>
       </div>
       <p className="muted hint arena-hint-text">
-        <b>{bindingDisplay(keybindings.arenaVoteLeft)} / {bindingDisplay(keybindings.arenaVoteRight)}</b> 选胜方 ·{' '}
+        <b>{bindingDisplay(keybindings.arenaVoteLeft)} / {bindingDisplay(keybindings.arenaVoteRight)}</b> 选胜方（也可点卡片下方按钮）·{' '}
         <b>{bindingDisplay(keybindings.arenaSkip)}</b> 跳过 · 按住 <b>{bindingDisplay(keybindings.arenaArmHide)}</b> 后按{' '}
         <b>{bindingDisplay(keybindings.arenaHideLeft)} / {bindingDisplay(keybindings.arenaHideRight)}</b> 屏蔽对应卡 ·{' '}
-        <b>{bindingDisplay(keybindings.arenaUndoHide)}</b> 撤销屏蔽（分数一并还原）· 屏蔽后幸存方按胜者计分 ·{' '}
-        单击图片放大 · 两侧"更多"可屏蔽并查看 Prompt 差异
+        <b>{bindingDisplay(keybindings.arenaUndoHide)}</b> 回到上一组（分数一并回滚）· 屏蔽后幸存方按胜者计分 ·{' '}
+        点图片放大查看 · 两侧"更多"可屏蔽并查看 Prompt 差异
       </p>
-      {lightbox && <Lightbox src={assetUrl(lightbox)} onClose={() => setLightbox(null)} />}
+      {lightbox && (
+        <Lightbox
+          src={assetUrl(lightbox.abs_path)}
+          target={lightbox}
+          onDelete={(image) => void deleteImage(image)}
+          onClose={() => setLightbox(null)}
+        />
+      )}
     </div>
   )
+}
+
+/** 撤销条上的一句话：说清楚「按下去会发生什么」。 */
+function backHint(entry: ArenaHistoryEntry): string {
+  if (entry.kind === 'vote') return '上一组：已投票（回到它，双方分数一并回滚）'
+  if (entry.kind === 'hide') return '上一组：已屏蔽一张（回到它，撤销屏蔽）'
+  return '上一组：已跳过（回到它，分数不变）'
 }
 
 function StatePanel({ message, actionLabel, onAction }: { message: string; actionLabel?: string; onAction?: () => void }) {

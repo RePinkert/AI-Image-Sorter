@@ -77,8 +77,8 @@ pub struct SyncAllResult {
     pub parse_errors: usize,
     /// v19：这一轮识别出的改名数量。
     pub renamed: usize,
-    /// v19：身份无法确认、被保留待确认的旧记录数量。
-    pub unconfirmed: usize,
+    /// 第 33 轮：文件已被删除、**自动清理**掉的记录数量。
+    pub removed: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,8 +137,8 @@ pub struct ScanResult {
     pub parse_errors: usize,
     /// v19：识别出的改名数量（路径变了，行没换 → 评分/标签/分组全保住）。
     pub renamed: usize,
-    /// v19：身份无法确认、被保留待确认的旧记录数量。
-    pub unconfirmed: usize,
+    /// 第 33 轮：文件已被删除、**自动清理**掉的记录数量。
+    pub removed: usize,
 }
 
 /// Canonicalize a path for stable cross-rescan matching so that the same
@@ -225,7 +225,7 @@ pub async fn add_source_and_scan(
             groups: stats.affected.len(),
             parse_errors: stats.parse_errors + backfilled.1,
             renamed: stats.renamed.len(),
-            unconfirmed: stats.unconfirmed.len(),
+            removed: stats.removed,
         })
     })
     .await
@@ -248,8 +248,8 @@ struct ScanStats {
     affected: HashSet<String>,
     /// v19：识别出的改名（路径变了，行没换）。
     renamed: Vec<RenameEvent>,
-    /// v19：身份无法确认、但**带用户状态**因而被保留的旧记录。
-    unconfirmed: Vec<UnconfirmedImage>,
+    /// 第 33 轮：文件已被删除、**自动清理**掉的记录数。
+    removed: usize,
 }
 
 /// 一次改名命中 —— 要把「凭什么认为是同一张图」如实告诉用户。
@@ -259,14 +259,6 @@ pub struct RenameEvent {
     pub new_path: String,
     /// 判定依据（内容键 / 元数据 / 内容哈希）。
     pub basis: String,
-}
-
-/// 身份无法确认的旧记录（文件不在原路径，且认不出来）。
-#[derive(Debug, Clone, Serialize)]
-pub struct UnconfirmedImage {
-    pub abs_path: String,
-    pub filename: String,
-    pub reason: String,
 }
 
 /// Idempotent scan of one source folder: keep rows for files still on disk
@@ -291,6 +283,11 @@ fn scan_source(
     norm_source: &str,
     files: &[PathBuf],
 ) -> Result<ScanStats, String> {
+    // **指纹必须先补齐**（第 33 轮）：「改名认领」的第三级判定依据就是
+    // 它 —— 指纹是**扫描时**算的，改名之后旧文件已经不在盘上，来不及算。
+    // 所以补齐必须在扫描**之前**。一次性代价（存量行读一遍盘），补齐
+    // 之后每次扫描都是 0 成本。
+    let _ = backfill_content_fingerprints(db, source_id);
     let identity = db
         .list_source_identity_rows(source_id)
         .map_err(|e| e.to_string())?;
@@ -298,12 +295,6 @@ fn scan_source(
     for row in &identity {
         existing_map.insert(normalize_path(&PathBuf::from(&row.abs_path)), row.clone());
     }
-    // 带用户状态（评分 / 标签 / 手动分组）的行：改名认领失败时**保留**，
-    // 交给用户确认 —— 宁可多留一行，也不毁掉手工分拣的结果。
-    let user_state = db
-        .images_with_user_state(source_id)
-        .map_err(|e| e.to_string())?;
-
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -438,7 +429,6 @@ fn scan_source(
     let matches = crate::fingerprint::match_renames(&olds, &news);
 
     let mut matched_new: HashSet<usize> = HashSet::new();
-    let mut preserved: HashSet<i64> = HashSet::new();
     for m in &matches {
         let old = &olds[m.old_index];
         let new = &parsed[m.new_index];
@@ -456,20 +446,16 @@ fn scan_source(
             basis: m.basis.as_str().to_string(),
         });
     }
-    // 认领不出来的旧行：带用户状态的**保留**并上报，等用户确认。
-    for (i, o) in olds.iter().enumerate() {
-        if matches.iter().any(|m| m.old_index == i) {
-            continue;
-        }
-        if user_state.contains(&o.id) {
-            preserved.insert(o.id);
-            stats.unconfirmed.push(UnconfirmedImage {
-                abs_path: o.abs_path.clone(),
-                filename: o.abs_path.rsplit('/').next().unwrap_or("").to_string(),
-                reason: "文件已不在原路径，且无法按内容确认身份 —— 记录已保留".to_string(),
-            });
-        }
-    }
+    // ── 第 33 轮：路径对不上的旧行 → **自动清理** ──────────────
+    //
+    // 用户 2026-11-02 裁决：「用户删了就删了，提醒一下就可以了」——
+    // 让人手动点 N 次「确认删除」不是好体验。所以：文件不在原路径、
+    // 又没能按内容认领（改名）的行，**直接清掉**（连同评分 / 标签 /
+    // 手动分组 —— 图都没了，这些也没有意义了）。
+    //
+    // 改名本身仍然**不丢分拣**：上面那一步（按内容身份认领 → 就地改
+    // 路径）已经处理掉了绝大多数改名；走到这里的行，是**真的没人要了**。
+    // 下面 delete_missing_source_images 会把它们清掉（路径不在盘上）。
 
     // ── 认领不出来的旧文件 = 真·新图 ──────────────────────────
     for (i, p) in parsed.iter().enumerate() {
@@ -537,13 +523,23 @@ fn scan_source(
         stats.added += 1;
     }
 
-    // Remove rows for files that vanished from disk — except the ones the
-    // user still has state on (they are preserved for confirmation).
+    // Remove rows for files that vanished from disk.
+    //
+    // 第 33 轮：文件没了 → **自动清理**（用户 2026-11-02 裁决：「用户删了
+    // 就删了，提醒一下就可以了」）。评分 / 标签 / 手动分组一并清掉 ——
+    // 图都没了，它们也没有意义。
+    //
+    // 改名**不**走这条路：上面那一步已经按内容身份认领掉、就地改了路径。
     let (removed, deleted_l1) = db
-        .delete_missing_source_images(source_id, &on_disk, &preserved)
+        .delete_missing_source_images(source_id, &on_disk)
         .map_err(|e| e.to_string())?;
     stats.affected.extend(deleted_l1);
-    let _ = removed;
+    stats.removed = removed;
+    if removed > 0 {
+        // 这行日志是发行版探针的**实现特征串**（`missing.autoclean`）——
+        // 它在二进制里，就说明自动清理这条路真的被编进去了。
+        log::info!("source {source_id}: 已自动清理 {removed} 条文件已不在原路径的记录");
+    }
     Ok(stats)
 }
 
@@ -757,7 +753,7 @@ fn run_sync(
     let mut total_pending = 0usize;
     let mut total_parse_errors = 0usize;
     let mut total_renamed = 0usize;
-    let mut total_unconfirmed = 0usize;
+    let mut total_removed = 0usize;
     let mut any_recluster = false;
     let mut any_changed = false;
 
@@ -781,7 +777,7 @@ fn run_sync(
 
         let norm_source = normalize_path(&PathBuf::from(&src.path));
         let (files, newest) = comfy_finder::list_images_with_newest(&PathBuf::from(&src.path));
-        let (stored_count, stored_newest) = db
+        let (_stored_count, stored_newest) = db
             .get_source_stats(src.id)
             .map_err(|e| e.to_string())?;
         // Re-cluster affected groups at the threshold the USER last applied
@@ -812,7 +808,21 @@ fn run_sync(
         // Only touch sources whose on-disk state actually changed since the
         // last scan. Unchanged sources emit NO progress events so the UI
         // sync bar stays silent on no-op polls.
-        let changed = stored_count != files.len() as i64 || stored_newest != newest;
+        //
+        // 第 33 轮：**用活的行数比**，不用存下来的 watermark。
+        //
+        // 为什么：watermark 记的是「已处理数」，而删除会被**上一轮扫描**
+        // 吸收掉 —— 那一轮把行留下了（旧的“绝不静默删除”口径），却把
+        // watermark 记成了盘上文件数，两者**重新相等** → 之后每 8 秒都判
+        // 「这个源没变」→ 扫描器**再也不会**碰那些行 → 用户删掉的文件
+        // 永远留在库里（实测：1003 行 vs 盘上 993 个文件，watermark 993）。
+        //
+        // 活的行数 vs 盘上文件数：不等 = 库里多了行（文件没了）或少了行
+        // （新文件 / 稳定性窗口里还没解析的文件）→ 都要扫。
+        let rows_now = db
+            .count_source_images(src.id)
+            .map_err(|e| e.to_string())?;
+        let changed = rows_now != files.len() || stored_newest != newest;
         any_changed |= changed;
         let mut affected: HashSet<String> = HashSet::new();
         let mut found = files.len();
@@ -840,10 +850,8 @@ fn run_sync(
             total_added += stats.added;
             total_pending += stats.pending;
             total_renamed += stats.renamed.len();
-            total_unconfirmed += stats.unconfirmed.len();
+            total_removed += stats.removed;
             emit("scan", found, processed, added, pending, stats.parse_errors);
-            // 指纹一次性补齐 —— 必须在**下一次改名之前**算好。
-            let _ = backfill_content_fingerprints(db, src.id);
         }
 
         let (backfilled, backfill_parse_errors) = backfill_source(db, src.id, &norm_source)?;
@@ -951,7 +959,7 @@ fn run_sync(
         reclustered: any_recluster,
         parse_errors: total_parse_errors,
         renamed: total_renamed,
-        unconfirmed: total_unconfirmed,
+        removed: total_removed,
     })
 }
 
@@ -1097,7 +1105,8 @@ fn trash_one_image(db: &crate::db::Db, image_id: i64) -> Result<(), String> {
     if p.exists() {
         trash::delete(&p).map_err(|e| e.to_string())?;
     }
-    db.delete_image_by_id(image_id)
+    // 评分没有外键 —— 连它一起删，别留一条指向不存在图片的孤儿评分。
+    db.delete_image_and_state(image_id)
         .map_err(|e| e.to_string())
 }
 
@@ -1194,7 +1203,10 @@ pub struct ArenaArgs {
 }
 
 #[tauri::command]
-pub fn arena_vote(args: ArenaArgs, state: State<'_, AppState>) -> Result<(f64, f64), String> {
+pub fn arena_vote(
+    args: ArenaArgs,
+    state: State<'_, AppState>,
+) -> Result<crate::db::ArenaVoteResult, String> {
     state
         .db
         .arena_vote_atomic(
@@ -1386,10 +1398,17 @@ pub fn undo_review_action(
 
 /// Send an image file to the operating-system recycle bin (Windows:
 /// SHFileOperation with FOF_ALLOWUNDO — fully reversible from the desktop
-/// Recycle Bin) and remove its DB row. Scores/labels cascade-delete with
-/// the image_id FK, which matches user intent ("this picture is gone, get
-/// rid of its metadata too"). The file is *not* permanently deleted; the
-/// user can restore it from the Recycle Bin if they change their mind.
+/// Recycle Bin) and remove its DB row. Labels / manual groupings cascade-
+/// delete with the image_id FK, and the score is deleted explicitly —
+/// `scores` has **no** foreign key (see the schema), so relying on the
+/// cascade leaves a score pointing at an image that no longer exists.
+/// This matches user intent ("this picture is gone, get rid of its metadata
+/// too"). The file is *not* permanently deleted; the user can restore it from
+/// the Recycle Bin if they change their mind.
+///
+/// If the file is **already gone** (deleted outside the app), there is
+/// nothing to send to the recycle bin — the row (and its score) are simply
+/// removed. That is the same outcome the user asked for.
 #[tauri::command]
 pub fn trash_image(
     image_id: i64,
@@ -1411,7 +1430,7 @@ pub fn trash_image(
     }
     state
         .db
-        .delete_image_by_id(image_id)
+        .delete_image_and_state(image_id)
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -1996,69 +2015,6 @@ pub fn apply_library_recovery(
     crate::reconcile::apply(&state.db, &path)
 }
 
-/// 用户确认「这张图确实被删了」→ 把那条**身份无法确认**的旧记录删掉。
-///
-/// 这是「绝不静默删除」的另一半：先保留、再让用户决定。
-#[tauri::command]
-pub fn discard_unconfirmed_image(
-    image_id: i64,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    state.db.delete_image_row(image_id).map_err(|e| e.to_string())
-}
-
-/// 身份无法确认、被保留待确认的旧记录（第 29 轮）。
-///
-/// 判据：文件已经不在原路径上，**而且**这条记录带用户状态（评分 / 标签 /
-/// 手动分组）。前者是「图没了」，后者是「不能悄悄扔掉」—— 两个都成立才
-/// 进这份名单。
-#[derive(Debug, Clone, Serialize)]
-pub struct UnconfirmedImageDto {
-    pub id: i64,
-    pub abs_path: String,
-    pub filename: String,
-    pub reason: String,
-}
-
-#[tauri::command]
-pub fn list_unconfirmed_images(
-    state: State<'_, AppState>,
-) -> Result<Vec<UnconfirmedImageDto>, String> {
-    let sources = state.db.list_sources().map_err(|e| e.to_string())?;
-    let mut out: Vec<UnconfirmedImageDto> = Vec::new();
-    for src in sources {
-        let rows = state
-            .db
-            .list_source_identity_rows(src.id)
-            .map_err(|e| e.to_string())?;
-        let user_state = state
-            .db
-            .images_with_user_state(src.id)
-            .map_err(|e| e.to_string())?;
-        for row in rows {
-            if !user_state.contains(&row.id) {
-                continue;
-            }
-            if PathBuf::from(&row.abs_path).is_file() {
-                continue;
-            }
-            let filename = row
-                .abs_path
-                .rsplit('/')
-                .next()
-                .unwrap_or(&row.abs_path)
-                .to_string();
-            out.push(UnconfirmedImageDto {
-                id: row.id,
-                abs_path: row.abs_path.clone(),
-                filename,
-                reason: "文件已不在原路径，且无法按内容确认身份 —— 记录已保留".to_string(),
-            });
-        }
-    }
-    Ok(out)
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupThumbDto {
     pub group_key: String,
@@ -2366,7 +2322,7 @@ mod e2e_tests {
         let second = scan_source(&db, source_id, &norm, &files2).unwrap();
         assert_eq!(second.renamed.len(), 1, "应识别出一次改名");
         assert_eq!(second.added, 0, "改名不该被当成新图");
-        assert_eq!(second.unconfirmed.len(), 0, "改名认出来了，不该有待确认");
+        assert_eq!(second.removed, 0, "改名认出来了，不该有任何清理");
 
         // 行数不变、image_id 不变、评分还在。
         let rows = db.list_source_identity_rows(source_id).unwrap();
@@ -2380,12 +2336,13 @@ mod e2e_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 第 29 轮：**身份认不出来时绝不静默删除**。
+    /// 第 33 轮：**文件真的被删了 → 自动清理**（用户 2026-11-02 裁决：
+    /// 「用户删了就删了，提醒一下就可以了」）。
     ///
-    /// 场景：一张带评分的图，它的文件被删了（不是改名 —— 认不出来）。
-    /// 期望：这一行**被保留**并进「待确认」名单，绝不悄悄消失。
+    /// 场景：一张带评分的图，它的文件被删了，也没人来认领（不是改名）。
+    /// 期望：这一行**自动清掉**（评分一并清掉），并如实报出「清理了几条」。
     #[test]
-    fn unidentifiable_missing_row_is_preserved_not_deleted() {
+    fn deleted_file_row_is_auto_cleaned() {
         let dir = std::env::temp_dir().join(format!("ais-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2406,10 +2363,117 @@ mod e2e_tests {
         std::fs::remove_file(&a).unwrap();
         let (files2, _) = comfy_finder::list_images_with_newest(&dir);
         let second = scan_source(&db, source_id, &norm, &files2).unwrap();
-        assert_eq!(second.unconfirmed.len(), 1, "认不出来就该进待确认名单");
+        assert_eq!(second.removed, 1, "文件没了就该自动清理一条");
+        assert_eq!(second.removed, 1, "真删了就该自动清理一条");
         let rows = db.list_source_identity_rows(source_id).unwrap();
-        assert_eq!(rows.len(), 1, "带用户状态的行绝不能被静默删除");
-        assert_eq!(db.score_of(id).unwrap(), Some(0.5), "评分必须还在");
+        assert!(rows.is_empty(), "文件没了，记录就该清掉");
+        assert_eq!(db.score_of(id).unwrap(), None, "不该留下孤儿评分");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 第 33 轮：**内容重复**导致改名认不出来 → 认不出来的行自动清理。
+    ///
+    /// 场景：三张**内容完全相同**的图 → 删掉一张、给另一张改名。
+    /// 改名认领失败（两边都不唯一，配对就是瞎猜）→ 走不到「就地改路径」，
+    /// 那一行就**没人要了** → 自动清理（评分一并清掉）。
+    #[test]
+    fn ambiguous_rename_is_auto_cleaned() {
+        let dir = std::env::temp_dir().join(format!("ais-ambig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("ComfyUI_00001_.png");
+        let b = dir.join("ComfyUI_00002_.png");
+        let d = dir.join("ComfyUI_00003_.png");
+        // 三张**一模一样**的图 → 内容键与内容指纹全都相同。
+        for p in [&a, &b, &d] {
+            std::fs::write(p, vec![7u8; 100]).unwrap();
+            age_file(p);
+        }
+
+        let db_path = dir.join("test.db");
+        let db = crate::db::open(&db_path).unwrap();
+        let source_id = db.upsert_source(&normalize_path(&dir), "local", None).unwrap();
+        let norm = normalize_path(&dir);
+        let (files, _) = comfy_finder::list_images_with_newest(&dir);
+        scan_source(&db, source_id, &norm, &files).unwrap();
+        let ids: Vec<i64> = db
+            .list_source_identity_rows(source_id)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids.len(), 3);
+        // 给其中一张记一个评分（用户状态）。
+        let scored = ids[0];
+        db.set_score(scored, 0.5).unwrap();
+
+        // 删掉一张、给另一张改名 —— 认领不出来（内容全都一样，配对是瞎猜）。
+        std::fs::remove_file(&a).unwrap();
+        std::fs::rename(&b, dir.join("ComfyUI_00099_.png")).unwrap();
+
+        let (files2, _) = comfy_finder::list_images_with_newest(&dir);
+        let second = scan_source(&db, source_id, &norm, &files2).unwrap();
+        assert!(
+            second.renamed.is_empty(),
+            "内容全同时不能瞎配对（否则等于把 A 的分拣搬到 B 上）"
+        );
+        // 认不出来 = 没人要了 → 自动清理（第 33 轮：删了就删了）。
+        assert!(second.removed >= 1, "认不出来的行该被清理");
+        assert_eq!(
+            db.score_of(scored).unwrap(),
+            None,
+            "记录被清掉时评分也该一起清掉（评分表没有外键）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 第 33 轮「缺失可见」：文件被删之后，**列表看得见**这件事。
+    ///
+    /// 场景：一张图入库 → 用户在应用之外删掉文件 → 再列这一组的图。
+    /// 期望：
+    /// 1. `file_missing` 为 true —— 实时 stat 出来的，不靠下一轮扫描；
+    /// 2. 记录**连同评分**一起清掉（评分表没有外键，不显式删就会留下
+    ///    一条指向不存在图片的孤儿评分）。
+    #[test]
+    fn missing_file_is_visible_and_cleaned() {
+        let dir = std::env::temp_dir().join(format!("ais-visible-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("ComfyUI_00001_.png");
+        std::fs::write(&a, vec![7u8; 100]).unwrap();
+        age_file(&a);
+
+        let db_path = dir.join("test.db");
+        let db = crate::db::open(&db_path).unwrap();
+        let source_id = db.upsert_source(&normalize_path(&dir), "local", None).unwrap();
+        let norm = normalize_path(&dir);
+        let (files, _) = comfy_finder::list_images_with_newest(&dir);
+        scan_source(&db, source_id, &norm, &files).unwrap();
+        let id = db.list_source_identity_rows(source_id).unwrap()[0].id;
+        db.set_score(id, 0.5).unwrap();
+
+        let group_key = db.list_groups(Some(source_id), 3).unwrap()[0].group_key.clone();
+
+        // 文件还在 → 不算缺失。
+        let before = db.list_group_images(&group_key, 3).unwrap();
+        assert_eq!(before.len(), 1);
+        assert!(!before[0].file_missing, "文件还在时不该报缺失");
+
+        // 用户在应用之外删掉文件。
+        std::fs::remove_file(&a).unwrap();
+
+        // 实时 stat —— 不用等扫描。
+        let after = db.list_group_images(&group_key, 3).unwrap();
+        assert_eq!(after.len(), 1, "带用户状态的行仍然保留");
+        assert!(after[0].file_missing, "文件没了就该看得见「缺失」");
+
+        // 用户点「删除记录」→ 记录 + 评分一起清掉。
+        db.delete_image_and_state(id).unwrap();
+        assert!(
+            db.list_group_images(&group_key, 3).unwrap().is_empty(),
+            "记录该被清掉"
+        );
+        assert_eq!(db.score_of(id).unwrap(), None, "不该留下孤儿评分");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2955,6 +3019,23 @@ pub async fn compute_text_signatures(
 /// 也得能证明。
 pub const CAP_SIGNATURE_EXPLICIT: &str = "ais.cap.signature.explicit.v1\0";
 
+/// 能力标记串：缺失自动清理（第 33 轮）。
+///
+/// 用户在应用之外删掉文件后，库里那一行按「绝不静默删除用户状态」的口径
+/// **保留**着 —— 但图已经取不到了。之前没有任何东西接住 `<img>` 的
+/// onError，于是缩略图框里只剩一块纯黑衬底，看上去像「还在加载」。
+///
+/// 用户 2026-11-02 裁决：「用户删了就删了，提醒一下就可以了」—— 让人
+/// 手动点 N 次不是好体验。所以现在：
+/// 1. 列清单时**实时**判「文件还在不在」（`ImageRow::file_missing`），
+///    缺失**看得见**；
+/// 2. 扫描时发现「文件不在了、且同样的内容也不在源里」（= 真删了，
+///    不是改名）→ **自动清理**那一行（连同评分 / 标签 / 手动分组），
+///    并在同步提示里**如实报出**清理了几条；
+/// 3. 「内容还在源里但认不出身份」（改名的歧义情形）→ 仍然保留，
+///    进「待确认」名单（第 29 轮的口径在这一条上仍然成立）。
+pub const CAP_MISSING_AUTOCLEAN: &str = "ais.cap.missing.autoclean.v1\0";
+
 /// 该源的**签名覆盖率**（第 30 轮）。
 ///
 /// 同步循环不再偷偷补算签名（见 `run_sync` 里的说明），所以「有多少图还没
@@ -3199,4 +3280,3 @@ pub async fn compute_signatures(
     }
     Ok(result)
 }
-

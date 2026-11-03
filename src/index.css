@@ -35,27 +35,28 @@
 
 :root {
   /* ---------------------------------------------------------------
-     中性色阶（规则13：8~10 档）。
-     契约：--n-7 及以上才可作正文色。--n-6 对面板仅 3.08:1，
-     只能用于大字号或纯装饰，绝不可用于小字号正文。
+     中性色阶（规则13）：n-1..n-9 九档 + 两个材质色（n-pure / ink-inverse）。
+     契约：正文色只能用 --n-7 及以上（n-8 正文、n-9 主文字）；
+     --n-1..--n-5 是表面与分隔线的明度台阶，不做文字色。
+     每一档都必须有真实用途 —— 没有用途的档位（旧的 --n-0 / --n-6）
+     已删除，不再占位。
      --------------------------------------------------------------- */
-  --n-0: #121216; /* 最深：缩略图占位、压暗层 */
   --n-1: #1a1a1f; /* 页面底 */
   --n-2: #24242c; /* 卡片 / 面板 */
   --n-3: #2e2e38; /* 次级面板 */
   --n-4: #3a3a46; /* 分隔线 */
   --n-5: #4a4a58; /* 悬停底 */
-  --n-6: #6e6e7e; /* 仅大字/装饰 —— 对 n-2 仅 3.08:1 */
   --n-7: #9a9aa8; /* 次要文字 —— 对 n-3 达 4.83:1 ✓ */
-  --n-8: #c8c8d2;
+  --n-8: #c8c8d2; /* 正文 */
   --n-9: #e6e6ea; /* 主文字 */
 
   /* ---------------------------------------------------------------
      强调色阶。规则13 的关键收益：有了多档才可能有 hover / active /
      浅底 tint，而不是所有交互都退化为「改 border-color」。
+     四档各有唯一职责：100 = 浅底 tint（规则14 的「浅底深字」）、
+     300 = 深色面上的强调文字/描边、500 = 装饰/大字、700 = 实心底。
      --------------------------------------------------------------- */
-  --accent-50: #1b2140; /* 选中态浅底 */
-  --accent-100: #232d55;
+  --accent-100: #232d55; /* 浅底 tint —— 与 accent-300 搭配 = 6.56:1 ✓ */
   --accent-300: #8ba3ff; /* 深色面上的强调文字/描边 —— 对 n-3 达 5.61:1 ✓ */
   --accent-500: #6c8cff; /* 仅装饰/大字 —— 对 n-3 仅 4.37:1 */
   --accent-700: #4a6ae0; /* 实心按钮底 + 白字 = 4.74:1 ✓ */
@@ -67,7 +68,27 @@
   /* 深色实底：配反白文字才达 AA。实测 #fff on --bad-500 仅 2.49、on --accent 仅 3.07，
      二者都不可用作实底 —— 这两个色标是浅色。 */
   --bad-700: #9e3535; /* 白字 6.97:1 ✓ */
-  --accent-700: #4a6ae0; /* 白字 4.74:1 ✓ */
+
+  /* 状态色的半透明底（徽章 / 行内高亮）= 由 500 档派生（军规13）。
+     **不得**在组件里写 rgba(229,115,115,…) 这种「第二个红」—— #e57373 不是
+     --bad-500(#e88a8a)，两套色标并行就是 token 漂移。
+     color-mix 保留原有的两档透明度：徽章 30%、行内高亮 35%。 */
+  --tint-bad-weak: color-mix(in srgb, var(--bad-500) 30%, transparent);
+  --tint-good-weak: color-mix(in srgb, var(--good-500) 30%, transparent);
+  --tint-bad-strong: color-mix(in srgb, var(--bad-500) 35%, transparent);
+  --tint-good-strong: color-mix(in srgb, var(--good-500) 35%, transparent);
+
+  /* 与图片叠加的表面色：必须是半透明（浮在图上），因此不是中性色阶的实色档。
+     值直接取自原先的组件字面量，视觉零变化 —— 只是把它收进唯一来源。 */
+  --surface-hover: rgb(40 40 52 / 0.9);
+  --scrim-blocked: rgb(40 40 50 / 0.78);
+
+  /* 缩略图尺寸阶梯（军规18）：32 / 48 / 64 / 96 四档，缩略图的宽高**只能**
+     取自这里，不得在组件里自创 42px / 86px 这种孤立尺寸。
+     当前用到 48（移动候选）/ 64（胶片条）/ 96（组行内）；32 档留待有需要时再加。 */
+  --thumb-s: 48px;
+  --thumb-m: 64px;
+  --thumb-l: 96px;
 
   /* 绝对墨色。图片 letterbox 衬底必须是纯黑（任何灰调都会在黑边上显出痕迹）；
      彩色实底上的文字必须是纯白。这两个是「材质」而非「主题色」，故不入中性色阶。 */
@@ -544,37 +565,6 @@ select {
   background: var(--panel-2);
 }
 
-/* 改名识别不出来的旧记录（第 29 轮「改名不丢分拣」）。
-   这是一条**要用户决定**的通知 —— 不是错误，也不是可以忽略的噪音：
-   里面每一条都带着用户的评分 / 标签 / 手动分组。 */
-.import-note {
-  margin-top: 12px;
-  padding: 12px 14px;
-  border-radius: var(--r-card);
-  background: var(--panel-2);
-}
-.import-note p {
-  margin: 0 0 8px;
-}
-.unconfirmed-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.unconfirmed-list li {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-.unconfirmed-list .path {
-  overflow-wrap: anywhere;
-  min-width: 0;
-}
-
 /* 可选中的源行：整行是按钮，选中态用**强调色边框**（军规 16）。
    旧版「查看分组 / 重新扫描」是两个同形按钮，用户分不清哪个能进主页面；
    现在整行可选中，全页只有一个主操作「打开分组列表」（军规 06）。 */
@@ -743,6 +733,10 @@ select {
 .group-thumb {
   position: relative;
   width: 100%;
+  /* 军规18：方框是**框体**（遮罩），不是「把图裁成方的」的借口。
+     图按 contain 完整放进框里，多出来的地方用纯黑衬底 —— 与文件夹视角、
+     查看器同一条语言（图片 letterbox 必须是纯黑，见上面的墨色注释）。
+     不生成任何缩略图文件：这一步完全由 CSS 完成。 */
   aspect-ratio: 1;
   border-radius: var(--r-control);
   overflow: hidden;
@@ -751,7 +745,7 @@ select {
 .group-thumb img {
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: contain;
   display: block;
 }
 .group-thumb-grid {
@@ -1091,7 +1085,9 @@ select {
 }
 .arena-card {
   position: relative;
-  cursor: pointer;
+  /* 卡片本身**不是**按钮：点图片 = 放大查看，判定走卡下方的按钮。
+     光标必须是 default —— 之前 pointer 让整张卡看起来「点下去就是选中」。 */
+  cursor: default;
   border-radius: var(--r-card);
   overflow: hidden;
   border: 2px solid transparent;
@@ -1099,7 +1095,30 @@ select {
   max-height: 72vh;
 }
 .arena-card:hover {
-  border-color: var(--accent);
+  /* 悬停 = 「可以放大查看」，而不是「可以判定」。 */
+  border-color: var(--n-4);
+}
+/* 悬停时浮在图上的「放大查看」提示。它压在图上 → 必须自带半透明底
+   （军规17），且不能吃掉点击（pointer-events: none）。 */
+.arena-card::after {
+  content: '放大查看';
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 4px 10px;
+  border-radius: var(--r-control);
+  background: rgba(0, 0, 0, 0.62);
+  color: var(--n-9);
+  font-size: 12px;
+  line-height: 1.4;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s;
+  z-index: 3;
+}
+.arena-card:hover::after {
+  opacity: 1;
 }
 /* Loser fly-off after vote — anchored to center; one-shot CSS animation
    gives an unmistakable visual closure to "this pair is decided". */
@@ -1117,6 +1136,8 @@ select {
   max-height: 72vh;
   max-width: 44vw;
   display: block;
+  /* 图片是「放大查看」的入口 —— 光标必须说清楚这一点。 */
+  cursor: zoom-in;
 }
 /* Pending-hide hover state: H pressed, waiting for ←/→ to pick a card. */
 .arena-card.arena-pending {
@@ -1160,17 +1181,48 @@ select {
   font-weight: 700;
   padding: 2px 8px;
   border-radius: var(--r-control);
+  /* 分数徽章只是**信息** —— 盖在图上却不能吃掉点击，
+     否则点它会落到卡片上（判定的地盘），与「点图 = 放大」相撞。 */
+  pointer-events: none;
+  z-index: 2;
 }
-.arena-label {
+/* 判定按钮：把「选中这一张」从「点图」里拆出来。
+   判定是一次不可轻触的分数写入 —— 必须是一个说得出名字的控件。 */
+.arena-vote-btn {
   position: absolute;
   bottom: 8px;
   left: 50%;
   transform: translateX(-50%);
-  background: rgba(0, 0, 0, 0.6);
-  color: var(--text);
-  font-size: 11px;
-  padding: 2px 8px;
+  background: rgba(0, 0, 0, 0.62);
+  color: var(--n-9);
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 4px 10px;
   border-radius: var(--r-control);
+  cursor: pointer;
+  backdrop-filter: blur(4px);
+  border: 1px solid transparent;
+  transition: background 0.15s, color 0.15s;
+  z-index: 4;
+}
+.arena-vote-btn:hover:not(:disabled) {
+  background: var(--accent-700);
+  color: var(--ink-inverse);
+}
+.arena-vote-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+/* 操作反馈行（删除等动作的结果）。与 .action-error 分开：那个是**坏了**，
+   这个是**成了** —— 两者不能共用语气与颜色。 */
+.notice-line {
+  flex: 0 0 auto;
+  padding: 5px 16px;
+  font-size: 13px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--good-500) 12%, transparent);
+  border-bottom: 1px solid var(--border);
+  text-align: center;
 }
 .arena-vs {
   font-size: 24px;
@@ -1283,6 +1335,11 @@ select {
   display: block;
   width: 100%;
   height: 100%;
+  /* 军规18：框体尺寸取自 DB 的 width/height（为了在文件解码前就能布局）。
+     存储尺寸与实际文件不一致时，不加这一条 img 会被**非等比拉伸** ——
+     onLoad 纠正之前的那一帧就是变形的。contain 会让它留边而不是变形，
+     正常数据下不产生任何视觉差异。 */
+  object-fit: contain;
   user-select: none;
   -webkit-user-drag: none;
 }
@@ -1343,7 +1400,7 @@ select {
   color: var(--n-9);
 }
 .viewer-nav-btn:hover:not(:disabled) {
-  background: rgba(40, 40, 52, 0.9);
+  background: var(--surface-hover);
 }
 
 .lightbox-hud {
@@ -1379,6 +1436,10 @@ select {
   text-align: center;
   pointer-events: none;
 }
+/* 「Delete 删除」是一整个词组 —— 不许在「删」与「除」之间折行。 */
+.lb-hint-nowrap {
+  white-space: nowrap;
+}
 
 /* 胶片条：位于舞台**下方**，永不压住放大后的图。
    规则19（慎用边框）：舞台是纯黑 --n-pure，胶片条是 --n-1 —— 底色差
@@ -1397,7 +1458,7 @@ select {
 .filmstrip-item {
   position: relative;
   flex: 0 0 auto;
-  width: 64px;
+  width: var(--thumb-m);
   padding: 0;
   border: 0;
   border-radius: var(--r-control);
@@ -1407,10 +1468,11 @@ select {
 }
 .filmstrip-item img {
   display: block;
-  width: 64px;
-  height: 64px;
-  object-fit: cover;
-  background: var(--n-2);
+  /* 军规18：尺寸取自阶梯；遮罩而非裁切 —— 整张图都在框里。 */
+  width: var(--thumb-m);
+  height: var(--thumb-m);
+  object-fit: contain;
+  background: var(--n-pure);
 }
 .filmstrip-item.active {
   box-shadow: 0 0 0 2px var(--accent-300);
@@ -1706,7 +1768,7 @@ select {
   content: '';
   position: absolute;
   inset: 0;
-  background: rgba(40, 40, 50, 0.78);
+  background: var(--scrim-blocked);
   pointer-events: none;
   z-index: 1;
 }
@@ -1878,16 +1940,18 @@ select {
 }
 .move-target-thumbs {
   display: grid;
-  grid-template-columns: repeat(2, 42px);
-  grid-template-rows: repeat(2, 42px);
-  flex: 0 0 84px;
+  /* 军规18：2×2 的每个格子都取自缩略图阶梯（48），整组宽度 = 2×阶梯 + 缝。 */
+  grid-template-columns: repeat(2, var(--thumb-s));
+  grid-template-rows: repeat(2, var(--thumb-s));
+  flex: 0 0 calc(var(--thumb-s) * 2 + 2px);
   gap: 2px;
   background: var(--n-pure);
 }
 .move-target-thumbs img {
-  width: 42px;
-  height: 42px;
-  object-fit: cover;
+  width: var(--thumb-s);
+  height: var(--thumb-s);
+  /* 遮罩而非裁切：候选组是「这几组像不像」的判据，看不到的构图就是丢失的信息。 */
+  object-fit: contain;
 }
 .move-target-info {
   min-width: 0;
@@ -2036,11 +2100,11 @@ select {
   border-radius: var(--r-control);
 }
 .diff-badge[data-side='left'] {
-  background: rgba(229, 115, 115, 0.3);
+  background: var(--tint-bad-weak);
   color: var(--bad-500);
 }
 .diff-badge[data-side='right'] {
-  background: rgba(129, 199, 132, 0.3);
+  background: var(--tint-good-weak);
   color: var(--good-500);
 }
 
@@ -2079,11 +2143,11 @@ select {
   padding: 0 1px;
 }
 .diff-token.diff-left {
-  background: rgba(229, 115, 115, 0.35);
+  background: var(--tint-bad-strong);
   color: var(--bad-500);
 }
 .diff-token.diff-right {
-  background: rgba(129, 199, 132, 0.35);
+  background: var(--tint-good-strong);
   color: var(--good-500);
 }
 
@@ -2197,7 +2261,7 @@ select {
   opacity: 0.45;
 }
 .rec-highlight {
-  background: rgba(129, 199, 132, 0.35);
+  background: var(--tint-good-strong);
   border-radius: var(--r-control);
   padding: 0 2px;
   font-weight: 700;
@@ -2504,9 +2568,11 @@ select {
   padding-top: 8px;
 }
 .row-img {
-  width: 86px;
-  height: 86px;
-  object-fit: cover;
+  /* 军规18：86 是孤立尺寸（阶梯里没有这一档）→ 归到 96。 */
+  width: var(--thumb-l);
+  height: var(--thumb-l);
+  object-fit: contain;
+  background: var(--n-pure);
   border-radius: var(--r-control);
   cursor: default;
 }
@@ -2599,4 +2665,70 @@ select {
   border-style: dashed;
   justify-content: center;
   max-width: none;
+}
+/* ------------------------------------------------------------------
+   「文件已删除」的显式状态（第 33 轮）。
+
+   背景：用户在应用之外删掉文件后，图已经取不到了，而 `<img>` 的 onError
+   之前**没人接** —— 画面上「什么都不发生」，缩略图框里只剩军规 18 的纯黑
+   letterbox 衬底，看上去像「还在加载」。用户看到的现象就是「留了一个黑色
+   占位符」。
+
+   口径：
+   * 底色 --bad-100 / 文字 --bad-500 —— 这一对已登记进对比度校验
+     （5.39:1 ✓），不是新色标。
+   * **不靠颜色单独传信息**（军规 15）：格子里有字（小格「已删」、
+     大格「文件已删除」），再叠一个 title 说明原因。
+   * 这一段放在文件末尾 —— `.thumb-missing` 与各容器自己的尺寸规则
+     同权重，靠「后写的赢」来覆盖底色，别去改那些既有规则。
+   ------------------------------------------------------------------ */
+.thumb-missing {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bad-100);
+  color: var(--bad-500);
+  font-size: 11px;
+  line-height: 1.2;
+  text-align: center;
+  overflow: hidden;
+}
+.thumb-missing-label {
+  padding: 0 4px;
+}
+/* 组封面（2×2 格子）：标记要跟同位置的 img 一样参与网格排布。 */
+.group-thumb-grid .thumb-missing {
+  min-width: 0;
+  min-height: 0;
+}
+.group-thumb-grid.count-1 .thumb-missing {
+  grid-column: 1 / -1;
+  grid-row: 1 / -1;
+}
+.group-thumb-grid.count-2 .thumb-missing:first-child,
+.group-thumb-grid.count-2 .thumb-missing:last-child {
+  grid-row: 1 / -1;
+}
+/* 文件夹视角的卡片图：img 是绝对定位铺满格子的，标记要跟着铺满。 */
+.folder-item .thumb-missing {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+/* 胶片条 / 移动候选：尺寸取自阶梯 token（军规 18）。 */
+.filmstrip-item .thumb-missing {
+  width: var(--thumb-m);
+  height: var(--thumb-m);
+}
+.move-target-thumbs .thumb-missing {
+  width: var(--thumb-s);
+  height: var(--thumb-s);
+}
+/* 比对台的两张大卡：尺寸由内容决定，标记要自己给一个盒子。 */
+.arena-card .thumb-missing,
+.card .thumb-missing {
+  width: min(70vw, 560px);
+  aspect-ratio: 4 / 3;
 }

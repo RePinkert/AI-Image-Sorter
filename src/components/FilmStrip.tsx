@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef } from 'react'
 import { assetUrl } from '../api'
 import type { ImageRow } from '../types'
+import { Thumb } from './Thumb'
 
 // A horizontal filmstrip of the surrounding images, borrowed from the
 // "preview pane" of a mature local photo manager.
@@ -60,7 +61,14 @@ export function FilmStrip({ images, activeIndex, onSelect }: FilmStripProps) {
             onClick={() => onSelect(index)}
             title={img.filename}
           >
-            <img src={assetUrl(img.abs_path)} alt="" loading="lazy" decoding="async" draggable={false} />
+            <Thumb
+              src={assetUrl(img.abs_path)}
+              alt=""
+              fileMissing={img.file_missing}
+              loading="lazy"
+              decoding="async"
+              draggable={false}
+            />
             <span className="filmstrip-label">{img.filename}</span>
           </button>
         )
